@@ -295,12 +295,61 @@ pub fn send_command_to_socket(socket_path: &Path, cmd: &str) -> std::io::Result<
     Ok(resp)
 }
 
-/// Construct a production `CommandExecutor` matching C++ `AcpiUtils::executeAcpiCommand` / `Daemon`:
-/// forwards commands over `/tmp/awcc.sock` when the daemon socket is available, or falls back to
-/// `sh -c` when `/proc/acpi/call` is present and no daemon is listening.
+/// Attempt a direct in-process write/read to `/proc/acpi/call` or CPU turbo sysfs
+/// without spawning `pkexec` or `sh` whenever the current process has write permission
+/// (e.g. inside `awccd` or when `/proc/acpi/call` has group/udev write permissions).
+#[must_use]
+pub fn try_direct_kernel_io(cmd: &str) -> Option<String> {
+    let trimmed = cmd.trim();
+
+    // 1. Direct `/proc/acpi/call` write + read
+    const PREFIX_START: &str = "pkexec sh -c 'echo \"";
+    const SUFFIX_END: &str = "\" > /proc/acpi/call && cat /proc/acpi/call'";
+    if let Some(rest) = trimmed.strip_prefix(PREFIX_START)
+        && let Some(acpi_payload) = rest.strip_suffix(SUFFIX_END)
+    {
+        let acpi_path = Path::new("/proc/acpi/call");
+        if acpi_path.exists() && fs::write(acpi_path, format!("{acpi_payload}\n")).is_ok() {
+            return fs::read_to_string(acpi_path).ok();
+        }
+        return None;
+    }
+
+    // 2. Direct sysfs CPU Turbo Boost write
+    for sysfs_path_str in [
+        "/sys/devices/system/cpu/intel_pstate/no_turbo",
+        "/sys/devices/system/cpu/cpufreq/boost",
+    ] {
+        if trimmed.contains(sysfs_path_str) {
+            let val = if trimmed.contains("echo 1") {
+                "1\n"
+            } else if trimmed.contains("echo 0") {
+                "0\n"
+            } else {
+                return None;
+            };
+            let sysfs_path = Path::new(sysfs_path_str);
+            if sysfs_path.exists() && fs::write(sysfs_path, val).is_ok() {
+                return Some(val.trim().to_string());
+            }
+            return None;
+        }
+    }
+
+    None
+}
+
+/// Construct a production `CommandExecutor`:
+/// 1. Tries direct in-process file I/O (`fs::write` + `fs::read_to_string`) on `/proc/acpi/call`
+///    or sysfs when the current process has write permission (zero `pkexec`/`sh` overhead).
+/// 2. Otherwise forwards over `/tmp/awcc.sock` when the privileged `awccd` daemon is listening.
+/// 3. Falls back to `sh -c` only when neither direct write access nor the daemon socket is available.
 #[must_use]
 pub fn default_linux_command_executor(socket_path: PathBuf) -> CommandExecutor {
     Arc::new(move |cmd: &str| {
+        if let Some(resp) = try_direct_kernel_io(cmd) {
+            return resp;
+        }
         if socket_path.exists()
             && let Ok(resp) = send_command_to_socket(&socket_path, cmd)
         {

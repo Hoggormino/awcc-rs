@@ -9,9 +9,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use awcc_core::{
-    DeviceProfile, FanCurveConfig, FanCurvePoint, SimScenario, ThermalMode, ThermalModeState,
+    DeviceProfile, FanCurveConfig, FanCurvePoint, OperationLifecycle, SimScenario, ThermalMode,
+    ThermalModeState,
     lighting::{LightingEffect, PowerStateSlot, ZoneTarget},
 };
+use awcc_platform::WriteAuditEntry;
 use awcc_service::{
     ServiceCommand, SystemSnapshot, ThermalOrchestrator, ThermalServiceHandle,
     resolve_host_device_profile,
@@ -20,7 +22,7 @@ use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
 };
 use slint::{
-    Color, ComponentHandle, ModelRc, PhysicalSize, SharedString, Timer, TimerMode, VecModel,
+    Color, ComponentHandle, Model, ModelRc, PhysicalSize, SharedString, Timer, TimerMode, VecModel,
 };
 
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::todo)]
@@ -81,7 +83,7 @@ where
             "--scenario" => {
                 let Some(val) = iter.next() else {
                     bail!(
-                        "--scenario requires a scenario name (normal|compact|rollback|unknown|lighting|diagnostics)"
+                        "--scenario requires a scenario name (normal|compact|rollback|unknown|lighting|diagnostics|settings)"
                     );
                 };
                 opts.scenario = val;
@@ -111,7 +113,7 @@ OPTIONS:
   --screenshot <PATH>        Render a deterministic PNG screenshot using the Slint software renderer
   --width <PX>               Window width for screenshot rendering (default: 1120)
   --height <PX>              Window height for screenshot rendering (default: 720)
-  --scenario <NAME>          Preset state for screenshot: normal | compact | rollback | unknown | lighting | diagnostics"
+  --scenario <NAME>          Preset state for screenshot: normal | compact | rollback | unknown | lighting | diagnostics | settings"
     );
 }
 
@@ -215,6 +217,275 @@ fn u32_to_slint_color(rgb: u32) -> Color {
     Color::from_rgb_u8(r, g, b)
 }
 
+fn parse_hex_or_dec_u16(token: &str) -> Option<u16> {
+    let t = token.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        t.parse::<u16>().ok()
+    }
+}
+
+fn decode_wmax_call(
+    raw_cmd: &str,
+    code_table: Option<&awcc_core::ThermalCodeTable>,
+) -> Option<String> {
+    let wmax_idx = raw_cmd.find("WMAX")?;
+    let after_wmax = &raw_cmd[wmax_idx + 4..];
+    let brace_start = after_wmax.find('{')?;
+    let brace_end = after_wmax[brace_start..].find('}')? + brace_start;
+    let header_tokens: Vec<&str> = after_wmax[..brace_start].split_whitespace().collect();
+    let subcmd_str = header_tokens.last().copied()?;
+    let subcmd = parse_hex_or_dec_u16(subcmd_str)?;
+
+    let args: Vec<u16> = after_wmax[brace_start + 1..brace_end]
+        .split(',')
+        .filter_map(parse_hex_or_dec_u16)
+        .collect();
+    let arg1 = args.first().copied().unwrap_or(0);
+    let arg2 = args.get(1).copied().unwrap_or(0);
+    let arg3 = args.get(2).copied().unwrap_or(0);
+    let arg4 = args.get(3).copied().unwrap_or(0);
+
+    let meaning = match (subcmd, arg1) {
+        (0x15, 0x01) => {
+            let resolved_mode = code_table.and_then(|table| {
+                match table.decode_query_response(u32::from(arg2)) {
+                    ThermalModeState::Known(m) => Some(m.display_name()),
+                    ThermalModeState::Unknown { .. } => ThermalMode::ALL
+                        .iter()
+                        .copied()
+                        .find(|&m| table.set_code_for(m) == arg2)
+                        .map(ThermalMode::display_name),
+                }
+            });
+            let mode_name = resolved_mode.unwrap_or(match arg2 {
+                0x00 => "Manual",
+                0xA0 => "Balanced",
+                0xA1 => "Quiet",
+                0xA2 => "Cool",
+                0xA3 => "Performance",
+                0xA4 => "Full Speed",
+                0xA5 => "Battery Saver",
+                0xAB | 0x35 => "G-Mode",
+                _ => "Custom Profile",
+            });
+            format!("Set Thermal Profile → {mode_name}")
+        }
+        (0x15, 0x02) => {
+            let fan_name = match arg2 {
+                0x32 => "CPU Fan",
+                0x33 => "GPU Fan",
+                0x36 => "Top Fan",
+                0x3A => "Front Fan",
+                _ => "Fan",
+            };
+            format!("Set {fan_name} Boost → {arg3}%")
+        }
+        (0x15, 0x03) => {
+            let cap = 100_u16.saturating_sub(arg2);
+            format!("Set CPU Temp Limit → {cap}°C (TCC Offset -{arg2}°C)")
+        }
+        (0x25, 0x01) => {
+            if arg2 != 0 {
+                "Engage G-Mode GameShift Latch".to_string()
+            } else {
+                "Toggle / Clear G-Mode GameShift Latch".to_string()
+            }
+        }
+        _ => "ACPI WMAX Control Call".to_string(),
+    };
+
+    Some(format!(
+        "{meaning}  ·  WMAX 0x{subcmd:02X} [0x{arg1:02X}, 0x{arg2:02X}, 0x{arg3:02X}, 0x{arg4:02X}]"
+    ))
+}
+
+fn decode_usb_elc_call(raw_cmd: &str) -> Option<String> {
+    if !raw_cmd.contains("USB HID") {
+        return None;
+    }
+    let bracket_start = raw_cmd.find('[')?;
+    let bracket_end = raw_cmd[bracket_start..].find(']')? + bracket_start;
+    let hex_inner = &raw_cmd[bracket_start + 1..bracket_end];
+    let bytes: Vec<u8> = hex_inner
+        .split_whitespace()
+        .filter_map(|b| u8::from_str_radix(b, 16).ok())
+        .collect();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let hex_upper = bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let b2 = bytes.get(2).copied().unwrap_or(0);
+    let b3 = bytes.get(3).copied().unwrap_or(0);
+    let b4 = bytes.get(4).copied().unwrap_or(0);
+    let b5 = bytes.get(5).copied().unwrap_or(0);
+
+    let meaning = match bytes[1] {
+        0x21 => {
+            let op = u16::from_be_bytes([b2, b3]);
+            let slot = u16::from_be_bytes([b4, b5]);
+            let slot_name = match slot {
+                0x0000 => "Volatile Session (Slot 0)".to_string(),
+                0x0061 => "Boot Default (0x0061)".to_string(),
+                0x005B => "Power AC Sleep (0x005B)".to_string(),
+                0x005C => "Power AC On (0x005C)".to_string(),
+                0x005D => "Power Charging (0x005D)".to_string(),
+                0x005E => "Power DC Sleep (0x005E)".to_string(),
+                0x005F => "Power DC On (0x005F)".to_string(),
+                0x0060 => "Power Critical (0x0060)".to_string(),
+                _ => format!("Slot 0x{slot:04X}"),
+            };
+            let op_name = match op {
+                0x0001 => "Start Animation",
+                0x0002 => "Save Animation",
+                0x0003 => "Play Animation",
+                0x0005 => "Erase Animation Slot",
+                0x0006 => "Set Boot Default Slot",
+                _ => "Animation Op",
+            };
+            format!("{op_name} → {slot_name}")
+        }
+        0x22 => {
+            let op = u16::from_be_bytes([b2, b3]);
+            let op_name = match op {
+                0x0001 => "Start Session Animation",
+                0x0002 => "Save Session Animation",
+                0x0003 => "Play Session Animation",
+                0x0005 => "Remove Session Animation",
+                0x0006 => "Set Session Default",
+                _ => "Session Animation Command",
+            };
+            op_name.to_string()
+        }
+        0x23 => {
+            let count = usize::from(b4);
+            let zones = if bytes.len() >= 5 + count {
+                &bytes[5..5 + count]
+            } else {
+                &[]
+            };
+            let zone_desc = if zones.len() >= 7 {
+                "All Chassis & Keyboard Zones"
+            } else {
+                match zones {
+                    [0x04, 0x05, 0x06, 0x07] => "4 Keyboard Zones",
+                    [0x01, 0x00] | [0x00, 0x01] => "Stadium Lights",
+                    [0x03] => "Alienhead Logo",
+                    [0x02] => "Power Button LED",
+                    _ => "Selected Zones",
+                }
+            };
+            format!("Select Target Zones → {zone_desc} ({count} LEDs)")
+        }
+        0x24 => {
+            let action_name = match b2 {
+                0x00 => "Morph",
+                0x01 => "Pulse",
+                0x02 => "Static Color",
+                _ => "Keyframe",
+            };
+            let duration_ms = u16::from_be_bytes([b3, b4]);
+            let r = bytes.get(7).copied().unwrap_or(0);
+            let g = bytes.get(8).copied().unwrap_or(0);
+            let b = bytes.get(9).copied().unwrap_or(0);
+            format!(
+                "Set Lighting Keyframe → {action_name} #{r:02X}{g:02X}{b:02X} ({duration_ms} ms)"
+            )
+        }
+        0x26 => {
+            let pct = 100_u8.saturating_sub(b2.min(100));
+            format!("Set Hardware Brightness → {pct}% (Dim 0x{b2:02X}, {b3} zones)")
+        }
+        0x27 => {
+            let count = bytes.get(6).copied().unwrap_or(0);
+            format!("Set Direct Color → #{b2:02X}{b3:02X}{b4:02X} ({count} zones)")
+        }
+        _ => "ELC Lighting Command".to_string(),
+    };
+
+    Some(format!("{meaning}  ·  ELC [{hex_upper}]"))
+}
+
+/// Format a `WriteAuditEntry` into `(meaning_and_hex, clean_outcome)` with zero `pkexec sh -c` noise.
+#[must_use]
+pub fn format_log_entry(
+    entry: &WriteAuditEntry,
+    code_table: Option<&awcc_core::ThermalCodeTable>,
+) -> (String, String) {
+    let raw_cmd = entry.command.as_str();
+    let command_text = if let Some(wmax_formatted) = decode_wmax_call(raw_cmd, code_table) {
+        wmax_formatted
+    } else if let Some(usb_formatted) = decode_usb_elc_call(raw_cmd) {
+        usb_formatted
+    } else if raw_cmd.contains("intel_pstate/no_turbo") {
+        let disabled = raw_cmd.contains("echo 1") || raw_cmd.ends_with("= 1");
+        if disabled {
+            "Set CPU Turbo Boost → Disabled  ·  intel_pstate/no_turbo = 0x01".to_string()
+        } else {
+            "Set CPU Turbo Boost → Enabled  ·  intel_pstate/no_turbo = 0x00".to_string()
+        }
+    } else if raw_cmd.contains("cpufreq/boost") {
+        let enabled = raw_cmd.contains("echo 1") || raw_cmd.ends_with("= 1");
+        if enabled {
+            "Set CPU Turbo Boost → Enabled  ·  cpufreq/boost = 0x01".to_string()
+        } else {
+            "Set CPU Turbo Boost → Disabled  ·  cpufreq/boost = 0x00".to_string()
+        }
+    } else {
+        raw_cmd.to_string()
+    };
+
+    let outcome_text = match entry.outcome.as_str() {
+        "0x0" | "0x0 (OK)" => "OK (0x00)".to_string(),
+        "0x1" => "OK (0x01)".to_string(),
+        "33 bytes transferred" => "OK (33B ACK)".to_string(),
+        other if other.contains("0xffffffff") || other.contains("0xFFFFFFFF") => {
+            "Rejected (0xFFFFFFFF)".to_string()
+        }
+        other => other.to_string(),
+    };
+
+    (command_text, outcome_text)
+}
+
+fn format_clean_lifecycle_message(
+    lifecycle: &OperationLifecycle,
+    code_table: Option<&awcc_core::ThermalCodeTable>,
+) -> String {
+    match lifecycle {
+        OperationLifecycle::RolledBack { summary, reason } => {
+            if let Some(decoded) = decode_wmax_call(reason, code_table) {
+                format!("{summary} — Rejected: {decoded}")
+            } else {
+                format!("{summary} — {reason}")
+            }
+        }
+        OperationLifecycle::Failed { summary, error } => {
+            if let Some(decoded) = decode_wmax_call(error, code_table) {
+                format!("{summary}: Hardware rejected {decoded}")
+            } else {
+                format!("{summary}: {error}")
+            }
+        }
+        _ => lifecycle.detail_message(),
+    }
+}
+
+const fn interval_label_for_ms(ms: i32) -> &'static str {
+    match ms {
+        500 => "0.5s",
+        2000 => "2.0s",
+        5000 => "5.0s",
+        _ => "1.0s",
+    }
+}
+
 /// Apply an immutable `SystemSnapshot` onto the Slint `MainWindow`.
 fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_sliders: bool) {
     ui.set_is_simulated(snap.is_simulated);
@@ -227,7 +498,10 @@ fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_slide
     ui.set_write_count(snap.write_count() as i32);
 
     ui.set_lifecycle_badge(SharedString::from(snap.lifecycle.badge_label()));
-    ui.set_lifecycle_message(SharedString::from(snap.lifecycle.detail_message()));
+    ui.set_lifecycle_message(SharedString::from(format_clean_lifecycle_message(
+        &snap.lifecycle,
+        Some(&snap.profile.code_table),
+    )));
     ui.set_lifecycle_is_error(snap.lifecycle.is_error_or_rollback());
 
     ui.set_active_mode_label(SharedString::from(snap.thermal_mode_state.display_label()));
@@ -319,9 +593,9 @@ fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_slide
         ui.set_staged_lighting_brightness(f32::from(snap.lighting_brightness_pct));
     }
     let persist_str = if snap.lighting_persist_boot {
-        "Boot Slot 0x0061"
+        "Saved as Boot Default"
     } else {
-        "Volatile Session"
+        "Session Only"
     };
     ui.set_active_lighting_summary(SharedString::from(format!(
         "{} · {} · Brightness {}% · {persist_str}",
@@ -370,20 +644,56 @@ fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_slide
         )));
     }
 
-    let rows: Vec<AuditRow> = snap
-        .write_audit_log
-        .iter()
-        .map(|entry| AuditRow {
-            seq_text: SharedString::from(format!("#{:02}", entry.sequence)),
-            command: SharedString::from(entry.command.as_str()),
-            outcome: SharedString::from(entry.outcome.as_str()),
-            succeeded: entry.succeeded,
-        })
-        .collect();
-    ui.set_audit_rows(ModelRc::new(VecModel::from(rows)));
+    // Only rebuild the virtualized Log model when the number of recorded entries changes.
+    if sync_staged_sliders || ui.get_audit_rows().row_count() != snap.write_audit_log.len() {
+        let rows: Vec<AuditRow> = snap
+            .write_audit_log
+            .iter()
+            .rev()
+            .map(|entry| {
+                let (command_str, outcome_str) =
+                    format_log_entry(entry, Some(&snap.profile.code_table));
+                AuditRow {
+                    seq_text: SharedString::from(format!("#{:02}", entry.sequence)),
+                    command: SharedString::from(command_str),
+                    outcome: SharedString::from(outcome_str),
+                    succeeded: entry.succeeded,
+                }
+            })
+            .collect();
+        ui.set_audit_rows(ModelRc::new(VecModel::from(rows)));
+    }
 }
 
-fn wire_ui_callbacks(ui: &MainWindow, service: &Rc<RefCell<ThermalServiceHandle>>) {
+fn restart_auto_refresh_timer(
+    timer: &Timer,
+    ui_weak: slint::Weak<MainWindow>,
+    service: Rc<RefCell<ThermalServiceHandle>>,
+    enabled: bool,
+    interval_ms: i32,
+) {
+    if !enabled {
+        timer.stop();
+        return;
+    }
+    let ms = u64::try_from(interval_ms.clamp(250, 60_000)).unwrap_or(1000);
+    timer.start(TimerMode::Repeated, Duration::from_millis(ms), move || {
+        if let Some(w) = ui_weak.upgrade() {
+            let cmd = if w.get_fan_curve_active() {
+                ServiceCommand::StepFanCurve
+            } else {
+                ServiceCommand::Refresh
+            };
+            service.borrow().send(cmd);
+        }
+    });
+}
+
+fn wire_ui_callbacks(
+    ui: &MainWindow,
+    service: &Rc<RefCell<ThermalServiceHandle>>,
+    refresh_timer: &Rc<Timer>,
+) {
     {
         let svc = Rc::clone(service);
         ui.on_request_refresh(move || {
@@ -630,6 +940,46 @@ fn wire_ui_callbacks(ui: &MainWindow, service: &Rc<RefCell<ThermalServiceHandle>
             svc.borrow().send(ServiceCommand::SetSimScenario(scenario));
         });
     }
+
+    {
+        let ui_weak = ui.as_weak();
+        let svc = Rc::clone(service);
+        let timer = Rc::clone(refresh_timer);
+        ui.on_toggle_auto_refresh(move |enabled| {
+            if let Some(w) = ui_weak.upgrade() {
+                let interval_ms = w.get_refresh_interval_ms();
+                restart_auto_refresh_timer(
+                    &timer,
+                    w.as_weak(),
+                    Rc::clone(&svc),
+                    enabled,
+                    interval_ms,
+                );
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let svc = Rc::clone(service);
+        let timer = Rc::clone(refresh_timer);
+        ui.on_select_refresh_interval(move |interval_ms| {
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_refresh_interval_ms(interval_ms);
+                w.set_refresh_interval_label(SharedString::from(interval_label_for_ms(
+                    interval_ms,
+                )));
+                let enabled = w.get_auto_refresh_enabled();
+                restart_auto_refresh_timer(
+                    &timer,
+                    w.as_weak(),
+                    Rc::clone(&svc),
+                    enabled,
+                    interval_ms,
+                );
+            }
+        });
+    }
 }
 
 /// Software-renderer platform for deterministic headless screenshot generation.
@@ -706,7 +1056,7 @@ fn render_headless_screenshot(
             ui.set_staged_color_preset_index(1);
             s
         }
-        "diagnostics" => {
+        "diagnostics" | "log" => {
             orch.set_sim_scenario(SimScenario::AcpiSetFailureRollback);
             let _ = orch.toggle_gmode();
             orch.set_sim_scenario(SimScenario::Normal);
@@ -718,6 +1068,12 @@ fn render_headless_screenshot(
             );
             sync_snapshot_to_ui(&ui, &s, true);
             ui.set_active_nav_index(2);
+            s
+        }
+        "settings" => {
+            let s = orch.query_snapshot();
+            sync_snapshot_to_ui(&ui, &s, true);
+            ui.set_active_nav_index(3);
             s
         }
         _ => {
@@ -807,7 +1163,17 @@ fn main() -> Result<()> {
         let initial_snap = service.borrow().current_snapshot().clone();
         sync_snapshot_to_ui(&ui, &initial_snap, true);
     }
-    wire_ui_callbacks(&ui, &service);
+    let refresh_timer = Rc::new(Timer::default());
+    wire_ui_callbacks(&ui, &service, &refresh_timer);
+
+    // Start periodic auto-refresh timer (default 1000ms = 1.0s, configurable in Settings).
+    restart_auto_refresh_timer(
+        &refresh_timer,
+        ui.as_weak(),
+        Rc::clone(&service),
+        ui.get_auto_refresh_enabled(),
+        ui.get_refresh_interval_ms(),
+    );
 
     // Non-blocking 50ms poll timer to apply newly published worker snapshots on the UI thread.
     let poll_timer = Timer::default();
@@ -853,6 +1219,32 @@ mod tests {
     }
 
     #[test]
+    fn format_log_entry_strips_pkexec_and_includes_meaning_and_hex() {
+        let pkexec_entry = WriteAuditEntry {
+            sequence: 1,
+            command: "pkexec sh -c 'echo \"\\_SB.AMWW.WMAX 0 0x15 {0x1,0xa3,0x0,0x00}\" > /proc/acpi/call && cat /proc/acpi/call'".to_string(),
+            outcome: "0x0".to_string(),
+            succeeded: true,
+        };
+        let (cmd, out) = format_log_entry(&pkexec_entry, None);
+        assert!(!cmd.contains("pkexec"));
+        assert!(cmd.contains("Set Thermal Profile → Performance"));
+        assert!(cmd.contains("WMAX 0x15 [0x01, 0xA3, 0x00, 0x00]"));
+        assert_eq!(out, "OK (0x00)");
+
+        let usb_entry = WriteAuditEntry {
+            sequence: 2,
+            command: "USB HID 187c:0550 OUT [03 24 02 07 d0 00 fa f5 9e 0b]".to_string(),
+            outcome: "33 bytes transferred".to_string(),
+            succeeded: true,
+        };
+        let (usb_cmd, usb_out) = format_log_entry(&usb_entry, None);
+        assert!(usb_cmd.contains("Set Lighting Keyframe → Static Color #F59E0B (2000 ms)"));
+        assert!(usb_cmd.contains("ELC [03 24 02 07 D0 00 FA F5 9E 0B]"));
+        assert_eq!(usb_out, "OK (33B ACK)");
+    }
+
+    #[test]
     fn ui_staging_never_emits_hardware_writes_until_apply_is_invoked() {
         i_slint_backend_testing::init_no_event_loop();
         let orchestrator =
@@ -862,12 +1254,21 @@ mod tests {
 
         let initial_snap = service.borrow().current_snapshot().clone();
         sync_snapshot_to_ui(&ui, &initial_snap, true);
-        wire_ui_callbacks(&ui, &service);
+        let refresh_timer = Rc::new(Timer::default());
+        wire_ui_callbacks(&ui, &service, &refresh_timer);
 
         assert_eq!(ui.get_write_count(), 0);
         assert_eq!(ui.get_active_mode_label().as_str(), "Balanced");
         assert!(!ui.get_boost_dirty());
         assert!(!ui.get_tcc_dirty());
+        assert!(ui.get_auto_refresh_enabled());
+        assert_eq!(ui.get_refresh_interval_ms(), 1000);
+
+        // Changing refresh interval in Settings updates UI state without hardware writes:
+        ui.invoke_select_refresh_interval(500);
+        assert_eq!(ui.get_refresh_interval_ms(), 500);
+        assert_eq!(ui.get_refresh_interval_label().as_str(), "0.5s");
+        assert_eq!(ui.get_write_count(), 0);
 
         // Programmatically syncing a snapshot where G-Mode, Turbo, and Stealth flip must
         // NEVER fire `Switch.checked_state_changed` or `Slider.value_changed` feedback loops:

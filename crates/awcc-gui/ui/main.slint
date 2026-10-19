@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 // AWCC Linux — Slint Material 3 (@material 1.1.0) Desktop UI
 
-import { Palette } from "std-widgets.slint";
+import { Palette, ListView } from "std-widgets.slint";
 import {
     MaterialWindow,
     NavigationRail,
@@ -18,7 +18,6 @@ import {
     OutlineButton,
     LinearProgressIndicator,
     HorizontalDivider,
-    ScrollView,
     MaterialText,
     MaterialPalette,
     MaterialTypography,
@@ -34,11 +33,11 @@ export struct AuditRow {
 }
 
 export component MainWindow inherits MaterialWindow {
-    title: "Alienware Command Center — Linux (Material 3)";
+    title: "Alienware Command Center — Linux";
     preferred-width: 1120px;
     preferred-height: 720px;
-    min-width: 840px;
-    min-height: 580px;
+    min-width: 880px;
+    min-height: 620px;
 
     // Navigation & simulation properties
     in-out property <int> active-nav-index: 0;
@@ -49,6 +48,11 @@ export component MainWindow inherits MaterialWindow {
     in property <string> smbios-id: "0x0A86";
     in property <string> db-source: "compiled-in DEFAULT_DATABASE_JSON";
     in property <int> write-count: 0;
+
+    // Auto-refresh & Settings properties
+    in-out property <bool> auto-refresh-enabled: true;
+    in-out property <int> refresh-interval-ms: 1000;
+    in property <string> refresh-interval-label: "1.0s";
 
     // Lifecycle feedback banner
     in property <string> lifecycle-badge: "READY";
@@ -75,7 +79,7 @@ export component MainWindow inherits MaterialWindow {
     in property <bool> sensors-available: true;
     in-out property <bool> cpu-turbo-enabled: true;
 
-    // CPU TCC Offset (0..15°C reduction from TjMax, WMAX 0x14 0x0d / 0x15 0x03)
+    // CPU TCC Offset (0..15°C reduction from TjMax)
     in property <string> tcc-offset-text: "0°C";
     in-out property <float> staged-tcc-offset: 0;
     in-out property <bool> tcc-dirty: false;
@@ -94,22 +98,22 @@ export component MainWindow inherits MaterialWindow {
     in-out property <float> staged-curve-hysteresis: 3;
     in-out property <bool> curve-dirty: false;
 
-    // 7-Zone ELC Lighting (187c:0550, 0x0F01) properties
-    in-out property <int> staged-zone-group-index: 0; // 0=All, 1=Keyboard, 2=Logo, 3=Tron
+    // 7-Zone AlienFX Lighting properties
+    in-out property <int> staged-zone-group-index: 0; // 0=All, 1=Keyboard, 2=Logo, 3=Tron, 4=Power
     in-out property <int> staged-effect-index: 0;     // 0=Static, 1=Breathe, 2=Spectrum, 3=Wave, 4=Rainbow, 5=BackAndForth, 6=DefaultBlue
     in-out property <int> staged-color-preset-index: 0;
     in-out property <float> staged-lighting-duration-ms: 600;
     in-out property <float> staged-lighting-brightness: 100;
     in-out property <bool> staged-lighting-persist-boot: true;
     in-out property <bool> lighting-stealth-enabled: false;
-    in property <string> active-lighting-summary: "All Zones · Static #00F0FF · Brightness 100% · Boot Slot 0x0061";
+    in property <string> active-lighting-summary: "All Zones · Static · Brightness 100% · Saved as Boot Default";
     in property <color> zone-logo-color: #00f0ff;
     in property <color> zone-tron-color: #00f0ff;
     in property <color> zone-kbd-color: #00f0ff;
     in property <color> zone-power-color: #00f0ff;
     in property <string> elc-firmware-summary: "ELC 187c:0550 · FW 2.0.5 · Platform 0x0F01 (8 Active Zones, 7 Stored Animations)";
 
-    // Diagnostics & Write Audit Log
+    // Hardware Command Log (virtualized via ListView)
     in property <[AuditRow]> audit-rows: [];
 
     // Callbacks to Rust service controller
@@ -131,6 +135,8 @@ export component MainWindow inherits MaterialWindow {
     callback toggle-stealth-mode(bool);
     callback program-power-led-states();
     callback select-sim-scenario(int);
+    callback toggle-auto-refresh(bool);
+    callback select-refresh-interval(int);
 
     init => {
         Palette.color-scheme = ColorScheme.dark;
@@ -161,9 +167,16 @@ export component MainWindow inherits MaterialWindow {
                 {
                     icon: @image-url("icons/diagnostics.svg"),
                     selected_icon: @image-url("icons/diagnostics.svg"),
-                    text: "Audit",
+                    text: "Log",
                     show_badge: root.write-count > 0,
                     badge: root.write-count > 0 ? "\{root.write-count}" : ""
+                },
+                {
+                    icon: @image-url("icons/settings.svg"),
+                    selected_icon: @image-url("icons/settings.svg"),
+                    text: "Settings",
+                    show_badge: false,
+                    badge: ""
                 },
             ];
         }
@@ -180,7 +193,7 @@ export component MainWindow inherits MaterialWindow {
             padding: 14px;
             spacing: 10px;
 
-            // 1. Persistent Top Simulation & Hardware Header Banner
+            // 1. Persistent Top Hardware Header Banner
             Rectangle {
                 z: 100;
                 height: 50px;
@@ -223,13 +236,15 @@ export component MainWindow inherits MaterialWindow {
                             spacing: 2px;
 
                             MaterialText {
-                                text: "\{root.device-name}  ·  \{root.acpi-path}  ·  SMBIOS \{root.smbios-id}";
+                                text: root.device-name;
                                 style: MaterialTypography.title_small;
                                 color: MaterialPalette.on_surface;
                             }
 
                             MaterialText {
-                                text: "Hardware Writes Executed: \{root.write-count}  |  Active Mode: \{root.active-mode-label} (\{root.active-mode-code-label})";
+                                text: root.auto-refresh-enabled
+                                    ? "Active Profile: \{root.active-mode-label}  ·  Auto-Refresh: \{root.refresh-interval-label}  ·  Logged Commands: \{root.write-count}"
+                                    : "Active Profile: \{root.active-mode-label}  ·  Auto-Refresh: Paused  ·  Logged Commands: \{root.write-count}";
                                 style: MaterialTypography.body_small;
                                 color: MaterialPalette.on_surface_variant;
                             }
@@ -245,7 +260,7 @@ export component MainWindow inherits MaterialWindow {
                             y: floor((parent.height - self.height) / 2 / 1px) * 1px;
                             icon: @image-url("icons/refresh.svg");
                             text: "Refresh";
-                            tooltip: "Passively query mode and telemetry (0 hardware writes)";
+                            tooltip: "Passively query thermal mode and telemetry (0 hardware writes)";
                             clicked => {
                                 root.request-refresh();
                             }
@@ -258,7 +273,7 @@ export component MainWindow inherits MaterialWindow {
             HorizontalLayout {
                 z: 80;
                 spacing: 10px;
-                height: 40px;
+                height: 38px;
 
                 if root.is-simulated : SegmentedButton {
                     horizontal-stretch: 0;
@@ -266,7 +281,7 @@ export component MainWindow inherits MaterialWindow {
                     items: [
                         { icon: @image-url(""), text: "Normal" },
                         { icon: @image-url(""), text: "Rollback" },
-                        { icon: @image-url(""), text: "0xFE" },
+                        { icon: @image-url(""), text: "Unmapped" },
                         { icon: @image-url(""), text: "No Sensors" },
                     ];
                     index_changed(idx) => {
@@ -311,1122 +326,1222 @@ export component MainWindow inherits MaterialWindow {
                             text: root.lifecycle-message;
                             style: MaterialTypography.body_small;
                             color: root.lifecycle-is-error ? MaterialPalette.on_error_container : MaterialPalette.on_secondary_container;
+                            overflow: elide;
                         }
                     }
                 }
             }
 
-            // 3. Screen Body (Thermals = 0, Lighting = 1, Diagnostics = 2)
-            if root.active-nav-index == 0 : ScrollView {
+            // 3. Screen Body (Thermals = 0, Lighting = 1, Log = 2, Settings = 3)
+            if root.active-nav-index == 0 : VerticalLayout {
                 vertical-stretch: 1;
-
-                VerticalLayout {
-                    alignment: start;
-                    spacing: 8px;
-                    padding-right: 4px;
-
-                    // Section A: Thermal Profile & G-Mode (GameShift) Control Card
-                    FilledCard {
-                        z: 50;
-                        VerticalLayout {
-                            alignment: start;
-                            padding: 10px;
-                            spacing: 8px;
-
-                            HorizontalLayout {
-                                alignment: space-between;
-                                spacing: 10px;
-
-                                VerticalLayout {
-                                    alignment: center;
-                                    spacing: 2px;
-
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        alignment: start;
-
-                                        MaterialText {
-                                            text: "Thermal Profile & G-Mode";
-                                            style: MaterialTypography.title_medium;
-                                            color: MaterialPalette.on_surface;
-                                        }
-
-                                        Rectangle {
-                                            height: 22px;
-                                            width: 124px;
-                                            border-radius: 6px;
-                                            background: root.mode-is-unknown ? MaterialPalette.error_container : (root.gmode-active ? MaterialPalette.primary : MaterialPalette.primary_container);
-
-                                            MaterialText {
-                                                width: 100%;
-                                                height: 100%;
-                                                horizontal-alignment: center;
-                                                vertical-alignment: center;
-                                                text: root.active-mode-label;
-                                                style: MaterialTypography.label_medium_prominent;
-                                                color: root.mode-is-unknown ? MaterialPalette.on_error_container : (root.gmode-active ? MaterialPalette.on_primary : MaterialPalette.on_primary_container);
-                                            }
-                                        }
-                                    }
-
-                                    MaterialText {
-                                        text: root.mode-is-unknown
-                                            ? "Unmapped ACPI mode byte — explicitly distinct from Manual (0x00)."
-                                            : "Two-step G-Mode (WMAX 0x25 + 0x15 0xAB) with rollback; restores `\{root.pre-gmode-restore-label}`.";
-                                        style: MaterialTypography.body_small;
-                                        color: MaterialPalette.on_surface_variant;
-                                    }
-                                }
-
-                                // G-Mode Quick Action (explicitly sized Switch + TonalButton)
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    alignment: end;
-
-                                    Switch {
-                                        width: 52px;
-                                        height: 32px;
-                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
-                                        checked <=> root.gmode-active;
-                                        tooltip: "Toggle G-Mode (GameShift 0x25 + USTT 0xAB)";
-                                        checked_state_changed(_) => {
-                                            root.request-toggle-gmode();
-                                        }
-                                    }
-
-                                    TonalButton {
-                                        height: 36px;
-                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
-                                        icon: @image-url("icons/bolt.svg");
-                                        text: root.gmode-active ? "Exit G-Mode" : "Engage G-Mode";
-                                        clicked => {
-                                            root.request-toggle-gmode();
-                                        }
-                                    }
-                                }
-                            }
-
-                            HorizontalDivider {}
-
-                            // Supported Thermal Profile InputChips (fixed 32px height row)
-                            HorizontalLayout {
-                                height: 32px;
-                                spacing: 8px;
-                                alignment: start;
-
-                                InputChip {
-                                    enabled: true;
-                                    text: "Quiet";
-                                    checked: !root.mode-is-unknown && root.selected-mode-key == "Quiet";
-                                    clicked => { root.select-thermal-mode("Quiet"); }
-                                }
-                                InputChip {
-                                    enabled: true;
-                                    text: "Cool";
-                                    checked: !root.mode-is-unknown && root.selected-mode-key == "Cool";
-                                    clicked => { root.select-thermal-mode("Cool"); }
-                                }
-                                InputChip {
-                                    enabled: true;
-                                    text: "Balanced";
-                                    checked: !root.mode-is-unknown && root.selected-mode-key == "Balanced";
-                                    clicked => { root.select-thermal-mode("Balanced"); }
-                                }
-                                InputChip {
-                                    enabled: true;
-                                    text: "Performance";
-                                    checked: !root.mode-is-unknown && root.selected-mode-key == "Performance";
-                                    clicked => { root.select-thermal-mode("Performance"); }
-                                }
-                                InputChip {
-                                    enabled: true;
-                                    text: "Full Speed";
-                                    checked: !root.mode-is-unknown && root.selected-mode-key == "FullSpeed";
-                                    clicked => { root.select-thermal-mode("FullSpeed"); }
-                                }
-                                InputChip {
-                                    enabled: true;
-                                    text: "Manual";
-                                    checked: !root.mode-is-unknown && root.selected-mode-key == "Manual";
-                                    clicked => { root.select-thermal-mode("Manual"); }
-                                }
-                                InputChip {
-                                    enabled: true;
-                                    text: "G-Mode (0xAB)";
-                                    checked: !root.mode-is-unknown && root.selected-mode-key == "GMode";
-                                    clicked => { root.select-thermal-mode("GMode"); }
-                                }
-                            }
-                        }
-                    }
-
-                    // Section B: 2-Column Live CPU & GPU Telemetry Cards
-                    HorizontalLayout {
-                        spacing: 10px;
-
-                        // CPU Telemetry + Turbo + TCC Offset Card
-                        ElevatedCard {
-                            horizontal-stretch: 1;
-
-                            VerticalLayout {
-                                alignment: start;
-                                padding: 10px;
-                                spacing: 6px;
-
-                                HorizontalLayout {
-                                    alignment: space-between;
-
-                                    MaterialText {
-                                        text: "CPU Telemetry, Turbo & TCC (0x32)";
-                                        style: MaterialTypography.title_small;
-                                        color: MaterialPalette.on_surface;
-                                    }
-
-                                    Rectangle {
-                                        height: 20px;
-                                        width: 92px;
-                                        border-radius: 4px;
-                                        background: root.sensors-available ? MaterialPalette.secondary_container : MaterialPalette.error_container;
-
-                                        MaterialText {
-                                            width: 100%;
-                                            height: 100%;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                            text: root.sensors-available ? "SENSOR LIVE" : "UNAVAILABLE";
-                                            style: MaterialTypography.label_small;
-                                            color: root.sensors-available ? MaterialPalette.on_secondary_container : MaterialPalette.on_error_container;
-                                        }
-                                    }
-                                }
-
-                                HorizontalLayout {
-                                    spacing: 8px;
-
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        MaterialText {
-                                            text: "Core Temp";
-                                            style: MaterialTypography.label_medium;
-                                            color: MaterialPalette.on_surface_variant;
-                                        }
-                                        MaterialText {
-                                            text: root.cpu-temp-text;
-                                            style: MaterialTypography.title_large;
-                                            color: MaterialPalette.on_surface;
-                                        }
-                                    }
-
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        MaterialText {
-                                            text: "Fan Speed";
-                                            style: MaterialTypography.label_medium;
-                                            color: MaterialPalette.on_surface_variant;
-                                        }
-                                        MaterialText {
-                                            text: root.cpu-rpm-text;
-                                            style: MaterialTypography.title_large;
-                                            color: MaterialPalette.on_surface;
-                                        }
-                                    }
-
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        MaterialText {
-                                            text: "Boost";
-                                            style: MaterialTypography.label_medium;
-                                            color: MaterialPalette.on_surface_variant;
-                                        }
-                                        MaterialText {
-                                            text: root.cpu-boost-text;
-                                            style: MaterialTypography.title_large;
-                                            color: MaterialPalette.primary;
-                                        }
-                                    }
-
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        MaterialText {
-                                            text: "TCC Offset";
-                                            style: MaterialTypography.label_medium;
-                                            color: MaterialPalette.on_surface_variant;
-                                        }
-                                        MaterialText {
-                                            text: root.tcc-offset-text;
-                                            style: MaterialTypography.title_large;
-                                            color: MaterialPalette.tertiary;
-                                        }
-                                    }
-                                }
-
-                                LinearProgressIndicator {
-                                    progress: root.cpu-boost-progress;
-                                    indeterminate: false;
-                                }
-
-                                HorizontalLayout {
-                                    height: 32px;
-                                    alignment: space-between;
-
-                                    MaterialText {
-                                        vertical-alignment: center;
-                                        text: "CPU Turbo Boost (intel_pstate)";
-                                        style: MaterialTypography.body_small;
-                                        color: MaterialPalette.on_surface_variant;
-                                    }
-
-                                    Switch {
-                                        width: 52px;
-                                        height: 32px;
-                                        checked <=> root.cpu-turbo-enabled;
-                                        checked_state_changed(enabled) => {
-                                            root.toggle-cpu-turbo(enabled);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // GPU Telemetry + CPU TCC Offset Staged Control Card
-                        ElevatedCard {
-                            horizontal-stretch: 1;
-
-                            VerticalLayout {
-                                alignment: start;
-                                padding: 10px;
-                                spacing: 6px;
-
-                                HorizontalLayout {
-                                    alignment: space-between;
-
-                                    MaterialText {
-                                        text: "GPU Telemetry (0x33) & CPU TjMax Cap";
-                                        style: MaterialTypography.title_small;
-                                        color: MaterialPalette.on_surface;
-                                    }
-
-                                    Rectangle {
-                                        height: 20px;
-                                        width: 92px;
-                                        border-radius: 4px;
-                                        background: root.sensors-available ? MaterialPalette.secondary_container : MaterialPalette.error_container;
-
-                                        MaterialText {
-                                            width: 100%;
-                                            height: 100%;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                            text: root.sensors-available ? "SENSOR LIVE" : "UNAVAILABLE";
-                                            style: MaterialTypography.label_small;
-                                            color: root.sensors-available ? MaterialPalette.on_secondary_container : MaterialPalette.on_error_container;
-                                        }
-                                    }
-                                }
-
-                                HorizontalLayout {
-                                    spacing: 8px;
-
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        MaterialText {
-                                            text: "Core Temp";
-                                            style: MaterialTypography.label_medium;
-                                            color: MaterialPalette.on_surface_variant;
-                                        }
-                                        MaterialText {
-                                            text: root.gpu-temp-text;
-                                            style: MaterialTypography.title_large;
-                                            color: MaterialPalette.on_surface;
-                                        }
-                                    }
-
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        MaterialText {
-                                            text: "Fan Speed";
-                                            style: MaterialTypography.label_medium;
-                                            color: MaterialPalette.on_surface_variant;
-                                        }
-                                        MaterialText {
-                                            text: root.gpu-rpm-text;
-                                            style: MaterialTypography.title_large;
-                                            color: MaterialPalette.on_surface;
-                                        }
-                                    }
-
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        MaterialText {
-                                            text: "Boost";
-                                            style: MaterialTypography.label_medium;
-                                            color: MaterialPalette.on_surface_variant;
-                                        }
-                                        MaterialText {
-                                            text: root.gpu-boost-text;
-                                            style: MaterialTypography.title_large;
-                                            color: MaterialPalette.primary;
-                                        }
-                                    }
-                                }
-
-                                LinearProgressIndicator {
-                                    progress: root.gpu-boost-progress;
-                                    indeterminate: false;
-                                }
-
-                                // Staged CPU TCC Offset (0..15°C) slider + Apply button
-                                HorizontalLayout {
-                                    height: 34px;
-                                    spacing: 8px;
-                                    alignment: space-between;
-
-                                    MaterialText {
-                                        vertical-alignment: center;
-                                        text: "TCC Offset: \{round(root.staged-tcc-offset)}°C (Cap \{100 - round(root.staged-tcc-offset)}°C)";
-                                        style: MaterialTypography.body_small;
-                                        color: MaterialPalette.on_surface_variant;
-                                    }
-
-                                    Slider {
-                                        horizontal-stretch: 1;
-                                        height: 30px;
-                                        minimum: 0;
-                                        maximum: 15;
-                                        value <=> root.staged-tcc-offset;
-                                        value_changed(v) => {
-                                            root.stage-tcc-offset(v);
-                                        }
-                                    }
-
-                                    TonalButton {
-                                        height: 34px;
-                                        text: "Set TCC";
-                                        clicked => {
-                                            root.apply-staged-tcc();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Section C & D: 2-Column Side-by-Side Manual Fan Boost & Custom Fan Curve Cards
-                    HorizontalLayout {
-                        spacing: 10px;
-
-                        // Left Column: Staged Manual Fan Boost Override Card
-                        OutlinedCard {
-                            horizontal-stretch: 1;
-
-                            VerticalLayout {
-                                alignment: space-between;
-                                padding: 10px;
-                                spacing: 4px;
-
-                                HorizontalLayout {
-                                    alignment: space-between;
-                                    spacing: 8px;
-
-                                    MaterialText {
-                                        vertical-alignment: center;
-                                        text: "Staged Manual Fan Boost";
-                                        style: MaterialTypography.title_small;
-                                        color: MaterialPalette.on_surface;
-                                    }
-
-                                    Rectangle {
-                                        height: 20px;
-                                        width: 122px;
-                                        border-radius: 4px;
-                                        background: root.boost-dirty ? MaterialPalette.tertiary_container : MaterialPalette.surface_container_highest;
-
-                                        MaterialText {
-                                            width: 100%;
-                                            height: 100%;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                            text: root.boost-dirty ? "UNSAVED CHANGES" : "IN SYNC WITH HW";
-                                            style: MaterialTypography.label_small;
-                                            color: root.boost-dirty ? MaterialPalette.on_tertiary_container : MaterialPalette.on_surface_variant;
-                                        }
-                                    }
-                                }
-
-                                MaterialText {
-                                    text: "Stage locally (0 writes); Apply switches to Manual (0x00).";
-                                    style: MaterialTypography.body_small;
-                                    color: MaterialPalette.on_surface_variant;
-                                    overflow: elide;
-                                }
-
-                                VerticalLayout {
-                                    spacing: 2px;
-
-                                    HorizontalLayout {
-                                        alignment: space-between;
-                                        MaterialText {
-                                            text: "CPU Fan Boost (0x32)";
-                                            style: MaterialTypography.label_medium;
-                                            color: MaterialPalette.on_surface;
-                                        }
-                                        MaterialText {
-                                            text: "\{round(root.staged-cpu-boost)}% (HW: \{root.cpu-boost-text})";
-                                            style: MaterialTypography.label_medium;
-                                            color: MaterialPalette.primary;
-                                        }
-                                    }
-
-                                    Slider {
-                                        height: 24px;
-                                        enabled: true;
-                                        minimum: 0;
-                                        maximum: 100;
-                                        value <=> root.staged-cpu-boost;
-                                        value_changed(v) => {
-                                            root.stage-cpu-boost(v);
-                                        }
-                                    }
-                                }
-
-                                VerticalLayout {
-                                    spacing: 2px;
-
-                                    HorizontalLayout {
-                                        alignment: space-between;
-                                        MaterialText {
-                                            text: "GPU Fan Boost (0x33)";
-                                            style: MaterialTypography.label_medium;
-                                            color: MaterialPalette.on_surface;
-                                        }
-                                        MaterialText {
-                                            text: "\{round(root.staged-gpu-boost)}% (HW: \{root.gpu-boost-text})";
-                                            style: MaterialTypography.label_medium;
-                                            color: MaterialPalette.primary;
-                                        }
-                                    }
-
-                                    Slider {
-                                        height: 24px;
-                                        enabled: true;
-                                        minimum: 0;
-                                        maximum: 100;
-                                        value <=> root.staged-gpu-boost;
-                                        value_changed(v) => {
-                                            root.stage-gpu-boost(v);
-                                        }
-                                    }
-                                }
-
-                                HorizontalLayout {
-                                    height: 36px;
-                                    spacing: 8px;
-                                    alignment: end;
-
-                                    OutlineButton {
-                                        height: 36px;
-                                        text: "Reset";
-                                        enabled: root.boost-dirty;
-                                        clicked => {
-                                            root.reset-staged-boost();
-                                        }
-                                    }
-
-                                    FilledButton {
-                                        height: 36px;
-                                        text: "Apply Boost";
-                                        enabled: true;
-                                        clicked => {
-                                            root.apply-staged-boost();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Right Column: Custom 4-Point Temperature-to-Fan-Boost Curve Editor
-                        OutlinedCard {
-                            horizontal-stretch: 1;
-
-                            VerticalLayout {
-                                alignment: space-between;
-                                padding: 10px;
-                                spacing: 4px;
-
-                                HorizontalLayout {
-                                    alignment: space-between;
-                                    spacing: 8px;
-
-                                    MaterialText {
-                                        vertical-alignment: center;
-                                        text: "Custom Fan Curve";
-                                        style: MaterialTypography.title_small;
-                                        color: MaterialPalette.on_surface;
-                                    }
-
-                                    Rectangle {
-                                        height: 20px;
-                                        width: 112px;
-                                        border-radius: 4px;
-                                        background: root.fan-curve-active ? MaterialPalette.primary_container : MaterialPalette.surface_container_highest;
-
-                                        MaterialText {
-                                            width: 100%;
-                                            height: 100%;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                            text: root.fan-curve-active ? "CURVE ACTIVE" : "CURVE STOPPED";
-                                            style: MaterialTypography.label_small;
-                                            color: root.fan-curve-active ? MaterialPalette.on_primary_container : MaterialPalette.on_surface_variant;
-                                        }
-                                    }
-                                }
-
-                                MaterialText {
-                                    text: "4-point linear (45–85°C, \{round(root.staged-curve-hysteresis)}°C hyst.) · Drag points vertically";
-                                    style: MaterialTypography.body_small;
-                                    color: MaterialPalette.on_surface_variant;
-                                    overflow: elide;
-                                }
-
-                                FanCurveEditor {
-                                    horizontal-stretch: 1;
-                                    vertical-stretch: 1;
-                                    p45 <=> root.staged-curve-p1;
-                                    p60 <=> root.staged-curve-p2;
-                                    p75 <=> root.staged-curve-p3;
-                                    p85 <=> root.staged-curve-p4;
-                                    accent: MaterialPalette.primary;
-                                    surface: MaterialPalette.surface;
-                                    secondary-text: MaterialPalette.on_surface_variant;
-                                    grid-color: MaterialPalette.outline_variant;
-
-                                    edit-finished => {
-                                        root.stage-fan-curve(
-                                            self.p45,
-                                            self.p60,
-                                            self.p75,
-                                            self.p85
-                                        );
-                                    }
-                                }
-
-                                HorizontalLayout {
-                                    height: 36px;
-                                    spacing: 8px;
-                                    alignment: end;
-
-                                    OutlineButton {
-                                        height: 36px;
-                                        text: "Stop Curve";
-                                        enabled: root.fan-curve-active;
-                                        clicked => {
-                                            root.stop-fan-curve();
-                                        }
-                                    }
-
-                                    FilledButton {
-                                        height: 36px;
-                                        text: "Apply Curve";
-                                        clicked => {
-                                            root.apply-fan-curve();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Screen 1: Interactive 7-Zone AlienFX Lighting & Chassis Map (187c:0550, 0x0F01)
-            if root.active-nav-index == 1 : ScrollView {
-                vertical-stretch: 1;
-
-                VerticalLayout {
-                    alignment: start;
-                    spacing: 10px;
-                    padding-right: 4px;
-
-                    // Section A: Interactive 7-Zone Alienware m15 R6 Chassis & 4-Zone Keyboard Map
-                    FilledCard {
-                        VerticalLayout {
-                            alignment: start;
-                            padding: 12px;
+                spacing: 8px;
+
+                // Section A: Thermal Profile & G-Mode (GameShift) Control Card
+                FilledCard {
+                    z: 50;
+                    VerticalLayout {
+                        alignment: start;
+                        padding: 10px;
+                        spacing: 8px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
                             spacing: 10px;
 
-                            HorizontalLayout {
-                                alignment: space-between;
-                                spacing: 10px;
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
 
-                                VerticalLayout {
-                                    spacing: 2px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+
                                     MaterialText {
-                                        text: "AlienFX 7-Zone Chassis & 4-Zone Keyboard Map (ELC 187c:0550 · 0x0F01)";
+                                        text: "Thermal Profile & G-Mode";
                                         style: MaterialTypography.title_medium;
                                         color: MaterialPalette.on_surface;
                                     }
-                                    MaterialText {
-                                        text: root.active-lighting-summary;
-                                        style: MaterialTypography.body_small;
-                                        color: MaterialPalette.on_surface_variant;
+
+                                    Rectangle {
+                                        height: 22px;
+                                        width: 124px;
+                                        border-radius: 6px;
+                                        background: root.mode-is-unknown ? MaterialPalette.error_container : (root.gmode-active ? MaterialPalette.primary : MaterialPalette.primary_container);
+
+                                        MaterialText {
+                                            width: 100%;
+                                            height: 100%;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            text: root.active-mode-label;
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: root.mode-is-unknown ? MaterialPalette.on_error_container : (root.gmode-active ? MaterialPalette.on_primary : MaterialPalette.on_primary_container);
+                                        }
                                     }
                                 }
 
+                                MaterialText {
+                                    text: root.mode-is-unknown
+                                        ? "Unrecognized thermal profile reported by firmware — distinct from Manual mode."
+                                        : "G-Mode engages maximum fan speed and power limits; exiting restores \{root.pre-gmode-restore-label}.";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                    overflow: elide;
+                                }
+                            }
+
+                            // G-Mode Quick Action (explicitly sized Switch + TonalButton)
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: end;
+
+                                Switch {
+                                    width: 52px;
+                                    height: 32px;
+                                    y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                    checked <=> root.gmode-active;
+                                    tooltip: "Toggle G-Mode (GameShift)";
+                                    checked_state_changed(_) => {
+                                        root.request-toggle-gmode();
+                                    }
+                                }
+
+                                TonalButton {
+                                    height: 36px;
+                                    y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                    icon: @image-url("icons/bolt.svg");
+                                    text: root.gmode-active ? "Exit G-Mode" : "Engage G-Mode";
+                                    clicked => {
+                                        root.request-toggle-gmode();
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalDivider {}
+
+                        // Supported Thermal Profile InputChips (fixed 32px height row)
+                        HorizontalLayout {
+                            height: 32px;
+                            spacing: 8px;
+                            alignment: start;
+
+                            InputChip {
+                                enabled: true;
+                                text: "Quiet";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "Quiet";
+                                clicked => { root.select-thermal-mode("Quiet"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "Cool";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "Cool";
+                                clicked => { root.select-thermal-mode("Cool"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "Balanced";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "Balanced";
+                                clicked => { root.select-thermal-mode("Balanced"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "Performance";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "Performance";
+                                clicked => { root.select-thermal-mode("Performance"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "Full Speed";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "FullSpeed";
+                                clicked => { root.select-thermal-mode("FullSpeed"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "Manual";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "Manual";
+                                clicked => { root.select-thermal-mode("Manual"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "G-Mode";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "GMode";
+                                clicked => { root.select-thermal-mode("GMode"); }
+                            }
+                        }
+                    }
+                }
+
+                // Section B: 2-Column Live CPU & GPU Telemetry Cards
+                HorizontalLayout {
+                    spacing: 10px;
+
+                    // CPU Telemetry & Turbo Card
+                    ElevatedCard {
+                        horizontal-stretch: 1;
+
+                        VerticalLayout {
+                            alignment: start;
+                            padding: 10px;
+                            spacing: 6px;
+
+                            HorizontalLayout {
+                                alignment: space-between;
+
+                                MaterialText {
+                                    text: "CPU Telemetry & Turbo Boost";
+                                    style: MaterialTypography.title_small;
+                                    color: MaterialPalette.on_surface;
+                                }
+
                                 Rectangle {
-                                    height: 24px;
-                                    width: 136px;
-                                    border-radius: 6px;
-                                    background: root.lighting-stealth-enabled ? MaterialPalette.error_container : MaterialPalette.primary_container;
+                                    height: 20px;
+                                    width: 92px;
+                                    border-radius: 4px;
+                                    background: root.sensors-available ? MaterialPalette.secondary_container : MaterialPalette.error_container;
 
                                     MaterialText {
                                         width: 100%;
                                         height: 100%;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
-                                        text: root.lighting-stealth-enabled ? "STEALTH (DARK)" : "ELC 2.0 ACTIVE";
-                                        style: MaterialTypography.label_medium_prominent;
-                                        color: root.lighting-stealth-enabled ? MaterialPalette.on_error_container : MaterialPalette.on_primary_container;
+                                        text: root.sensors-available ? "SENSOR LIVE" : "UNAVAILABLE";
+                                        style: MaterialTypography.label_small;
+                                        color: root.sensors-available ? MaterialPalette.on_secondary_container : MaterialPalette.on_error_container;
                                     }
                                 }
                             }
 
-                            // Visual Chassis Zone Map: Top Row (Stadium Top 0x00, Alienhead Logo 0x03, Stadium Bottom 0x01, Power LED 0x02)
                             HorizontalLayout {
                                 spacing: 8px;
-                                height: 48px;
 
-                                Rectangle {
+                                VerticalLayout {
                                     horizontal-stretch: 1;
-                                    border-radius: 8px;
-                                    background: MaterialPalette.surface_container_highest;
-                                    border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 3 ? 2px : 1px;
-                                    border-color: root.zone-tron-color;
-
-                                    HorizontalLayout {
-                                        padding-left: 10px;
-                                        padding-right: 10px;
-                                        spacing: 8px;
-                                        Rectangle {
-                                            width: 14px;
-                                            height: 14px;
-                                            y: floor((parent.height - self.height) / 2 / 1px) * 1px;
-                                            border-radius: 7px;
-                                            background: root.zone-tron-color;
-                                        }
-                                        MaterialText {
-                                            vertical-alignment: center;
-                                            text: "Stadium Top (0x00)";
-                                            style: MaterialTypography.label_medium_prominent;
-                                            color: MaterialPalette.on_surface;
-                                        }
+                                    MaterialText {
+                                        text: "Core Temp";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.cpu-temp-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.on_surface;
                                     }
                                 }
 
-                                Rectangle {
+                                VerticalLayout {
                                     horizontal-stretch: 1;
-                                    border-radius: 8px;
-                                    background: MaterialPalette.surface_container_highest;
-                                    border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 2 ? 2px : 1px;
-                                    border-color: root.zone-logo-color;
-
-                                    HorizontalLayout {
-                                        padding-left: 10px;
-                                        padding-right: 10px;
-                                        spacing: 8px;
-                                        Rectangle {
-                                            width: 14px;
-                                            height: 14px;
-                                            y: floor((parent.height - self.height) / 2 / 1px) * 1px;
-                                            border-radius: 7px;
-                                            background: root.zone-logo-color;
-                                        }
-                                        MaterialText {
-                                            vertical-alignment: center;
-                                            text: "Alienhead Logo (0x03)";
-                                            style: MaterialTypography.label_medium_prominent;
-                                            color: MaterialPalette.on_surface;
-                                        }
+                                    MaterialText {
+                                        text: "Fan Speed";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.cpu-rpm-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.on_surface;
                                     }
                                 }
 
-                                Rectangle {
+                                VerticalLayout {
                                     horizontal-stretch: 1;
-                                    border-radius: 8px;
-                                    background: MaterialPalette.surface_container_highest;
-                                    border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 3 ? 2px : 1px;
-                                    border-color: root.zone-tron-color;
-
-                                    HorizontalLayout {
-                                        padding-left: 10px;
-                                        padding-right: 10px;
-                                        spacing: 8px;
-                                        Rectangle {
-                                            width: 14px;
-                                            height: 14px;
-                                            y: floor((parent.height - self.height) / 2 / 1px) * 1px;
-                                            border-radius: 7px;
-                                            background: root.zone-tron-color;
-                                        }
-                                        MaterialText {
-                                            vertical-alignment: center;
-                                            text: "Stadium Bottom (0x01)";
-                                            style: MaterialTypography.label_medium_prominent;
-                                            color: MaterialPalette.on_surface;
-                                        }
+                                    MaterialText {
+                                        text: "Boost";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.cpu-boost-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.primary;
                                     }
                                 }
 
-                                Rectangle {
+                                VerticalLayout {
                                     horizontal-stretch: 1;
-                                    border-radius: 8px;
-                                    background: MaterialPalette.surface_container_highest;
-                                    border-width: root.staged-zone-group-index == 4 ? 2px : 1px;
-                                    border-color: root.zone-power-color;
-
-                                    HorizontalLayout {
-                                        padding-left: 10px;
-                                        padding-right: 10px;
-                                        spacing: 8px;
-                                        Rectangle {
-                                            width: 14px;
-                                            height: 14px;
-                                            y: floor((parent.height - self.height) / 2 / 1px) * 1px;
-                                            border-radius: 7px;
-                                            background: root.zone-power-color;
-                                        }
-                                        MaterialText {
-                                            vertical-alignment: center;
-                                            text: "Power LED (0x02 · 0x5B..60)";
-                                            style: MaterialTypography.label_medium_prominent;
-                                            color: MaterialPalette.on_surface;
-                                        }
+                                    MaterialText {
+                                        text: "TCC Offset";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.tcc-offset-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.tertiary;
                                     }
                                 }
                             }
 
-                            // Visual 4-Zone Keyboard Map (KB Left 0x04, Center-Left 0x05, Center-Right 0x06, Right 0x07)
+                            LinearProgressIndicator {
+                                progress: root.cpu-boost-progress;
+                                indeterminate: false;
+                            }
+
                             HorizontalLayout {
-                                spacing: 8px;
-                                height: 52px;
+                                height: 34px;
+                                alignment: space-between;
 
-                                for zone_label in [
-                                    "KB Left (0x04)",
-                                    "KB Center-Left (0x05)",
-                                    "KB Center-Right (0x06)",
-                                    "KB Right (0x07)"
-                                ] : Rectangle {
-                                    horizontal-stretch: 1;
-                                    border-radius: 8px;
-                                    background: MaterialPalette.surface_container_high;
-                                    border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 1 ? 2px : 1px;
-                                    border-color: root.zone-kbd-color;
+                                MaterialText {
+                                    vertical-alignment: center;
+                                    text: "CPU Turbo Boost";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
 
-                                    HorizontalLayout {
-                                        padding-left: 10px;
-                                        padding-right: 10px;
-                                        spacing: 8px;
-                                        Rectangle {
-                                            width: 12px;
-                                            height: 24px;
-                                            y: floor((parent.height - self.height) / 2 / 1px) * 1px;
-                                            border-radius: 4px;
-                                            background: root.zone-kbd-color;
-                                        }
-                                        MaterialText {
-                                            vertical-alignment: center;
-                                            text: zone_label;
-                                            style: MaterialTypography.label_medium_prominent;
-                                            color: MaterialPalette.on_surface;
-                                        }
+                                Switch {
+                                    width: 52px;
+                                    height: 32px;
+                                    y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                    checked <=> root.cpu-turbo-enabled;
+                                    checked_state_changed(enabled) => {
+                                        root.toggle-cpu-turbo(enabled);
                                     }
                                 }
                             }
                         }
                     }
 
-                    // Section B: Zone Group, Effect Mode, Color Swatch, Tempo & Persistence Controls
+                    // GPU Telemetry + CPU TCC Offset Staged Control Card
                     ElevatedCard {
+                        horizontal-stretch: 1;
+
                         VerticalLayout {
                             alignment: start;
-                            padding: 12px;
-                            spacing: 10px;
+                            padding: 10px;
+                            spacing: 6px;
 
-                            // Row 1: Target Zone Group
                             HorizontalLayout {
-                                spacing: 8px;
-                                height: 32px;
-                                alignment: start;
-
-                                MaterialText {
-                                    width: 110px;
-                                    vertical-alignment: center;
-                                    text: "Target Zones:";
-                                    style: MaterialTypography.label_large;
-                                    color: MaterialPalette.on_surface;
-                                }
-
-                                InputChip {
-                                    text: "All Zones (7)";
-                                    checked: root.staged-zone-group-index == 0;
-                                    clicked => { root.staged-zone-group-index = 0; }
-                                }
-                                InputChip {
-                                    text: "Keyboard (0x04..0x07)";
-                                    checked: root.staged-zone-group-index == 1;
-                                    clicked => { root.staged-zone-group-index = 1; }
-                                }
-                                InputChip {
-                                    text: "Alienhead Logo (0x03)";
-                                    checked: root.staged-zone-group-index == 2;
-                                    clicked => { root.staged-zone-group-index = 2; }
-                                }
-                                InputChip {
-                                    text: "Stadium / Tron (0x00, 0x01)";
-                                    checked: root.staged-zone-group-index == 3;
-                                    clicked => { root.staged-zone-group-index = 3; }
-                                }
-                                InputChip {
-                                    text: "Power LED (0x02)";
-                                    checked: root.staged-zone-group-index == 4;
-                                    clicked => { root.staged-zone-group-index = 4; }
-                                }
-                            }
-
-                            // Row 2: Effect Mode
-                            HorizontalLayout {
-                                spacing: 8px;
-                                height: 32px;
-                                alignment: start;
-
-                                MaterialText {
-                                    width: 110px;
-                                    vertical-alignment: center;
-                                    text: "Effect Mode:";
-                                    style: MaterialTypography.label_large;
-                                    color: MaterialPalette.on_surface;
-                                }
-
-                                InputChip {
-                                    text: "Static";
-                                    checked: root.staged-effect-index == 0;
-                                    clicked => { root.staged-effect-index = 0; }
-                                }
-                                InputChip {
-                                    text: "Breathe";
-                                    checked: root.staged-effect-index == 1;
-                                    clicked => { root.staged-effect-index = 1; }
-                                }
-                                InputChip {
-                                    text: "Spectrum";
-                                    checked: root.staged-effect-index == 2;
-                                    clicked => { root.staged-effect-index = 2; }
-                                }
-                                InputChip {
-                                    text: "Wave";
-                                    checked: root.staged-effect-index == 3;
-                                    clicked => { root.staged-effect-index = 3; }
-                                }
-                                InputChip {
-                                    text: "Rainbow";
-                                    checked: root.staged-effect-index == 4;
-                                    clicked => { root.staged-effect-index = 4; }
-                                }
-                                InputChip {
-                                    text: "Back & Forth";
-                                    checked: root.staged-effect-index == 5;
-                                    clicked => { root.staged-effect-index = 5; }
-                                }
-                                InputChip {
-                                    text: "Default Blue";
-                                    checked: root.staged-effect-index == 6;
-                                    clicked => { root.staged-effect-index = 6; }
-                                }
-                            }
-
-                            // Row 3: Color Presets
-                            HorizontalLayout {
-                                spacing: 8px;
-                                height: 32px;
-                                alignment: start;
-
-                                MaterialText {
-                                    width: 110px;
-                                    vertical-alignment: center;
-                                    text: "Color Swatch:";
-                                    style: MaterialTypography.label_large;
-                                    color: MaterialPalette.on_surface;
-                                }
-
-                                InputChip {
-                                    text: "Alien Cyan";
-                                    checked: root.staged-color-preset-index == 0;
-                                    clicked => { root.staged-color-preset-index = 0; }
-                                }
-                                InputChip {
-                                    text: "Nebula Purple";
-                                    checked: root.staged-color-preset-index == 1;
-                                    clicked => { root.staged-color-preset-index = 1; }
-                                }
-                                InputChip {
-                                    text: "Plasma Green";
-                                    checked: root.staged-color-preset-index == 2;
-                                    clicked => { root.staged-color-preset-index = 2; }
-                                }
-                                InputChip {
-                                    text: "Solar Amber";
-                                    checked: root.staged-color-preset-index == 3;
-                                    clicked => { root.staged-color-preset-index = 3; }
-                                }
-                                InputChip {
-                                    text: "Crimson Red";
-                                    checked: root.staged-color-preset-index == 4;
-                                    clicked => { root.staged-color-preset-index = 4; }
-                                }
-                                InputChip {
-                                    text: "Pure White";
-                                    checked: root.staged-color-preset-index == 5;
-                                    clicked => { root.staged-color-preset-index = 5; }
-                                }
-                            }
-
-                            HorizontalDivider {}
-
-                            // Row 4: Effect Speed (Tempo / Duration ms) + ELC Hardware Brightness (0..100%)
-                            HorizontalLayout {
-                                spacing: 16px;
-
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    spacing: 4px;
-
-                                    HorizontalLayout {
-                                        alignment: space-between;
-                                        MaterialText {
-                                            text: "Animation Speed / Duration (0x24 AddAction)";
-                                            style: MaterialTypography.label_large;
-                                            color: MaterialPalette.on_surface;
-                                        }
-                                        MaterialText {
-                                            text: "\{round(root.staged-lighting-duration-ms)} ms";
-                                            style: MaterialTypography.label_large;
-                                            color: MaterialPalette.primary;
-                                        }
-                                    }
-
-                                    Slider {
-                                        height: 30px;
-                                        minimum: 100;
-                                        maximum: 3000;
-                                        value <=> root.staged-lighting-duration-ms;
-                                    }
-                                }
-
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    spacing: 4px;
-
-                                    HorizontalLayout {
-                                        alignment: space-between;
-                                        MaterialText {
-                                            text: "ELC Brightness (0x26 SetDim)";
-                                            style: MaterialTypography.label_large;
-                                            color: MaterialPalette.on_surface;
-                                        }
-                                        MaterialText {
-                                            text: "\{round(root.staged-lighting-brightness)}%";
-                                            style: MaterialTypography.label_large;
-                                            color: MaterialPalette.primary;
-                                        }
-                                    }
-
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        Slider {
-                                            horizontal-stretch: 1;
-                                            height: 30px;
-                                            minimum: 0;
-                                            maximum: 100;
-                                            value <=> root.staged-lighting-brightness;
-                                        }
-                                        TonalButton {
-                                            height: 32px;
-                                            text: "Set Dim";
-                                            clicked => {
-                                                root.apply-staged-brightness();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            HorizontalDivider {}
-
-                            // Row 5: Stealth Toggle, Boot Slot 0x0061 Persistence, Power Button Slots & Apply Button
-                            HorizontalLayout {
-                                height: 36px;
                                 alignment: space-between;
-                                spacing: 12px;
+
+                                MaterialText {
+                                    text: "GPU Telemetry & CPU Temp Limit";
+                                    style: MaterialTypography.title_small;
+                                    color: MaterialPalette.on_surface;
+                                }
+
+                                Rectangle {
+                                    height: 20px;
+                                    width: 92px;
+                                    border-radius: 4px;
+                                    background: root.sensors-available ? MaterialPalette.secondary_container : MaterialPalette.error_container;
+
+                                    MaterialText {
+                                        width: 100%;
+                                        height: 100%;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        text: root.sensors-available ? "SENSOR LIVE" : "UNAVAILABLE";
+                                        style: MaterialTypography.label_small;
+                                        color: root.sensors-available ? MaterialPalette.on_secondary_container : MaterialPalette.on_error_container;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    MaterialText {
+                                        text: "Core Temp";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.gpu-temp-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    MaterialText {
+                                        text: "Fan Speed";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.gpu-rpm-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    MaterialText {
+                                        text: "Boost";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.gpu-boost-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.primary;
+                                    }
+                                }
+                            }
+
+                            LinearProgressIndicator {
+                                progress: root.gpu-boost-progress;
+                                indeterminate: false;
+                            }
+
+                            // Staged CPU TCC Offset (0..15°C) slider + Apply button
+                            HorizontalLayout {
+                                height: 34px;
+                                spacing: 8px;
+
+                                MaterialText {
+                                    vertical-alignment: center;
+                                    text: "TCC Limit: \{100 - round(root.staged-tcc-offset)}°C (-\{round(root.staged-tcc-offset)}°C)";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+
+                                Slider {
+                                    horizontal-stretch: 1;
+                                    min-width: 90px;
+                                    height: 28px;
+                                    y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                    enabled: true;
+                                    minimum: 0;
+                                    maximum: 15;
+                                    value <=> root.staged-tcc-offset;
+                                    value_changed(v) => {
+                                        root.stage-tcc-offset(v);
+                                    }
+                                }
+
+                                TonalButton {
+                                    height: 34px;
+                                    text: "Set Limit";
+                                    clicked => {
+                                        root.apply-staged-tcc();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Section C & D: 2-Column Side-by-Side Manual Fan Boost & Custom Fan Curve Cards
+                HorizontalLayout {
+                    vertical-stretch: 1;
+                    spacing: 10px;
+
+                    // Left Column: Staged Manual Fan Boost Override Card
+                    OutlinedCard {
+                        horizontal-stretch: 1;
+
+                        VerticalLayout {
+                            alignment: space-between;
+                            padding: 10px;
+                            spacing: 4px;
+
+                            HorizontalLayout {
+                                alignment: space-between;
+                                spacing: 8px;
+
+                                MaterialText {
+                                    vertical-alignment: center;
+                                    text: "Staged Manual Fan Boost";
+                                    style: MaterialTypography.title_small;
+                                    color: MaterialPalette.on_surface;
+                                }
+
+                                Rectangle {
+                                    height: 20px;
+                                    width: 122px;
+                                    border-radius: 4px;
+                                    background: root.boost-dirty ? MaterialPalette.tertiary_container : MaterialPalette.surface_container_highest;
+
+                                    MaterialText {
+                                        width: 100%;
+                                        height: 100%;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        text: root.boost-dirty ? "UNSAVED CHANGES" : "IN SYNC WITH HW";
+                                        style: MaterialTypography.label_small;
+                                        color: root.boost-dirty ? MaterialPalette.on_tertiary_container : MaterialPalette.on_surface_variant;
+                                    }
+                                }
+                            }
+
+                            MaterialText {
+                                text: "Adjust sliders to stage fan speed; click Apply Boost to activate Manual mode.";
+                                style: MaterialTypography.body_small;
+                                color: MaterialPalette.on_surface_variant;
+                                overflow: elide;
+                            }
+
+                            VerticalLayout {
+                                spacing: 2px;
 
                                 HorizontalLayout {
-                                    spacing: 14px;
-                                    alignment: start;
-
-                                    HorizontalLayout {
-                                        spacing: 6px;
-                                        Switch {
-                                            width: 52px;
-                                            height: 32px;
-                                            y: floor((parent.height - self.height) / 2 / 1px) * 1px;
-                                            checked <=> root.lighting-stealth-enabled;
-                                            checked_state_changed(v) => {
-                                                root.toggle-stealth-mode(v);
-                                            }
-                                        }
-                                        MaterialText {
-                                            vertical-alignment: center;
-                                            text: "Stealth (Go Dark)";
-                                            style: MaterialTypography.body_small;
-                                            color: MaterialPalette.on_surface;
-                                        }
+                                    alignment: space-between;
+                                    MaterialText {
+                                        text: "CPU Fan Boost";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface;
                                     }
+                                    MaterialText {
+                                        text: "\{round(root.staged-cpu-boost)}% (Current: \{root.cpu-boost-text})";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.primary;
+                                    }
+                                }
 
-                                    HorizontalLayout {
-                                        spacing: 6px;
-                                        Switch {
-                                            width: 52px;
-                                            height: 32px;
-                                            y: floor((parent.height - self.height) / 2 / 1px) * 1px;
-                                            checked <=> root.staged-lighting-persist-boot;
-                                        }
-                                        MaterialText {
-                                            vertical-alignment: center;
-                                            text: root.staged-lighting-persist-boot
-                                                ? "Persist Boot Slot 0x0061"
-                                                : "Volatile Session (0x27 / Slot 0)";
-                                            style: MaterialTypography.body_small;
-                                            color: MaterialPalette.on_surface_variant;
-                                        }
+                                Slider {
+                                    height: 24px;
+                                    enabled: true;
+                                    minimum: 0;
+                                    maximum: 100;
+                                    value <=> root.staged-cpu-boost;
+                                    value_changed(v) => {
+                                        root.stage-cpu-boost(v);
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                spacing: 2px;
+
+                                HorizontalLayout {
+                                    alignment: space-between;
+                                    MaterialText {
+                                        text: "GPU Fan Boost";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                    MaterialText {
+                                        text: "\{round(root.staged-gpu-boost)}% (Current: \{root.gpu-boost-text})";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.primary;
+                                    }
+                                }
+
+                                Slider {
+                                    height: 24px;
+                                    enabled: true;
+                                    minimum: 0;
+                                    maximum: 100;
+                                    value <=> root.staged-gpu-boost;
+                                    value_changed(v) => {
+                                        root.stage-gpu-boost(v);
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                height: 36px;
+                                spacing: 8px;
+                                alignment: end;
+
+                                OutlineButton {
+                                    height: 36px;
+                                    text: "Reset";
+                                    enabled: root.boost-dirty;
+                                    clicked => {
+                                        root.reset-staged-boost();
+                                    }
+                                }
+
+                                FilledButton {
+                                    height: 36px;
+                                    text: "Apply Boost";
+                                    enabled: true;
+                                    clicked => {
+                                        root.apply-staged-boost();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Right Column: Custom 4-Point Temperature-to-Fan-Boost Curve Editor
+                    OutlinedCard {
+                        horizontal-stretch: 1;
+
+                        VerticalLayout {
+                            alignment: space-between;
+                            padding: 10px;
+                            spacing: 4px;
+
+                            HorizontalLayout {
+                                alignment: space-between;
+                                spacing: 8px;
+
+                                MaterialText {
+                                    vertical-alignment: center;
+                                    text: "Custom Fan Curve";
+                                    style: MaterialTypography.title_small;
+                                    color: MaterialPalette.on_surface;
+                                }
+
+                                Rectangle {
+                                    height: 20px;
+                                    width: 112px;
+                                    border-radius: 4px;
+                                    background: root.fan-curve-active ? MaterialPalette.primary_container : MaterialPalette.surface_container_highest;
+
+                                    MaterialText {
+                                        width: 100%;
+                                        height: 100%;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        text: root.fan-curve-active ? "CURVE ACTIVE" : "CURVE STOPPED";
+                                        style: MaterialTypography.label_small;
+                                        color: root.fan-curve-active ? MaterialPalette.on_primary_container : MaterialPalette.on_surface_variant;
+                                    }
+                                }
+                            }
+
+                            MaterialText {
+                                text: "4-point linear (45–85°C, \{round(root.staged-curve-hysteresis)}°C hyst.) · Drag points vertically";
+                                style: MaterialTypography.body_small;
+                                color: MaterialPalette.on_surface_variant;
+                                overflow: elide;
+                            }
+
+                            FanCurveEditor {
+                                horizontal-stretch: 1;
+                                vertical-stretch: 1;
+                                p45 <=> root.staged-curve-p1;
+                                p60 <=> root.staged-curve-p2;
+                                p75 <=> root.staged-curve-p3;
+                                p85 <=> root.staged-curve-p4;
+                                accent: MaterialPalette.primary;
+                                surface: MaterialPalette.surface;
+                                secondary-text: MaterialPalette.on_surface_variant;
+                                grid-color: MaterialPalette.outline_variant;
+
+                                edit-finished => {
+                                    root.stage-fan-curve(
+                                        self.p45,
+                                        self.p60,
+                                        self.p75,
+                                        self.p85
+                                    );
+                                }
+                            }
+
+                            HorizontalLayout {
+                                height: 36px;
+                                spacing: 8px;
+                                alignment: end;
+
+                                OutlineButton {
+                                    height: 36px;
+                                    text: "Stop Curve";
+                                    enabled: root.fan-curve-active;
+                                    clicked => {
+                                        root.stop-fan-curve();
+                                    }
+                                }
+
+                                FilledButton {
+                                    height: 36px;
+                                    text: "Apply Curve";
+                                    clicked => {
+                                        root.apply-fan-curve();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Screen 1: Interactive AlienFX Lighting & Chassis Map
+            if root.active-nav-index == 1 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 10px;
+
+                // Section A: Interactive Chassis & 4-Zone Keyboard Map
+                FilledCard {
+                    VerticalLayout {
+                        alignment: start;
+                        padding: 12px;
+                        spacing: 10px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
+                            spacing: 10px;
+
+                            VerticalLayout {
+                                spacing: 2px;
+                                MaterialText {
+                                    text: "AlienFX Chassis & 4-Zone Keyboard Lighting";
+                                    style: MaterialTypography.title_medium;
+                                    color: MaterialPalette.on_surface;
+                                }
+                                MaterialText {
+                                    text: root.active-lighting-summary;
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+                            }
+
+                            Rectangle {
+                                height: 24px;
+                                width: 136px;
+                                border-radius: 6px;
+                                background: root.lighting-stealth-enabled ? MaterialPalette.error_container : MaterialPalette.primary_container;
+
+                                MaterialText {
+                                    width: 100%;
+                                    height: 100%;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    text: root.lighting-stealth-enabled ? "STEALTH (DARK)" : "LIGHTS ACTIVE";
+                                    style: MaterialTypography.label_medium_prominent;
+                                    color: root.lighting-stealth-enabled ? MaterialPalette.on_error_container : MaterialPalette.on_primary_container;
+                                }
+                            }
+                        }
+
+                        // Visual Chassis Zone Map: Top Row (Stadium Top, Alienhead Logo, Stadium Bottom, Power Button)
+                        HorizontalLayout {
+                            spacing: 8px;
+                            height: 48px;
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: MaterialPalette.surface_container_highest;
+                                border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 3 ? 2px : 1px;
+                                border-color: root.zone-tron-color;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 14px;
+                                        height: 14px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        border-radius: 7px;
+                                        background: root.zone-tron-color;
+                                    }
+                                    MaterialText {
+                                        vertical-alignment: center;
+                                        text: "Stadium Top";
+                                        style: MaterialTypography.label_medium_prominent;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: MaterialPalette.surface_container_highest;
+                                border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 2 ? 2px : 1px;
+                                border-color: root.zone-logo-color;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 14px;
+                                        height: 14px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        border-radius: 7px;
+                                        background: root.zone-logo-color;
+                                    }
+                                    MaterialText {
+                                        vertical-alignment: center;
+                                        text: "Alienhead Logo";
+                                        style: MaterialTypography.label_medium_prominent;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: MaterialPalette.surface_container_highest;
+                                border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 3 ? 2px : 1px;
+                                border-color: root.zone-tron-color;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 14px;
+                                        height: 14px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        border-radius: 7px;
+                                        background: root.zone-tron-color;
+                                    }
+                                    MaterialText {
+                                        vertical-alignment: center;
+                                        text: "Stadium Bottom";
+                                        style: MaterialTypography.label_medium_prominent;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: MaterialPalette.surface_container_highest;
+                                border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 4 ? 2px : 1px;
+                                border-color: root.zone-power-color;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 14px;
+                                        height: 14px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        border-radius: 7px;
+                                        background: root.zone-power-color;
+                                    }
+                                    MaterialText {
+                                        vertical-alignment: center;
+                                        text: "Power Button";
+                                        style: MaterialTypography.label_medium_prominent;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Visual 4-Zone Keyboard Map
+                        HorizontalLayout {
+                            spacing: 8px;
+                            height: 52px;
+
+                            for zone_label in [
+                                "Keyboard Left",
+                                "Keyboard Center-L",
+                                "Keyboard Center-R",
+                                "Keyboard Right"
+                            ] : Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: MaterialPalette.surface_container_high;
+                                border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 1 ? 2px : 1px;
+                                border-color: root.zone-kbd-color;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 12px;
+                                        height: 24px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        border-radius: 4px;
+                                        background: root.zone-kbd-color;
+                                    }
+                                    MaterialText {
+                                        vertical-alignment: center;
+                                        text: zone_label;
+                                        style: MaterialTypography.label_medium_prominent;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Section B: Zone Group, Effect Mode, Color Swatch, Speed & Brightness Controls
+                ElevatedCard {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        alignment: space-between;
+                        padding: 12px;
+                        spacing: 10px;
+
+                        // Row 1: Target Zone Group
+                        HorizontalLayout {
+                            spacing: 6px;
+                            height: 32px;
+                            alignment: start;
+
+                            MaterialText {
+                                width: 98px;
+                                vertical-alignment: center;
+                                text: "Target Zones:";
+                                style: MaterialTypography.label_large;
+                                color: MaterialPalette.on_surface;
+                            }
+
+                            InputChip {
+                                text: "All Zones";
+                                checked: root.staged-zone-group-index == 0;
+                                clicked => { root.staged-zone-group-index = 0; }
+                            }
+                            InputChip {
+                                text: "Keyboard";
+                                checked: root.staged-zone-group-index == 1;
+                                clicked => { root.staged-zone-group-index = 1; }
+                            }
+                            InputChip {
+                                text: "Alienhead Logo";
+                                checked: root.staged-zone-group-index == 2;
+                                clicked => { root.staged-zone-group-index = 2; }
+                            }
+                            InputChip {
+                                text: "Stadium Lights";
+                                checked: root.staged-zone-group-index == 3;
+                                clicked => { root.staged-zone-group-index = 3; }
+                            }
+                            InputChip {
+                                text: "Power Button";
+                                checked: root.staged-zone-group-index == 4;
+                                clicked => { root.staged-zone-group-index = 4; }
+                            }
+                        }
+
+                        // Row 2: Effect Mode
+                        HorizontalLayout {
+                            spacing: 6px;
+                            height: 32px;
+                            alignment: start;
+
+                            MaterialText {
+                                width: 98px;
+                                vertical-alignment: center;
+                                text: "Effect Mode:";
+                                style: MaterialTypography.label_large;
+                                color: MaterialPalette.on_surface;
+                            }
+
+                            InputChip {
+                                text: "Static";
+                                checked: root.staged-effect-index == 0;
+                                clicked => { root.staged-effect-index = 0; }
+                            }
+                            InputChip {
+                                text: "Breathe";
+                                checked: root.staged-effect-index == 1;
+                                clicked => { root.staged-effect-index = 1; }
+                            }
+                            InputChip {
+                                text: "Spectrum";
+                                checked: root.staged-effect-index == 2;
+                                clicked => { root.staged-effect-index = 2; }
+                            }
+                            InputChip {
+                                text: "Wave";
+                                checked: root.staged-effect-index == 3;
+                                clicked => { root.staged-effect-index = 3; }
+                            }
+                            InputChip {
+                                text: "Rainbow";
+                                checked: root.staged-effect-index == 4;
+                                clicked => { root.staged-effect-index = 4; }
+                            }
+                            InputChip {
+                                text: "Back & Forth";
+                                checked: root.staged-effect-index == 5;
+                                clicked => { root.staged-effect-index = 5; }
+                            }
+                            InputChip {
+                                text: "Default Blue";
+                                checked: root.staged-effect-index == 6;
+                                clicked => { root.staged-effect-index = 6; }
+                            }
+                        }
+
+                        // Row 3: Color Presets
+                        HorizontalLayout {
+                            spacing: 6px;
+                            height: 32px;
+                            alignment: start;
+
+                            MaterialText {
+                                width: 98px;
+                                vertical-alignment: center;
+                                text: "Color Swatch:";
+                                style: MaterialTypography.label_large;
+                                color: MaterialPalette.on_surface;
+                            }
+
+                            InputChip {
+                                text: "Alien Cyan";
+                                checked: root.staged-color-preset-index == 0;
+                                clicked => { root.staged-color-preset-index = 0; }
+                            }
+                            InputChip {
+                                text: "Nebula Purple";
+                                checked: root.staged-color-preset-index == 1;
+                                clicked => { root.staged-color-preset-index = 1; }
+                            }
+                            InputChip {
+                                text: "Plasma Green";
+                                checked: root.staged-color-preset-index == 2;
+                                clicked => { root.staged-color-preset-index = 2; }
+                            }
+                            InputChip {
+                                text: "Solar Amber";
+                                checked: root.staged-color-preset-index == 3;
+                                clicked => { root.staged-color-preset-index = 3; }
+                            }
+                            InputChip {
+                                text: "Crimson Red";
+                                checked: root.staged-color-preset-index == 4;
+                                clicked => { root.staged-color-preset-index = 4; }
+                            }
+                            InputChip {
+                                text: "Pure White";
+                                checked: root.staged-color-preset-index == 5;
+                                clicked => { root.staged-color-preset-index = 5; }
+                            }
+                        }
+
+                        HorizontalDivider {}
+
+                        // Row 4: Effect Speed + Hardware Brightness
+                        HorizontalLayout {
+                            spacing: 16px;
+
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 4px;
+
+                                HorizontalLayout {
+                                    alignment: space-between;
+                                    MaterialText {
+                                        text: "Animation Speed / Duration";
+                                        style: MaterialTypography.label_large;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                    MaterialText {
+                                        text: "\{round(root.staged-lighting-duration-ms)} ms";
+                                        style: MaterialTypography.label_large;
+                                        color: MaterialPalette.primary;
+                                    }
+                                }
+
+                                Slider {
+                                    height: 30px;
+                                    enabled: true;
+                                    minimum: 100;
+                                    maximum: 3000;
+                                    value <=> root.staged-lighting-duration-ms;
+                                }
+                            }
+
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 4px;
+
+                                HorizontalLayout {
+                                    alignment: space-between;
+                                    MaterialText {
+                                        text: "Hardware Brightness";
+                                        style: MaterialTypography.label_large;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                    MaterialText {
+                                        text: "\{round(root.staged-lighting-brightness)}%";
+                                        style: MaterialTypography.label_large;
+                                        color: MaterialPalette.primary;
                                     }
                                 }
 
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    alignment: end;
-
-                                    OutlineButton {
-                                        height: 36px;
-                                        text: "Program Power LED (0x02)";
+                                    Slider {
+                                        horizontal-stretch: 1;
+                                        min-width: 100px;
+                                        height: 30px;
+                                        enabled: true;
+                                        minimum: 0;
+                                        maximum: 100;
+                                        value <=> root.staged-lighting-brightness;
+                                    }
+                                    TonalButton {
+                                        height: 32px;
+                                        text: "Set Dim";
                                         clicked => {
-                                            root.program-power-led-states();
+                                            root.apply-staged-brightness();
                                         }
                                     }
+                                }
+                            }
+                        }
 
-                                    FilledButton {
-                                        height: 36px;
-                                        text: "Apply Lighting";
-                                        clicked => {
-                                            root.apply-staged-lighting();
+                        HorizontalDivider {}
+
+                        // Row 5: Stealth Toggle, Boot Default Persistence, Power Button & Apply Button
+                        HorizontalLayout {
+                            height: 36px;
+                            alignment: space-between;
+                            spacing: 12px;
+
+                            HorizontalLayout {
+                                spacing: 14px;
+                                alignment: start;
+
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Switch {
+                                        width: 52px;
+                                        height: 32px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        checked <=> root.lighting-stealth-enabled;
+                                        checked_state_changed(v) => {
+                                            root.toggle-stealth-mode(v);
+                                        }
+                                    }
+                                    MaterialText {
+                                        vertical-alignment: center;
+                                        text: "Stealth (Lights Off)";
+                                        style: MaterialTypography.body_small;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Switch {
+                                        width: 52px;
+                                        height: 32px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        checked <=> root.staged-lighting-persist-boot;
+                                    }
+                                    MaterialText {
+                                        vertical-alignment: center;
+                                        text: root.staged-lighting-persist-boot
+                                            ? "Save as Boot Default"
+                                            : "Session Only (Temporary)";
+                                        style: MaterialTypography.body_small;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: end;
+
+                                OutlineButton {
+                                    height: 36px;
+                                    text: "Program Power LED";
+                                    clicked => {
+                                        root.program-power-led-states();
+                                    }
+                                }
+
+                                FilledButton {
+                                    height: 36px;
+                                    text: "Apply Lighting";
+                                    clicked => {
+                                        root.apply-staged-lighting();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Screen 2: Virtualized Hardware Command Log (Action Meaning + Hex Payload)
+            if root.active-nav-index == 2 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 10px;
+
+                OutlinedCard {
+                    vertical-stretch: 1;
+
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
+
+                            VerticalLayout {
+                                spacing: 2px;
+                                MaterialText {
+                                    text: "Hardware Command Log (\{root.write-count} Commands — Newest First)";
+                                    style: MaterialTypography.title_medium;
+                                    color: MaterialPalette.on_surface;
+                                }
+                                MaterialText {
+                                    text: "Shows each command's human-readable meaning and underlying ACPI WMAX / USB HID hex payload.";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+                            }
+
+                            MaterialText {
+                                vertical-alignment: center;
+                                text: root.write-count == 0
+                                    ? "Zero unsolicited writes since startup"
+                                    : "\{root.write-count} explicit commands recorded";
+                                style: MaterialTypography.label_medium_prominent;
+                                color: MaterialPalette.primary;
+                            }
+                        }
+
+                        HorizontalDivider {}
+
+                        if root.audit-rows.length == 0 : MaterialText {
+                            text: "No hardware write commands have been issued in this session.";
+                            style: MaterialTypography.body_medium;
+                            color: MaterialPalette.on_surface_variant;
+                        }
+
+                        ListView {
+                            vertical-stretch: 1;
+
+                            for row in root.audit-rows : Rectangle {
+                                height: 38px;
+
+                                Rectangle {
+                                    x: 0px;
+                                    y: 2px;
+                                    width: parent.width;
+                                    height: 34px;
+                                    border-radius: 6px;
+                                    background: row.succeeded ? MaterialPalette.surface_container : MaterialPalette.error_container;
+
+                                    HorizontalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+                                        spacing: 10px;
+
+                                        MaterialText {
+                                            width: 44px;
+                                            vertical-alignment: center;
+                                            text: row.seq_text;
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: row.succeeded ? MaterialPalette.primary : MaterialPalette.on_error_container;
+                                        }
+
+                                        MaterialText {
+                                            horizontal-stretch: 1;
+                                            vertical-alignment: center;
+                                            text: row.command;
+                                            style: MaterialTypography.body_small;
+                                            color: row.succeeded ? MaterialPalette.on_surface : MaterialPalette.on_error_container;
+                                            overflow: elide;
+                                        }
+
+                                        MaterialText {
+                                            width: 170px;
+                                            horizontal-alignment: right;
+                                            vertical-alignment: center;
+                                            text: row.outcome;
+                                            style: MaterialTypography.label_small;
+                                            color: row.succeeded ? MaterialPalette.on_surface_variant : MaterialPalette.on_error_container;
+                                            overflow: elide;
                                         }
                                     }
                                 }
@@ -1436,108 +1551,161 @@ export component MainWindow inherits MaterialWindow {
                 }
             }
 
-            // Screen 2: Diagnostics, ELC 0x0F01 Config & Hardware Write Audit Log
-            if root.active-nav-index == 2 : ScrollView {
+            // Screen 3: Application Settings & System Hardware Details
+            if root.active-nav-index == 3 : VerticalLayout {
                 vertical-stretch: 1;
+                alignment: start;
+                spacing: 10px;
 
-                VerticalLayout {
-                    alignment: start;
-                    spacing: 12px;
+                ElevatedCard {
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 12px;
 
-                    ElevatedCard {
-                        VerticalLayout {
+                        MaterialText {
+                            text: "Telemetry & Polling Settings";
+                            style: MaterialTypography.title_medium;
+                            color: MaterialPalette.on_surface;
+                        }
+
+                        HorizontalLayout {
+                            height: 34px;
+                            alignment: space-between;
+
+                            VerticalLayout {
+                                alignment: center;
+                                MaterialText {
+                                    text: "Automatic Telemetry & Fan Curve Refresh";
+                                    style: MaterialTypography.body_medium;
+                                    color: MaterialPalette.on_surface;
+                                }
+                                MaterialText {
+                                    text: "Periodically polls CPU/GPU sensors and steps the custom fan curve when active.";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+                            }
+
+                            Switch {
+                                width: 52px;
+                                height: 32px;
+                                y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                checked <=> root.auto-refresh-enabled;
+                                checked_state_changed(enabled) => {
+                                    root.toggle-auto-refresh(enabled);
+                                }
+                            }
+                        }
+
+                        HorizontalDivider {}
+
+                        HorizontalLayout {
+                            height: 34px;
+                            spacing: 8px;
                             alignment: start;
-                            padding: 14px;
-                            spacing: 6px;
 
                             MaterialText {
-                                text: "Device Database & ELC 0x0F01 Configuration";
-                                style: MaterialTypography.title_medium;
+                                width: 150px;
+                                vertical-alignment: center;
+                                text: "Refresh Interval:";
+                                style: MaterialTypography.label_large;
                                 color: MaterialPalette.on_surface;
                             }
 
-                            MaterialText {
-                                text: "Database Source: \{root.db-source}  |  DMI Match: \{root.device-name}  |  ACPI Path: \{root.acpi-path}";
-                                style: MaterialTypography.body_medium;
-                                color: MaterialPalette.on_surface_variant;
+                            InputChip {
+                                enabled: root.auto-refresh-enabled;
+                                text: "0.5s (Fast)";
+                                checked: root.refresh-interval-ms == 500;
+                                clicked => { root.select-refresh-interval(500); }
                             }
-
-                            MaterialText {
-                                text: root.elc-firmware-summary;
-                                style: MaterialTypography.body_small;
-                                color: MaterialPalette.primary;
+                            InputChip {
+                                enabled: root.auto-refresh-enabled;
+                                text: "1.0s (Default)";
+                                checked: root.refresh-interval-ms == 1000;
+                                clicked => { root.select-refresh-interval(1000); }
+                            }
+                            InputChip {
+                                enabled: root.auto-refresh-enabled;
+                                text: "2.0s";
+                                checked: root.refresh-interval-ms == 2000;
+                                clicked => { root.select-refresh-interval(2000); }
+                            }
+                            InputChip {
+                                enabled: root.auto-refresh-enabled;
+                                text: "5.0s (Low Power)";
+                                checked: root.refresh-interval-ms == 5000;
+                                clicked => { root.select-refresh-interval(5000); }
                             }
                         }
                     }
+                }
 
-                    OutlinedCard {
-                        VerticalLayout {
-                            alignment: start;
-                            padding: 14px;
-                            spacing: 10px;
+                ElevatedCard {
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
 
-                            HorizontalLayout {
-                                alignment: space-between;
+                        MaterialText {
+                            text: "Lighting & Startup Preferences";
+                            style: MaterialTypography.title_medium;
+                            color: MaterialPalette.on_surface;
+                        }
 
+                        HorizontalLayout {
+                            height: 34px;
+                            alignment: space-between;
+
+                            VerticalLayout {
+                                alignment: center;
                                 MaterialText {
-                                    text: "Combined ACPI + USB HID Write Audit Log (Total Writes: \{root.write-count})";
-                                    style: MaterialTypography.title_small;
+                                    text: "Save Lighting Changes as Boot Default";
+                                    style: MaterialTypography.body_medium;
                                     color: MaterialPalette.on_surface;
                                 }
-
                                 MaterialText {
-                                    text: root.write-count == 0
-                                        ? "PASS: Zero unsolicited writes since startup"
-                                        : "Showing explicit user-initiated ACPI & USB HID writes";
-                                    style: MaterialTypography.label_medium_prominent;
-                                    color: MaterialPalette.primary;
+                                    text: "When enabled, Apply Lighting stores effects in controller flash so they persist across reboots.";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
                                 }
                             }
 
-                            HorizontalDivider {}
-
-                            if root.audit-rows.length == 0 : MaterialText {
-                                text: "No hardware write commands (WMAX 0x15 / WMAX 0x25 0x01 / sysfs / USB HID 187c:0550) have been issued.";
-                                style: MaterialTypography.body_medium;
-                                color: MaterialPalette.on_surface_variant;
+                            Switch {
+                                width: 52px;
+                                height: 32px;
+                                y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                checked <=> root.staged-lighting-persist-boot;
                             }
+                        }
+                    }
+                }
 
-                            for row in root.audit-rows : Rectangle {
-                                height: 34px;
-                                border-radius: 6px;
-                                background: row.succeeded ? MaterialPalette.surface_container : MaterialPalette.error_container;
+                OutlinedCard {
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 6px;
 
-                                HorizontalLayout {
-                                    padding-left: 10px;
-                                    padding-right: 10px;
-                                    spacing: 10px;
+                        MaterialText {
+                            text: "System & Hardware Controller Details";
+                            style: MaterialTypography.title_medium;
+                            color: MaterialPalette.on_surface;
+                        }
 
-                                    MaterialText {
-                                        width: 36px;
-                                        vertical-alignment: center;
-                                        text: row.seq_text;
-                                        style: MaterialTypography.label_medium_prominent;
-                                        color: row.succeeded ? MaterialPalette.primary : MaterialPalette.on_error_container;
-                                    }
+                        MaterialText {
+                            text: "Device Model: \{root.device-name}  ·  SMBIOS ID: \{root.smbios-id}  ·  ACPI WMAX Path: \{root.acpi-path}";
+                            style: MaterialTypography.body_medium;
+                            color: MaterialPalette.on_surface_variant;
+                        }
 
-                                    MaterialText {
-                                        horizontal-stretch: 1;
-                                        vertical-alignment: center;
-                                        text: row.command;
-                                        style: MaterialTypography.body_small;
-                                        color: row.succeeded ? MaterialPalette.on_surface : MaterialPalette.on_error_container;
-                                    }
+                        MaterialText {
+                            text: "Profile Database Source: \{root.db-source}";
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.on_surface_variant;
+                        }
 
-                                    MaterialText {
-                                        width: 240px;
-                                        horizontal-alignment: right;
-                                        vertical-alignment: center;
-                                        text: row.outcome;
-                                        style: MaterialTypography.label_small;
-                                        color: row.succeeded ? MaterialPalette.on_surface_variant : MaterialPalette.on_error_container;
-                                    }
-                                }
-                            }
+                        MaterialText {
+                            text: root.elc-firmware-summary;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.primary;
                         }
                     }
                 }

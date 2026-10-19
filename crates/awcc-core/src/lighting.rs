@@ -154,8 +154,8 @@ impl ZoneTarget {
             Self::All => "All Zones",
             Self::Keyboard => "Keyboard (4-Zone)",
             Self::Logo => "Alienhead Logo",
-            Self::Tron => "Stadium / Tron",
-            Self::PowerButton => "Power Button (0x02)",
+            Self::Tron => "Stadium Lights",
+            Self::PowerButton => "Power Button",
             Self::Custom(_) => "Custom Zones",
         }
     }

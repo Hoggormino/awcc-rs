@@ -103,6 +103,9 @@ pub struct ThermalOrchestrator {
     pre_curve_mode: Option<ThermalMode>,
     last_curve_boost: Option<(u8, u8)>,
     lifecycle: OperationLifecycle,
+    chronological_audit_log: Vec<WriteAuditEntry>,
+    synced_acpi_audit_len: usize,
+    synced_usb_audit_len: usize,
 }
 
 impl ThermalOrchestrator {
@@ -142,6 +145,9 @@ impl ThermalOrchestrator {
             pre_curve_mode: None,
             last_curve_boost: None,
             lifecycle: OperationLifecycle::Idle,
+            chronological_audit_log: Vec::new(),
+            synced_acpi_audit_len: 0,
+            synced_usb_audit_len: 0,
         }
     }
 
@@ -187,6 +193,36 @@ impl ThermalOrchestrator {
         diag
     }
 
+    fn sync_chronological_audit_log(&mut self) {
+        let acpi_log = self.transport.write_audit_log();
+        if self.synced_acpi_audit_len < acpi_log.len() {
+            for entry in &acpi_log[self.synced_acpi_audit_len..] {
+                let seq = self.chronological_audit_log.len() + 1;
+                self.chronological_audit_log.push(WriteAuditEntry {
+                    sequence: seq,
+                    command: entry.command.clone(),
+                    outcome: entry.outcome.clone(),
+                    succeeded: entry.succeeded,
+                });
+            }
+            self.synced_acpi_audit_len = acpi_log.len();
+        }
+
+        let usb_log = self.lighting.transport().write_audit_log();
+        if self.synced_usb_audit_len < usb_log.len() {
+            for entry in &usb_log[self.synced_usb_audit_len..] {
+                let seq = self.chronological_audit_log.len() + 1;
+                self.chronological_audit_log.push(WriteAuditEntry {
+                    sequence: seq,
+                    command: entry.command.clone(),
+                    outcome: entry.outcome.clone(),
+                    succeeded: entry.succeeded,
+                });
+            }
+            self.synced_usb_audit_len = usb_log.len();
+        }
+    }
+
     /// Passively query the current state without issuing any hardware writes.
     pub fn query_snapshot(&mut self) -> SystemSnapshot {
         let game_shift_enabled = self.transport.query_game_shift_status().unwrap_or(false);
@@ -206,16 +242,8 @@ impl ThermalOrchestrator {
         }
         let elc_diagnostics = self.cached_elc_diagnostics.clone();
 
-        let mut combined_audit = self.transport.write_audit_log().to_vec();
-        for usb_entry in self.lighting.transport().write_audit_log() {
-            let seq = combined_audit.len() + 1;
-            combined_audit.push(WriteAuditEntry {
-                sequence: seq,
-                command: usb_entry.command.clone(),
-                outcome: usb_entry.outcome.clone(),
-                succeeded: usb_entry.succeeded,
-            });
-        }
+        self.sync_chronological_audit_log();
+        let combined_audit = self.chronological_audit_log.clone();
 
         SystemSnapshot {
             profile: self.profile.clone(),
@@ -279,12 +307,12 @@ impl ThermalOrchestrator {
                     self.storage.save_pre_gmode(target);
                 }
                 self.lifecycle = OperationLifecycle::Confirmed {
-                    summary: format!("Switched thermal mode to {target} (0x{code:02X})"),
+                    summary: format!("Switched thermal mode to {target}"),
                 };
             }
             Err(err) => {
                 self.lifecycle = OperationLifecycle::Failed {
-                    summary: format!("Failed to set thermal mode to {target} (0x{code:02X})"),
+                    summary: format!("Failed to set thermal mode to {target}"),
                     error: err.to_string(),
                 };
             }
@@ -306,7 +334,7 @@ impl ThermalOrchestrator {
         // Step 1: Enable GameShift latch (`WMAX 0x25 0x01 0x01`).
         if let Err(err) = self.transport.set_game_shift_status(true) {
             self.lifecycle = OperationLifecycle::Failed {
-                summary: "G-Mode activation failed at Step 1 (WMAX 0x25)".to_string(),
+                summary: "G-Mode activation failed at Step 1".to_string(),
                 error: err.to_string(),
             };
             return self.query_snapshot();
@@ -317,16 +345,13 @@ impl ThermalOrchestrator {
         match self.transport.set_raw_thermal_mode(gmode_code) {
             Ok(()) => {
                 self.lifecycle = OperationLifecycle::Confirmed {
-                    summary: format!(
-                        "G-Mode (GameShift) engaged — WMAX 0x25=0x01 + 0x15=0x{gmode_code:02X}"
-                    ),
+                    summary: "G-Mode (GameShift) engaged — maximum cooling active".to_string(),
                 };
             }
             Err(err) => {
                 let _ = self.transport.set_game_shift_status(false);
                 self.lifecycle = OperationLifecycle::RolledBack {
-                    summary: "G-Mode transition aborted & rolled back (WMAX 0x25 restored to 0x00)"
-                        .to_string(),
+                    summary: "G-Mode transition aborted & rolled back".to_string(),
                     reason: err.to_string(),
                 };
             }
@@ -546,13 +571,13 @@ impl ThermalOrchestrator {
                 self.lighting_last_target = target.clone();
                 self.lighting_persist_boot = persist_boot;
                 let mode_str = if persist_boot {
-                    "boot default slot 0x0061"
+                    "boot default"
                 } else {
                     "volatile session"
                 };
                 self.lifecycle = OperationLifecycle::Confirmed {
                     summary: format!(
-                        "Applied {} to {} ({mode_str}, {reports_sent} USB HID reports)",
+                        "Applied {} to {} ({mode_str}, {reports_sent} USB reports)",
                         effect.name(),
                         target.label()
                     ),
@@ -574,7 +599,7 @@ impl ThermalOrchestrator {
             Ok(reports_sent) => {
                 self.lifecycle = OperationLifecycle::Confirmed {
                     summary: format!(
-                        "Set ELC lighting brightness to {}% ({reports_sent} USB HID reports)",
+                        "Set lighting brightness to {}% ({reports_sent} USB reports)",
                         self.lighting.brightness()
                     ),
                 };
@@ -594,7 +619,7 @@ impl ThermalOrchestrator {
         match self.lighting.set_stealth(enable) {
             Ok(active) => {
                 let msg = if active {
-                    "Stealth mode (Go Dark) enabled — all LEDs dimmed to 0%".to_string()
+                    "Stealth mode enabled — all LEDs dimmed to 0%".to_string()
                 } else {
                     format!(
                         "Stealth mode disabled — restored brightness to {}%",
@@ -630,7 +655,7 @@ impl ThermalOrchestrator {
             Ok(reports_sent) => {
                 self.lifecycle = OperationLifecycle::Confirmed {
                     summary: format!(
-                        "Programmed 6 power-button state slots (0x005B..0x0060) on LED 0x02 ({reports_sent} USB HID reports)"
+                        "Programmed Power Button LED states ({reports_sent} USB reports)"
                     ),
                 };
             }
@@ -880,5 +905,32 @@ mod tests {
             snap_stop.thermal_mode_state,
             ThermalModeState::Known(ThermalMode::Balanced)
         );
+    }
+
+    #[test]
+    fn interleaved_usb_and_acpi_writes_preserve_chronological_order() {
+        let mut orch =
+            ThermalOrchestrator::new_simulated_m15_r6().expect("simulated m15 R6 should init");
+
+        // 1. First perform a USB lighting write (generates multiple USB HID entries)
+        let snap1 = orch.set_brightness(80);
+        let usb_count = snap1.write_audit_log.len();
+        assert!(usb_count >= 1);
+        assert!(snap1.write_audit_log.last().unwrap().command.contains("USB HID"));
+
+        // 2. Next perform an ACPI thermal profile write
+        let snap2 = orch.set_thermal_mode(ThermalMode::Performance);
+        assert_eq!(snap2.write_audit_log.len(), usb_count + 1);
+        let last_after_acpi = snap2.write_audit_log.last().unwrap();
+        assert_eq!(last_after_acpi.sequence, usb_count + 1);
+        assert!(last_after_acpi.command.contains("WMAX 0 0x15"));
+
+        // 3. Next perform another USB write, then a TCC offset ACPI write
+        let snap3 = orch.set_brightness(60);
+        assert!(snap3.write_audit_log.last().unwrap().command.contains("USB HID"));
+        let snap4 = orch.set_tcc_offset(5);
+        let newest = snap4.write_audit_log.last().unwrap();
+        assert_eq!(newest.sequence, snap4.write_audit_log.len());
+        assert!(newest.command.contains("0x15 {0x03, 0x05"));
     }
 }
