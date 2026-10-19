@@ -19,6 +19,7 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ./scripts/smoke-test-installed.sh --cli target/debug/awcc-cli --gui target/debug/awcc-gui
 node scripts/test-issue-intake.mjs
+node scripts/test-issue-investigate.mjs
 ```
 
 ---
@@ -62,6 +63,7 @@ Follow AGENTS.md, CONTRIBUTING.md, and docs/agent_issue_investigation_workflow.m
    - `cargo test --workspace --all-features --locked`
    - `./scripts/smoke-test-installed.sh --cli target/debug/awcc-cli --gui target/debug/awcc-gui`
    - `node scripts/test-issue-intake.mjs`
+   - `node scripts/test-issue-investigate.mjs`
 
 6. Prepare a reviewable branch / draft PR summary:
    - Fill out the `.github/pull_request_template.md` structure referencing `Hoggormino/awcc-rs#<ISSUE_NUMBER>` and the Beads task ID:
@@ -139,13 +141,120 @@ Never attempt to reproduce an issue by writing to `/proc/acpi/call` or real USB 
    - `.github/workflows/issue-intake.yml` applies initial `needs-triage` + `area:*` labels (and `needs-info` with a single polite comment if required fields are blank).
 2. **Maintainer Triage**:
    - Maintainer reviews the report, removes `needs-triage`, and applies `confirmed` (and `needs-hardware-test` or `priority: high` if applicable). Once triaged by a maintainer, the intake bot never overrides labels or nags the issue.
-3. **Local-Agent Investigation & Draft PR**:
+3. **Optional Hosted Read-Only Investigation (`.github/workflows/issue-investigate.yml`)**:
+   - Maintainer can optionally dispatch the hosted read-only Codex workflow (Section 4 below) to produce a structured, source-grounded triage report before opening a local coding session.
+4. **Local-Agent Investigation & Draft PR**:
    - Maintainer runs the local coding agent with the prompt in Section 1 above for `Hoggormino/awcc-rs#<ISSUE_NUMBER>`.
    - Agent records its task in Beads (`bd`), adds offline regression tests, runs all quality gates, and prepares a branch/draft PR linking `Hoggormino/awcc-rs#<ISSUE_NUMBER>`.
-4. **Merge & Release**:
+5. **Merge & Release**:
    - After code review and CI pass on the PR, maintainer merges to `main`.
    - When cutting the next release (`vX.Y.Z` tag pushed by maintainer per [`docs/ci_packaging_and_release.md`](ci_packaging_and_release.md)), the release pipeline publishes all five Linux package formats and `build-manifest.json` / `SHA256SUMS`.
-5. **Post-Release Issue Follow-Up**:
+6. **Post-Release Issue Follow-Up**:
    - Update `Hoggormino/awcc-rs#<ISSUE_NUMBER>` with:
      - The exact release version (`vX.Y.Z`) and commit SHA containing the fix.
      - The validation status: either **Confirmed on hardware** (closing the issue) or **Included in `vX.Y.Z` — awaiting `needs-hardware-test` confirmation on `<Model Name>`** so the reporter can verify using the published package.
+
+---
+
+## 4. Optional GitHub-Hosted Issue Investigation Workflow (`.github/workflows/issue-investigate.yml`)
+
+In addition to the zero-cost deterministic intake workflow (`.github/workflows/issue-intake.yml`) and the local-agent workflow above, `awcc-rs` includes an **optional, manually triggered** GitHub-hosted investigation workflow ([`.github/workflows/issue-investigate.yml`](../.github/workflows/issue-investigate.yml)).
+
+### 4.1 Scope & Non-Goals
+
+- **Read-only investigation only**: The hosted workflow inspects the issue text, bounded comments, inline diagnostic summary, and the trusted `main` source tree to produce a structured JSON/Markdown report.
+- **No code changes or repository mutations by default**: It never repairs code, creates branches or pull requests, merges, closes issues, alters hardware capability flags, pushes tags, or publishes releases.
+- **No automatic paid runs**: It is triggered **only** via `workflow_dispatch` by an authorized maintainer. Public issue creation, edits, or comments never invoke the paid model.
+
+### 4.2 Required Secrets, Variables & Pinned Action Versions
+
+Configure in **Settings → Secrets and variables → Actions** on `Hoggormino/awcc-rs`:
+
+| Type | Name | Required | Default / Purpose |
+| :--- | :--- | :--- | :--- |
+| **Secret** | `OPENAI_API_KEY` | **Yes** (when running the workflow) | OpenAI API key passed exclusively to `openai/codex-action@v1` in the read-only `investigate` job. If unset, preflight fails immediately with a clear configuration message before invoking the action. |
+| **Variable** | `AWCC_CODEX_MODEL` | Optional | Model override passed to `openai/codex-action@v1` (`model` input). When unset/empty, uses the Codex CLI default model. |
+| **Variable** | `AWCC_CODEX_EFFORT` | Optional | Reasoning effort passed to `openai/codex-action@v1` (`effort` input, default `medium`). |
+
+Verified GitHub Action versions used in `.github/workflows/issue-investigate.yml`:
+- `actions/checkout@v7` (`persist-credentials: false`)
+- `actions/github-script@v9`
+- `openai/codex-action@v1` (`v1.13`, released `2026-10-05`, configured with `sandbox: read-only`, `safety-strategy: drop-sudo`, `allow-bots: false`, and `acl` installed prior to privilege reduction)
+- `actions/upload-artifact@v7` and `actions/download-artifact@v8`
+
+### 4.3 Security & Authorization Controls
+
+1. **Pre-Invocation Gates (`scripts/issue-investigate.mjs`)**:
+   - Locks execution to `GITHUB_REPOSITORY == "Hoggormino/awcc-rs"`, `GITHUB_EVENT_NAME == "workflow_dispatch"`, and `GITHUB_REF == "refs/heads/main"`.
+   - Verifies **both** `GITHUB_ACTOR` and `GITHUB_TRIGGERING_ACTOR` (accounting for workflow reruns) are non-bot accounts with effective `admin` or `write` repository permission (or explicit maintainer allowlist `Hoggormino`). An issue author's identity, `author_association`, or labels never grant authorization.
+   - Validates `issue_number` (`^[1-9][0-9]{0,8}$`), fetches the issue via the GitHub API, and rejects nonexistent issues (`404`) or pull request numbers (`issue.pull_request`).
+2. **Untrusted Data Isolation & Attachment Policy**:
+   - Collects bounded evidence (`16,000` chars max body, `30` comments max at `4,000` chars each) into `.codex-investigation/evidence.json` (`0600` permissions) with source URLs, UTC timestamp, inspected `HEAD` SHA, and truncation counters.
+   - Never downloads external attachments or follows reporter URLs; any referenced `.zip`/`.log` attachment URL is recorded in `attachment_notices` so missing attachment inspection is explicitly flagged for the local-agent workflow.
+3. **Privilege Reduction & Separate Publication Job**:
+   - Job 1 (`investigate`) runs with `permissions: contents: read` only, installs `acl` (`setfacl`), drops `sudo` via `safety-strategy: drop-sudo`, and runs Codex in `sandbox: read-only` with prompt [`docs/prompts/hosted_issue_investigation_prompt.md`](prompts/hosted_issue_investigation_prompt.md) and JSON Schema [`docs/schemas/issue-investigation-output.schema.json`](schemas/issue-investigation-output.schema.json).
+   - Fixed validation code in `scripts/issue-investigate.mjs` verifies the output JSON against the schema, rejects any claim that tests were executed/passed at runtime, writes `$GITHUB_STEP_SUMMARY`, and uploads `.codex-investigation/artifact/`.
+   - Job 2 (`publish-comment`) runs **only** when `investigate` succeeded and `publish_comment == true`. It downloads the artifact, re-validates `investigation-report.json`, and creates or updates at most **one** verified bot comment (`<!-- awcc-rs:issue-investigation:v1 -->` authored by `github-actions[bot]`), escaping all model output fields as plain data.
+
+### 4.4 How to Run
+
+Via GitHub CLI (dry-run summary + artifact only, default `publish_comment=false`):
+```bash
+gh workflow run issue-investigate.yml \
+  --repo Hoggormino/awcc-rs \
+  --ref main \
+  -f issue_number=42 \
+  -f publish_comment=false
+```
+
+To also publish/update the single verified bot comment on issue `#42`:
+```bash
+gh workflow run issue-investigate.yml \
+  --repo Hoggormino/awcc-rs \
+  --ref main \
+  -f issue_number=42 \
+  -f publish_comment=true
+```
+
+### 4.5 Example Expected Output (Fixture `#42`)
+
+```markdown
+## Automated Read-Only Issue Investigation (`#42`)
+
+> **Scope & Verification Notice**: This report was generated in a read-only sandbox against [`Hoggormino/awcc-rs` @ `1c41dff`](https://github.com/Hoggormino/awcc-rs/issues/42) at `2026-10-19T20:00:00Z`. **Static source inspection is not a runtime reproduction or passed test.**
+
+### Summary
+Issue #42 reports that G-Mode activation on Alienware m15 R6 fails when WMAX 0x25 returns 0xFFFFFFFF, triggering rollback to Balanced.
+
+### Metadata & Status
+- **Affected Version(s)**: `awcc-cli 0.2.0 (commit 404c0d9, deb)`
+- **Reproduction Status**: `needs_local_simulation_reproduction`
+- **Requires Physical Hardware Validation**: `true`
+
+### Grounded Source & Issue Evidence
+- **`crates/awcc-service/src/lib.rs:312`**: ThermalOrchestrator::toggle_gmode rolls back thermal mode when set_gmode_flag returns an ACPI rejection error.
+- **`issue#42`**: Inline AWCC Diagnostic Summary shows Matched in DB: true (Alienware m15 R6, AMWW) and gmode_rollback error code.
+
+### Hypotheses
+- **[MEDIUM]** BIOS firmware on this specific m15 R6 revision rejects WMAX 0x25 arg 0x01 unless USTT_GMODE (0xAB) is set first. — *Rationale*: Some AMWW firmware tables validate the active thermal mode before accepting the G-Mode flag subcommand.
+
+### Missing Information & Uninspected Evidence
+- Attached awcc-support.zip was not downloaded in hosted mode; inspect hardware-audit.jsonl locally to confirm exact WMAX call order.
+- Attachment referenced in issue#42 (https://github.com/user-attachments/files/12345/awcc-support.zip) was not downloaded in hosted mode; inspect locally via docs/agent_issue_investigation_workflow.md.
+
+### Suggested Offline Regression Test
+- **Target Crate**: `awcc-service`
+- **Mock / Fixture**: `SimBackend + SimFaults::fail_gmode_flag`
+- **Test Description**: Simulate WMAX 0x25 returning 0xFFFFFFFF via SimFaults and verify ThermalOrchestrator records RolledBack with preserved prior mode.
+
+### Recommended Next Step
+Download awcc-support.zip locally using the Phase 3 local-agent workflow, inspect hardware-audit.jsonl, and run cargo test -p awcc-service.
+
+### Candidate Duplicate Issues
+- [#19](https://github.com/Hoggormino/awcc-rs/issues/19): Earlier report of AMWW G-Mode WMAX 0x25 rejection on m15 R6.
+
+### What Was & Was Not Checked
+- **Checked**: Issue `#42` body (412 chars), 1 comment(s) (omitted: 0), 1 inline diagnostic block(s), and trusted repository checkout at `1c41dff`.
+- **Not Checked**: Uploaded file attachments (`awcc-support.zip`), external URLs, live ACPI/USB hardware, and runtime test execution (`cargo test` is run in the local-agent workflow and CI pipeline, not inside this read-only investigation job).
+```
+

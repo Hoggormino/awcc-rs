@@ -1,0 +1,190 @@
+name: Issue Investigation (Hosted Read-Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Positive integer issue number in Hoggormino/awcc-rs to investigate"
+        required: true
+        type: string
+      publish_comment:
+        description: "Publish or update the single verified bot investigation comment on the issue"
+        required: false
+        default: false
+        type: boolean
+
+# Minimal default permissions: no write or release authority at workflow level.
+permissions: {}
+
+# Serialize hosted investigation runs per issue so concurrent operator runs never overlap.
+concurrency:
+  group: issue-investigate-${{ github.repository }}-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  investigate:
+    name: Read-Only Issue Investigation (Codex Sandbox)
+    if: >-
+      github.repository == 'Hoggormino/awcc-rs' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted default branch without credential persistence
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install ACL utilities for unprivileged drop-sudo sandbox before privilege reduction
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends acl
+
+      - name: Verify maintainer authorization and collect bounded issue evidence
+        uses: actions/github-script@v9
+        env:
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          OPENAI_API_KEY_PRESENT: ${{ secrets.OPENAI_API_KEY != '' }}
+        with:
+          retries: 2
+          script: |
+            const { pathToFileURL } = await import("node:url");
+            const path = await import("node:path");
+            const modUrl = pathToFileURL(
+              path.resolve(process.cwd(), "scripts/issue-investigate.mjs")
+            ).href;
+            const { runPreflightStep } = await import(modUrl);
+            const result = await runPreflightStep({
+              github,
+              env: process.env,
+              workDir: process.cwd(),
+            });
+            core.info(
+              `Authorized actor=${result.gates.actorAuth.login} (${result.gates.actorAuth.source}), ` +
+              `triggering_actor=${result.gates.triggeringAuth.login} (${result.gates.triggeringAuth.source}) ` +
+              `for issue #${result.gates.issueNumber}.`
+            );
+
+      - name: Run read-only Codex investigation with drop-sudo protection
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: ${{ vars.AWCC_CODEX_MODEL || '' }}
+          effort: ${{ vars.AWCC_CODEX_EFFORT || 'medium' }}
+          sandbox: read-only
+          safety-strategy: drop-sudo
+          allow-bots: false
+          prompt-file: .codex-investigation/prompt.md
+          output-schema-file: docs/schemas/issue-investigation-output.schema.json
+          output-file: .codex-investigation/raw-output.json
+
+      - name: Validate structured investigation output and write job summary
+        if: always()
+        env:
+          CODEX_OUTCOME: ${{ steps.codex.outcome }}
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          node --input-type=module -e '
+            import { runValidateStep } from "./scripts/issue-investigate.mjs";
+            runValidateStep({ env: process.env, workDir: process.cwd() });
+          '
+
+      - name: Upload bounded investigation artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: issue-investigation-${{ inputs.issue_number }}-${{ github.run_id }}
+          path: .codex-investigation/artifact/
+          if-no-files-found: warn
+          retention-days: 14
+
+  publish-comment:
+    name: Publish Verified Investigation Comment
+    needs: investigate
+    if: >-
+      success() &&
+      inputs.publish_comment == true &&
+      github.repository == 'Hoggormino/awcc-rs' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout validation script and schema from trusted default branch
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/issue-investigate.mjs
+            docs/schemas/issue-investigation-output.schema.json
+
+      - name: Download validated investigation artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: issue-investigation-${{ inputs.issue_number }}-${{ github.run_id }}
+          path: .codex-investigation/artifact
+
+      - name: Re-validate output and create or update single verified bot comment
+        uses: actions/github-script@v9
+        env:
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        with:
+          retries: 2
+          script: |
+            const fs = await import("node:fs");
+            const path = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const modUrl = pathToFileURL(
+              path.resolve(process.cwd(), "scripts/issue-investigate.mjs")
+            ).href;
+            const {
+              verifySingleActorAuthorization,
+              validateIssueNumberInput,
+              publishOrUpdateInvestigationComment,
+            } = await import(modUrl);
+
+            const [owner, repo] = String(process.env.GITHUB_REPOSITORY || "").split("/");
+            const issueNumber = validateIssueNumberInput(process.env.INPUT_ISSUE_NUMBER);
+
+            await verifySingleActorAuthorization({
+              github,
+              owner,
+              repo,
+              username: process.env.GITHUB_ACTOR || "",
+              roleLabel: "actor",
+            });
+            await verifySingleActorAuthorization({
+              github,
+              owner,
+              repo,
+              username: process.env.GITHUB_TRIGGERING_ACTOR || process.env.GITHUB_ACTOR || "",
+              roleLabel: "triggering_actor",
+            });
+
+            const artifactDir = path.resolve(process.cwd(), ".codex-investigation/artifact");
+            const reportRaw = fs.readFileSync(
+              path.join(artifactDir, "investigation-report.json"),
+              "utf8"
+            );
+            const evidenceMeta = JSON.parse(
+              fs.readFileSync(path.join(artifactDir, "evidence-metadata.json"), "utf8")
+            );
+
+            const res = await publishOrUpdateInvestigationComment({
+              github,
+              owner,
+              repo,
+              issueNumber,
+              report: reportRaw,
+              evidenceMeta,
+            });
+            core.info(
+              `Investigation comment ${res.action} on #${issueNumber} (commentId=${res.commentId}).`
+            );

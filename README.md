@@ -94,5 +94,5 @@ See [`docs/ci_packaging_and_release.md`](docs/ci_packaging_and_release.md) for l
 ## Support, Contributing & Security
 
 - **Support & Diagnostics**: [`SUPPORT.md`](SUPPORT.md) — supported platforms, hardware matrix, passive support export (`awcc-cli diagnostics export`), and startup-failure capture.
-- **Contributing & Local Agent Investigation**: [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`docs/agent_issue_investigation_workflow.md`](docs/agent_issue_investigation_workflow.md).
+- **Contributing, Local Agent & Hosted Issue Investigation**: [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/agent_issue_investigation_workflow.md`](docs/agent_issue_investigation_workflow.md), and [`.github/workflows/issue-investigate.yml`](.github/workflows/issue-investigate.yml).
 - **Security Policy**: [`SECURITY.md`](SECURITY.md) — private vulnerability reporting instructions.
