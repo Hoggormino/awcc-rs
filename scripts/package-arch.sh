@@ -39,9 +39,12 @@ if ! command -v makepkg >/dev/null 2>&1; then
     exit 1
 fi
 
+OUT_DIR="$(realpath -m "${OUT_DIR}")"
 mkdir -p "${OUT_DIR}"
 if [[ -z "${TARBALL_PATH}" ]]; then
     TARBALL_PATH="${OUT_DIR}/${AWCC_TARBALL_NAME}"
+else
+    TARBALL_PATH="$(realpath -m "${TARBALL_PATH}")"
 fi
 
 if [[ ! -f "${TARBALL_PATH}" ]]; then

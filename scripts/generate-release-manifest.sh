@@ -28,6 +28,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+DIST_DIR="$(realpath -m "${DIST_DIR}")"
+
 if [[ -n "${RELEASE_TAG}" ]]; then
     validate_release_tag "${RELEASE_TAG}"
 fi

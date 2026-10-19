@@ -32,6 +32,9 @@ if ! command -v rpmbuild >/dev/null 2>&1; then
     exit 1
 fi
 
+STAGED_DIR="$(realpath -m "${STAGED_DIR}")"
+OUT_DIR="$(realpath -m "${OUT_DIR}")"
+
 if [[ ! -d "${STAGED_DIR}" ]]; then
     "${SCRIPT_DIR}/stage-release-payload.sh" --out-dir "${STAGED_DIR}"
 fi

@@ -48,6 +48,7 @@ if [[ -z "${RELEASE_TAG}" ]]; then
     exit 1
 fi
 
+DIST_DIR="$(realpath -m "${DIST_DIR}")"
 validate_release_tag "${RELEASE_TAG}"
 
 ALL_ASSETS=(

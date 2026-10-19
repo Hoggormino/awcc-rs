@@ -55,6 +55,15 @@ if [[ -z "${CLI_BIN}" || -z "${GUI_BIN}" ]]; then
     exit 1
 fi
 
+CLI_BIN="$(realpath -m "${CLI_BIN}")"
+GUI_BIN="$(realpath -m "${GUI_BIN}")"
+if [[ -n "${DATABASE_PATH}" ]]; then
+    DATABASE_PATH="$(realpath -m "${DATABASE_PATH}")"
+fi
+if [[ -n "${APPRUN_BIN}" ]]; then
+    APPRUN_BIN="$(realpath -m "${APPRUN_BIN}")"
+fi
+
 if [[ ! -x "${CLI_BIN}" ]]; then
     echo "ERROR: CLI binary is missing or not executable: ${CLI_BIN}" >&2
     exit 1
@@ -82,6 +91,7 @@ mkdir -p "${ISOLATED_CWD}" "${ISOLATED_HOME}" "${ISOLATED_STATE}"
 if [[ -z "${SCREENSHOT_DIR}" ]]; then
     SCREENSHOT_DIR="${WORK_TMP}/screenshots"
 fi
+SCREENSHOT_DIR="$(realpath -m "${SCREENSHOT_DIR}")"
 mkdir -p "${SCREENSHOT_DIR}"
 
 run_isolated() {

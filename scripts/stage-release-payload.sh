@@ -66,6 +66,8 @@ fi
 if [[ -z "${OUT_DIR}" ]]; then
     OUT_DIR="${AWCC_REPO_ROOT}/dist/staging/${AWCC_TARBALL_BASENAME}"
 fi
+BIN_DIR="$(realpath -m "${BIN_DIR}")"
+OUT_DIR="$(realpath -m "${OUT_DIR}")"
 
 for bin in awcc-cli awcc-gui; do
     if [[ ! -x "${BIN_DIR}/${bin}" ]]; then
