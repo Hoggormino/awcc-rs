@@ -327,13 +327,31 @@ pub fn read_dmi_smbios_id(sku_path: Option<&Path>) -> Option<String> {
     }
 }
 
+fn load_explicit_env_database() -> Option<Result<Database, CoreError>> {
+    let raw = std::env::var_os("AWCC_DATABASE_PATH")?;
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    let source = awcc_core::DatabaseSource::EnvVar(path.clone());
+    match fs::read_to_string(&path) {
+        Ok(contents) => Some(Database::from_json_str(&contents, source)),
+        Err(err) => Some(Err(CoreError::DatabaseParse {
+            source_label: source.to_string(),
+            details: err.to_string(),
+        })),
+    }
+}
+
 /// Resolve the live host `DeviceProfile` from DMI (`product_name`, `product_sku`), `/proc/cpuinfo`,
 /// and the 4-tier `database.json` lookup order.
 pub fn resolve_host_device_profile() -> Result<DeviceProfile, CoreError> {
-    let env_db = std::env::var_os("AWCC_DATABASE_PATH").map(PathBuf::from);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let db =
-        Database::resolve_with_reader(env_db.as_deref(), &cwd, |p| fs::read_to_string(p).ok())?;
+    let db = if let Some(explicit) = load_explicit_env_database() {
+        explicit?
+    } else {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Database::resolve_with_reader(None, &cwd, |p| fs::read_to_string(p).ok())?
+    };
     let device_name = read_dmi_product_name(None).unwrap_or_else(|| "Alienware m15 R6".to_string());
     let smbios_id = read_dmi_smbios_id(None).unwrap_or_else(|| "0x0A86".to_string());
     let cpu_vendor = read_cpu_vendor(None);
@@ -343,6 +361,23 @@ pub fn resolve_host_device_profile() -> Result<DeviceProfile, CoreError> {
         smbios_id,
         cpu_vendor,
     ))
+}
+
+/// Resolve the simulated `Alienware m15 R6` (`0x0A86`, `AMWW`, `GenuineIntel`) profile,
+/// honoring `AWCC_DATABASE_PATH` fail-closed when explicitly configured and otherwise using
+/// the compiled-in default database.
+pub fn resolve_simulated_m15_r6_profile() -> Result<DeviceProfile, CoreError> {
+    if let Some(explicit) = load_explicit_env_database() {
+        let db = explicit?;
+        Ok(DeviceProfile::resolve(
+            &db,
+            "Alienware m15 R6",
+            "0x0A86",
+            CpuVendor::Intel,
+        ))
+    } else {
+        DeviceProfile::alienware_m15_r6()
+    }
 }
 
 /// Linux `hwmon` sensor provider matching C++ `readHwmonLabeledSensor` in `src/Thermals.cpp`.

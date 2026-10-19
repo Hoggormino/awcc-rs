@@ -11,9 +11,11 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.92"
 license = "BSD-2-Clause"
 authors = ["AWCC Linux Contributors"]
+repository = "https://github.com/Hoggormino/awcc-rs"
+description = "Unofficial Alienware Command Center for Linux (Rust + Slint Material 3)"
 
 [workspace.dependencies]
 awcc-core = { path = "crates/awcc-core" }

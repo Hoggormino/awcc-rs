@@ -1,0 +1,32 @@
+#!/bin/sh
+# AppRun launcher for AWCC Linux AppImage.
+# Launches `awcc-gui` by default.
+# Dispatches to `awcc-cli` when invoked via an `awcc-cli` symlink/ARGV0 or when the first argument is `--cli` or `cli`.
+set -eu
+
+APPDIR="${APPDIR:-$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)}"
+export APPDIR
+
+if [ -d "$APPDIR/usr/lib" ]; then
+    export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+if [ -z "${AWCC_DATABASE_PATH:-}" ] && [ -f "$APPDIR/usr/share/awcc/database.json" ]; then
+    export AWCC_DATABASE_PATH="$APPDIR/usr/share/awcc/database.json"
+fi
+
+export PATH="$APPDIR/usr/bin${PATH:+:$PATH}"
+
+INVOKED_NAME="$(basename -- "${ARGV0:-$0}")"
+case "$INVOKED_NAME" in
+    awcc-cli*)
+        exec "$APPDIR/usr/bin/awcc-cli" "$@"
+        ;;
+esac
+
+if [ "${1:-}" = "--cli" ] || [ "${1:-}" = "cli" ]; then
+    shift
+    exec "$APPDIR/usr/bin/awcc-cli" "$@"
+fi
+
+exec "$APPDIR/usr/bin/awcc-gui" "$@"

@@ -143,7 +143,9 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand> {
         }
         "fancurve" => {
             let Some(arg1) = positional.get(1) else {
-                bail!("usage: awcc fancurve stop | <t1> <b1> <t2> <b2> <t3> <b3> <t4> <b4> [hyst]");
+                bail!(
+                    "usage: awcc-cli fancurve stop | <t1> <b1> <t2> <b2> <t3> <b3> <t4> <b4> [hyst]"
+                );
             };
             if arg1.eq_ignore_ascii_case("stop") || arg1.eq_ignore_ascii_case("off") {
                 return Ok(CliCommand::StopFanCurve);
@@ -163,7 +165,7 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand> {
         }
         "static" => {
             if positional.len() < 4 {
-                bail!("usage: awcc static <R> <G> <B> [--zone ...] [--volatile|--persist]");
+                bail!("usage: awcc-cli static <R> <G> <B> [--zone ...] [--volatile|--persist]");
             }
             let color = parse_rgb_triplet(&positional[1], &positional[2], &positional[3])?;
             Ok(CliCommand::ApplyLighting {
@@ -174,7 +176,7 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand> {
         }
         "breathe" | "wave" | "bkf" => {
             if positional.len() < 4 {
-                bail!("usage: awcc {cmd} <R> <G> <B> [duration_ms]");
+                bail!("usage: awcc-cli {cmd} <R> <G> <B> [duration_ms]");
             }
             let color = parse_rgb_triplet(&positional[1], &positional[2], &positional[3])?;
             let duration_ms = positional
@@ -245,7 +247,7 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand> {
         "power-led" => {
             if positional.len() < 4 {
                 bail!(
-                    "usage: awcc power-led <AC_R> <AC_G> <AC_B> [<DC_R> <DC_G> <DC_B> <CHG_R> <CHG_G> <CHG_B> <CRIT_R> <CRIT_G> <CRIT_B>]"
+                    "usage: awcc-cli power-led <AC_R> <AC_G> <AC_B> [<DC_R> <DC_G> <DC_B> <CHG_R> <CHG_G> <CHG_B> <CRIT_R> <CRIT_G> <CRIT_B>]"
                 );
             }
             let ac_color = parse_rgb_triplet(&positional[1], &positional[2], &positional[3])?;
@@ -607,7 +609,7 @@ fn main() -> Result<()> {
         }
         CliCommand::DeviceInfo => {
             let profile = if sim_mode {
-                DeviceProfile::alienware_m15_r6()
+                awcc_platform::resolve_simulated_m15_r6_profile()
                     .context("failed to resolve simulated device profile from database")?
             } else {
                 awcc_platform::resolve_host_device_profile()

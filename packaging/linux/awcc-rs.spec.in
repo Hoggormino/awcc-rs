@@ -1,0 +1,81 @@
+%global debug_package %{nil}
+%global __os_install_post %{nil}
+
+Name:           awcc-rs
+Version:        @VERSION@
+Release:        @RELEASE@%{?dist}
+Summary:        Unofficial Alienware Command Center for Linux (Rust + Slint Material 3)
+License:        BSD-2-Clause AND MIT
+URL:            https://github.com/Hoggormino/awcc-rs
+ExclusiveArch:  x86_64
+
+Requires:       hicolor-icon-theme
+Recommends:     libxkbcommon
+Recommends:     libxkbcommon-x11
+Recommends:     libX11
+Recommends:     libXcursor
+Recommends:     libXi
+Recommends:     libXrender
+Recommends:     wayland-libs-client
+Recommends:     wayland-libs-egl
+Recommends:     mesa-libEGL
+Recommends:     mesa-libGL
+
+%description
+AWCC Linux (awcc-rs) is an unofficial reimplementation of Alienware Command
+Center for Linux written in Rust with a Slint Material 3 desktop interface
+(awcc-gui) and command-line utility (awcc-cli). It supports thermal profile
+switching, GameShift (G-Mode), manual fan boost, custom 4-point fan curves,
+CPU TCC offset, and Alienware USB HID ELC RGB lighting, as well as a hardware-
+free simulation mode (--sim).
+
+%prep
+# Staged payload is provided via STAGED_ROOT macro
+
+%build
+# Pre-built common payload from Ubuntu 24.04 x86_64 baseline
+
+%install
+rm -rf %{buildroot}
+mkdir -p %{buildroot}%{_bindir}
+mkdir -p %{buildroot}%{_sysconfdir}/awcc
+mkdir -p %{buildroot}%{_datadir}/awcc
+mkdir -p %{buildroot}%{_datadir}/applications
+mkdir -p %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
+mkdir -p %{buildroot}%{_datadir}/icons/hicolor/256x256/apps
+mkdir -p %{buildroot}%{_datadir}/metainfo
+mkdir -p %{buildroot}%{_licensedir}/%{name}
+mkdir -p %{buildroot}%{_docdir}/%{name}
+
+install -m 0755 "%{staged_root}/bin/awcc-cli" "%{buildroot}%{_bindir}/awcc-cli"
+install -m 0755 "%{staged_root}/bin/awcc-gui" "%{buildroot}%{_bindir}/awcc-gui"
+install -m 0644 "%{staged_root}/share/awcc/database.json" "%{buildroot}%{_sysconfdir}/awcc/database.json"
+install -m 0644 "%{staged_root}/share/awcc/database.json" "%{buildroot}%{_datadir}/awcc/database.json"
+install -m 0644 "%{staged_root}/share/applications/awcc-gui.desktop" "%{buildroot}%{_datadir}/applications/awcc-gui.desktop"
+install -m 0644 "%{staged_root}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "%{buildroot}%{_datadir}/icons/hicolor/scalable/apps/awcc-gui.svg"
+install -m 0644 "%{staged_root}/share/icons/hicolor/256x256/apps/awcc-gui.png" "%{buildroot}%{_datadir}/icons/hicolor/256x256/apps/awcc-gui.png"
+install -m 0644 "%{staged_root}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "%{buildroot}%{_datadir}/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"
+install -m 0644 "%{staged_root}/share/licenses/awcc-rs/LICENSE" "%{buildroot}%{_licensedir}/%{name}/LICENSE"
+install -m 0644 "%{staged_root}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "%{buildroot}%{_licensedir}/%{name}/THIRD_PARTY_NOTICES.md"
+install -m 0644 "%{staged_root}/share/doc/awcc-rs/README.md" "%{buildroot}%{_docdir}/%{name}/README.md"
+install -m 0644 "%{staged_root}/share/doc/awcc-rs/INSTALL.txt" "%{buildroot}%{_docdir}/%{name}/INSTALL.txt"
+
+%files
+%{_bindir}/awcc-cli
+%{_bindir}/awcc-gui
+%dir %{_sysconfdir}/awcc
+%config(noreplace) %{_sysconfdir}/awcc/database.json
+%dir %{_datadir}/awcc
+%{_datadir}/awcc/database.json
+%{_datadir}/applications/awcc-gui.desktop
+%{_datadir}/icons/hicolor/scalable/apps/awcc-gui.svg
+%{_datadir}/icons/hicolor/256x256/apps/awcc-gui.png
+%{_datadir}/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml
+%license %{_licensedir}/%{name}/LICENSE
+%license %{_licensedir}/%{name}/THIRD_PARTY_NOTICES.md
+%doc %{_docdir}/%{name}/README.md
+%doc %{_docdir}/%{name}/INSTALL.txt
+
+%changelog
+* Mon Oct 19 2026 AWCC Linux Contributors <noreply@github.com> - @VERSION@-@RELEASE@
+- Automated release build of awcc-rs (@VERSION@) for x86_64 Linux.

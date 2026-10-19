@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.hoggormino.awcc_rs</id>
+  <name>AWCC Linux</name>
+  <summary>Thermal, fan curve, and RGB lighting control for Alienware systems</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>BSD-2-Clause</project_license>
+  <developer id="io.github.hoggormino">
+    <name>AWCC Linux Contributors</name>
+  </developer>
+  <launchable type="desktop-id">awcc-gui.desktop</launchable>
+  <description>
+    <p>
+      AWCC Linux (awcc-rs) is a Rust and Slint Material 3 desktop application and command-line
+      interface for controlling thermal profiles, G-Mode (GameShift), manual fan boost, custom
+      temperature-to-boost fan curves, CPU TCC offset, and Alienware ELC USB HID RGB lighting on
+      supported Alienware and Dell G-Series systems.
+    </p>
+    <p>
+      Includes a deterministic hardware simulation mode (--sim) for offline verification, UI
+      inspection, and headless screenshot rendering without requiring physical hardware access.
+    </p>
+  </description>
+  <url type="homepage">https://github.com/Hoggormino/awcc-rs</url>
+  <url type="bugtracker">https://github.com/Hoggormino/awcc-rs/issues</url>
+  <url type="vcs-browser">https://github.com/Hoggormino/awcc-rs</url>
+  <provides>
+    <binary>awcc-gui</binary>
+    <binary>awcc-cli</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+</component>

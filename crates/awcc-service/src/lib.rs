@@ -11,7 +11,7 @@ use awcc_core::{
     lighting::{LightingEffect, ZoneTarget},
     validate_fan_boost, validate_tcc_offset,
 };
-pub use awcc_platform::resolve_host_device_profile;
+pub use awcc_platform::{resolve_host_device_profile, resolve_simulated_m15_r6_profile};
 use awcc_platform::{
     HwmonProvider, LinuxAcpiTransport, MemoryStateStorage, PosixStateStore, SimBackend,
     StateStorage, ThermalTransport, WriteAuditEntry,
@@ -176,7 +176,7 @@ impl ThermalOrchestrator {
 
     /// Construct a default simulated Alienware m15 R6 orchestrator (`--sim`).
     pub fn new_simulated_m15_r6() -> Result<Self, awcc_core::CoreError> {
-        let profile = DeviceProfile::alienware_m15_r6()?;
+        let profile = resolve_simulated_m15_r6_profile()?;
         Ok(Self::new(
             profile,
             Box::new(SimBackend::new_alienware_m15_r6()),

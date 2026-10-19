@@ -9,14 +9,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use awcc_core::{
-    DeviceProfile, FanCurveConfig, FanCurvePoint, OperationLifecycle, SimScenario, ThermalMode,
-    ThermalModeState,
+    FanCurveConfig, FanCurvePoint, OperationLifecycle, SimScenario, ThermalMode, ThermalModeState,
     lighting::{LightingEffect, PowerStateSlot, ZoneTarget},
 };
 use awcc_platform::WriteAuditEntry;
 use awcc_service::{
     ServiceCommand, SystemSnapshot, ThermalOrchestrator, ThermalServiceHandle,
-    resolve_host_device_profile,
+    resolve_host_device_profile, resolve_simulated_m15_r6_profile,
 };
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
@@ -119,7 +118,7 @@ OPTIONS:
 
 fn run_device_info(sim_mode: bool) -> Result<()> {
     let profile = if sim_mode {
-        DeviceProfile::alienware_m15_r6()?
+        resolve_simulated_m15_r6_profile()?
     } else {
         resolve_host_device_profile()?
     };

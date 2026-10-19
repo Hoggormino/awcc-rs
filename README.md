@@ -12,47 +12,52 @@ Unofficial Alienware Command Center for Linux rewritten in **Rust** with a compa
 | [`crates/awcc-platform`](crates/awcc-platform) | Hardware transport traits (`ThermalTransport`, `StateStorage`, `ElcUsbTransport`) with both live Linux backends (`/proc/acpi/call` WMAX, `hwmon`, `rusb` USB HID) and deterministic `SimBackend` / `MockElcDevice`. |
 | [`crates/awcc-service`](crates/awcc-service) | Non-blocking background worker (`ThermalServiceHandle`), privileged Unix-socket daemon (`/tmp/awcc.sock` allowlist executor), and `evdev` hotkey keybinder (`G-Mode` / brightness cycle). |
 | [`crates/awcc-gui`](crates/awcc-gui) | Slint (`@material` 1.1.0) desktop GUI (`awcc-gui`) with live hardware auto-detection, interactive simulation scenario controls (`--sim`), and headless PNG screenshot export (`--screenshot`). |
-| [`crates/awcc-cli`](crates/awcc-cli) | Command-line interface and daemon entry point (`awcc`) supporting thermal modes, G-Mode, manual fan boost, TCC offset, custom fan curves, RGB lighting effects, and `raw-status` diagnostics. |
+| [`crates/awcc-cli`](crates/awcc-cli) | Command-line interface (`awcc-cli`) supporting thermal modes, G-Mode, manual fan boost, TCC offset, custom fan curves, RGB lighting effects, and `raw-status` diagnostics. |
 | [`conformance/`](conformance) | C++ baseline conformance vectors (`cpp_baseline_vectors.json`) verified by `crates/awcc-platform/tests/conformance_suite.rs`. |
+| [`packaging/linux/`](packaging/linux) | Linux desktop integration (`awcc-gui.desktop`, icons, AppStream metainfo, `AppRun`) and RPM/Arch package templates (`awcc-rs.spec.in`, `PKGBUILD.in`). |
+| [`scripts/`](scripts) | Reusable payload staging, multi-distro package builders (`.tar.gz`, `AppImage`, `.deb`, `.rpm`, `.pkg.tar.zst`), isolated smoke tests, and release publication scripts. |
 | [`ui-libraries/material-1.1.0`](ui-libraries/material-1.1.0) | Vendored official Slint Material 3 component library (`@material` `1.1.0`, MIT license). |
-| [`docs/`](docs) | Durable engineering specifications: C++ source assessment & compatibility map, architecture & migration strategy, and Figma/Material 3 mapping. |
+| [`docs/`](docs) | Engineering specifications: architecture & migration strategy, C++ compatibility map, Figma/Material 3 mapping, and [`ci_packaging_and_release.md`](docs/ci_packaging_and_release.md). |
 
 ---
 
 ## Clone, Build, and Test
 
+Toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (`1.95.0`, workspace MSRV `1.92`):
+
 ```bash
 git clone https://github.com/Hoggormino/awcc-rs.git
 cd awcc-rs
 
-# Build workspace (debug or release)
-cargo build --workspace
-cargo build --workspace --release
+# Build workspace (debug or release, locked to Cargo.lock)
+cargo build --workspace --locked
+cargo build --workspace --release --locked
 
 # Run quality gates (format, Clippy, unit & conformance tests)
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
 ```
 
 ---
 
-## Running the GUI & CLI
+## Running the GUI (`awcc-gui`) & CLI (`awcc-cli`)
 
 ### 1. Launch the Desktop GUI (`awcc-gui`)
 ```bash
-# Auto-detect live Alienware hardware (falls back to simulation if unavailable, or pass --sim)
+# Auto-detect live Alienware hardware (or pass --sim for simulation mode)
 cargo run -p awcc-gui
 
 # Explicitly run in Simulated Hardware Mode (Alienware m15 R6 · \_SB.AMWW.WMAX)
 cargo run -p awcc-gui -- --sim
 ```
 
-### 2. Run CLI Commands (`awcc`)
+### 2. Run CLI Commands (`awcc-cli`)
 ```bash
 cargo run -p awcc-cli -- --help
 cargo run -p awcc-cli -- device-info
-cargo run -p awcc-cli -- query-mode
+cargo run -p awcc-cli -- --sim device-info
+cargo run -p awcc-cli -- --sim query-mode
 ```
 
 ### 3. Render Deterministic Screenshots (`1120×720` Normal, `880×620` Compact, Rollback, Lighting, Diagnostics)
@@ -63,3 +68,17 @@ cargo run -p awcc-gui -- --sim --screenshot docs/screenshots/prototype-rollback-
 cargo run -p awcc-gui -- --sim --screenshot docs/screenshots/prototype-lighting-1120x720.png --width 1120 --height 720 --scenario lighting
 cargo run -p awcc-gui -- --sim --screenshot docs/screenshots/prototype-diagnostics-1120x720.png --width 1120 --height 720 --scenario diagnostics
 ```
+
+---
+
+## Packaging, CI & Releases
+
+Every push to `main`, pull request, manual `workflow_dispatch` run, and `vX.Y.Z` release tag builds and smoke-tests all five Linux `x86_64` package formats:
+
+1. **Binary Archive**: `awcc-rs-<version>-x86_64-unknown-linux-gnu.tar.gz`
+2. **AppImage**: `awcc-rs-<version>-x86_64.AppImage` (launches `awcc-gui` by default; pass `--cli <args>` or symlink as `awcc-cli` for CLI mode)
+3. **Debian / Ubuntu 24.04+**: `awcc-rs_<version>_amd64.deb`
+4. **Fedora 41+**: `awcc-rs-<version>-1.x86_64.rpm`
+5. **Arch Linux / CachyOS**: `awcc-rs-<version>-1-x86_64.pkg.tar.zst` + `PKGBUILD` + `.SRCINFO`
+
+See [`docs/ci_packaging_and_release.md`](docs/ci_packaging_and_release.md) for local packaging instructions, checksum verification (`SHA256SUMS`), hardware prerequisites, and maintainer release procedures.
