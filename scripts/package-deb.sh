@@ -53,6 +53,7 @@ mkdir -p \
     "${PKG_ROOT}/usr/share/icons/hicolor/scalable/apps" \
     "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps" \
     "${PKG_ROOT}/usr/share/metainfo" \
+    "${PKG_ROOT}/usr/share/licenses/awcc-rs" \
     "${PKG_ROOT}/usr/share/doc/awcc-rs"
 
 install -m 0755 "${STAGED_DIR}/bin/awcc-cli" "${PKG_ROOT}/usr/bin/awcc-cli"
@@ -63,6 +64,8 @@ install -m 0644 "${STAGED_DIR}/share/applications/awcc-gui.desktop" "${PKG_ROOT}
 install -m 0644 "${STAGED_DIR}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "${PKG_ROOT}/usr/share/icons/hicolor/scalable/apps/awcc-gui.svg"
 install -m 0644 "${STAGED_DIR}/share/icons/hicolor/256x256/apps/awcc-gui.png" "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps/awcc-gui.png"
 install -m 0644 "${STAGED_DIR}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "${PKG_ROOT}/usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"
+install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/LICENSE" "${PKG_ROOT}/usr/share/licenses/awcc-rs/LICENSE"
+install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "${PKG_ROOT}/usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md"
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/LICENSE" "${PKG_ROOT}/usr/share/doc/awcc-rs/copyright"
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "${PKG_ROOT}/usr/share/doc/awcc-rs/THIRD_PARTY_NOTICES.md"
 install -m 0644 "${STAGED_DIR}/share/doc/awcc-rs/README.md" "${PKG_ROOT}/usr/share/doc/awcc-rs/README.md"

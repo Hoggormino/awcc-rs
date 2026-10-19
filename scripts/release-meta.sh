@@ -18,9 +18,23 @@ AWCC_DEB_ARCH="amd64"
 AWCC_PKGREL="${AWCC_PKGREL:-1}"
 export AWCC_TARGET AWCC_ARCH AWCC_DEB_ARCH AWCC_PKGREL
 
-AWCC_GIT_SHA="$(git -C "${AWCC_REPO_ROOT}" rev-parse HEAD)"
-AWCC_GIT_SHORT_SHA="$(git -C "${AWCC_REPO_ROOT}" rev-parse --short=12 HEAD)"
-AWCC_SOURCE_DATE_EPOCH="$(git -C "${AWCC_REPO_ROOT}" log -1 --format=%ct HEAD)"
+if [[ -z "${AWCC_GIT_SHA:-}" ]]; then
+    if command -v git >/dev/null 2>&1 && git -C "${AWCC_REPO_ROOT}" rev-parse HEAD >/dev/null 2>&1; then
+        AWCC_GIT_SHA="$(git -C "${AWCC_REPO_ROOT}" rev-parse HEAD)"
+    else
+        AWCC_GIT_SHA="${GITHUB_SHA:-unknown}"
+    fi
+fi
+AWCC_GIT_SHORT_SHA="${AWCC_GIT_SHORT_SHA:-${AWCC_GIT_SHA:0:12}}"
+if [[ -z "${AWCC_SOURCE_DATE_EPOCH:-}" ]]; then
+    if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
+        AWCC_SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}"
+    elif command -v git >/dev/null 2>&1 && git -C "${AWCC_REPO_ROOT}" log -1 --format=%ct HEAD >/dev/null 2>&1; then
+        AWCC_SOURCE_DATE_EPOCH="$(git -C "${AWCC_REPO_ROOT}" log -1 --format=%ct HEAD)"
+    else
+        AWCC_SOURCE_DATE_EPOCH="1700000000"
+    fi
+fi
 export AWCC_GIT_SHA AWCC_GIT_SHORT_SHA AWCC_SOURCE_DATE_EPOCH
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-${AWCC_SOURCE_DATE_EPOCH}}"
 

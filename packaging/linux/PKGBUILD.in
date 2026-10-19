@@ -6,7 +6,7 @@ pkgdesc="Unofficial Alienware Command Center for Linux (Rust + Slint Material 3 
 arch=('x86_64')
 url="https://github.com/Hoggormino/awcc-rs"
 license=('BSD-2-Clause' 'MIT')
-depends=('glibc' 'gcc-libs' 'libusb' 'fontconfig' 'hicolor-icon-theme')
+depends=('glibc' 'gcc-libs' 'libusb' 'fontconfig' 'ttf-dejavu' 'hicolor-icon-theme')
 optdepends=(
   'libxkbcommon: Wayland and X11 keyboard handling for awcc-gui'
   'libxkbcommon-x11: X11 keyboard handling for awcc-gui'

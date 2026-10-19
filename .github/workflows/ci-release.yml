@@ -182,7 +182,8 @@ jobs:
               test -f /usr/share/awcc/database.json
               test -f /usr/share/applications/awcc-gui.desktop
               test -f /usr/share/doc/awcc-rs/copyright
-              test -f /usr/share/doc/awcc-rs/THIRD_PARTY_NOTICES.md
+              test -f /usr/share/licenses/awcc-rs/LICENSE
+              test -f /usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md
               useradd -m -s /bin/bash tester
               chown -R tester:tester /screenshots
               su - tester -c "/work/scripts/smoke-test-installed.sh \
@@ -221,7 +222,10 @@ jobs:
         run: |
           mkdir -p dist/staging/payload dist/fedora dist/fedora/smoke-screenshots
           tar -xzf dist/staged-payload.tar.gz -C dist/staging/payload
+          HOST_SDE="$(git log -1 --format=%ct HEAD)"
           docker run --rm \
+            -e AWCC_GIT_SHA="${GITHUB_SHA}" \
+            -e SOURCE_DATE_EPOCH="${HOST_SDE}" \
             -v "${PWD}:/work:rw" \
             fedora:41 \
             bash -euxo pipefail -c '
@@ -247,6 +251,7 @@ jobs:
                 --label rpm-fedora41 \
                 --screenshot-dir /work/dist/fedora/smoke-screenshots"
             '
+          sudo chown -R "$(id -u):$(id -g)" dist/fedora
 
       - name: Upload Fedora .rpm package
         uses: actions/upload-artifact@v7
@@ -288,14 +293,17 @@ jobs:
             echo "ERROR: Could not locate finalized release tarball in dist/ubuntu" >&2
             exit 1
           fi
+          HOST_SDE="$(git log -1 --format=%ct HEAD)"
           docker run --rm \
+            -e AWCC_GIT_SHA="${GITHUB_SHA}" \
+            -e SOURCE_DATE_EPOCH="${HOST_SDE}" \
             -v "${PWD}:/work:rw" \
             archlinux:base-devel \
             bash -euxo pipefail -c "
-              pacman -Sy --noconfirm python
+              pacman -Sy --noconfirm --needed python
               useradd -m -s /bin/bash builder
               chown -R builder:builder /work/dist/arch
-              su - builder -c 'cd /work && ./scripts/package-arch.sh --out-dir /work/dist/arch --tarball /work/${TARBALL_FILE} --skip-smoke'
+              su - builder -c 'AWCC_GIT_SHA=${GITHUB_SHA} SOURCE_DATE_EPOCH=${HOST_SDE} /work/scripts/package-arch.sh --out-dir /work/dist/arch --tarball /work/${TARBALL_FILE} --skip-smoke'
               pacman -U --noconfirm /work/dist/arch/awcc-rs-*-x86_64.pkg.tar.zst
               pacman -Qi awcc-rs
               pacman -Ql awcc-rs
