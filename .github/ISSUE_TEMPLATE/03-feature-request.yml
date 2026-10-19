@@ -1,0 +1,44 @@
+name: Feature Request
+description: Propose a workflow, CLI command, GUI improvement, or packaging enhancement.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Related area
+      description: Which part of awcc-rs does this proposal relate to?
+      options:
+        - "GUI (awcc-gui)"
+        - "Thermal / Fans / G-Mode / TCC (area: thermal)"
+        - "Lighting / USB ELC / Stealth (area: lighting)"
+        - "Packaging / systemd / udev / AppImage (area: packaging)"
+        - "Hardware Profile / DMI Detection (area: hardware)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What problem are you trying to solve, or what workflow is currently awkward or impossible?
+      placeholder: "When I try to ..., I have to ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired_behavior
+    attributes:
+      label: Desired behavior
+      description: Describe the CLI, GUI, or service behavior you would like to see, keeping hardware safety (no unsolicited writes on passive navigation/startup) in mind.
+      placeholder: "I would like awcc-cli / awcc-gui to ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or additional context (optional)
+      description: Any workarounds, constraints, or related issues.
+    validations:
+      required: false

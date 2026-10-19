@@ -18,7 +18,7 @@ Unofficial Alienware Command Center for Linux rewritten in **Rust** with a compa
 | [`packaging/linux/`](packaging/linux) | Linux desktop integration (`awcc-gui.desktop`, icons, AppStream metainfo, `AppRun`) and RPM/Arch package templates (`awcc-rs.spec.in`, `PKGBUILD.in`). |
 | [`scripts/`](scripts) | Reusable payload staging, multi-distro package builders (`.tar.gz`, `AppImage`, `.deb`, `.rpm`, `.pkg.tar.zst`), isolated smoke tests, and release publication scripts. |
 | [`ui-libraries/material-1.1.0`](ui-libraries/material-1.1.0) | Vendored official Slint Material 3 component library (`@material` `1.1.0`, MIT license). |
-| [`docs/`](docs) | Engineering specifications: architecture & migration strategy, C++ compatibility map, Figma/Material 3 mapping, [`operation_outcomes_and_build_identity.md`](docs/operation_outcomes_and_build_identity.md), [`structured_logging_and_support_export.md`](docs/structured_logging_and_support_export.md), and [`ci_packaging_and_release.md`](docs/ci_packaging_and_release.md). |
+| [`docs/`](docs) | Engineering specifications: architecture & migration strategy, C++ compatibility map, Figma/Material 3 mapping, [`operation_outcomes_and_build_identity.md`](docs/operation_outcomes_and_build_identity.md), [`structured_logging_and_support_export.md`](docs/structured_logging_and_support_export.md), [`agent_issue_investigation_workflow.md`](docs/agent_issue_investigation_workflow.md), and [`ci_packaging_and_release.md`](docs/ci_packaging_and_release.md). |
 
 ---
 
@@ -88,3 +88,11 @@ Every push to `main`, pull request, manual `workflow_dispatch` run, and `vX.Y.Z`
 `awcc-cli --version` / `awcc-gui --version` report the version, source commit (or `unknown`), dirty state, target, toolchain, and installation format; see [`docs/operation_outcomes_and_build_identity.md`](docs/operation_outcomes_and_build_identity.md) for that metadata and for how command outcomes (`Accepted` vs. `Confirmed` vs. `Failed`) and unavailable/stale state are reported. See [`docs/structured_logging_and_support_export.md`](docs/structured_logging_and_support_export.md) for log-level controls (`--log-level`, `-v`, `AWCC_LOG`), bounded session logs under `$XDG_STATE_HOME/awcc-rs/logs`, and passive redacted support bundles (`awcc-cli diagnostics export`).
 
 See [`docs/ci_packaging_and_release.md`](docs/ci_packaging_and_release.md) for local packaging instructions, checksum verification (`SHA256SUMS`), hardware prerequisites, and maintainer release procedures.
+
+---
+
+## Support, Contributing & Security
+
+- **Support & Diagnostics**: [`SUPPORT.md`](SUPPORT.md) — supported platforms, hardware matrix, passive support export (`awcc-cli diagnostics export`), and startup-failure capture.
+- **Contributing & Local Agent Investigation**: [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`docs/agent_issue_investigation_workflow.md`](docs/agent_issue_investigation_workflow.md).
+- **Security Policy**: [`SECURITY.md`](SECURITY.md) — private vulnerability reporting instructions.

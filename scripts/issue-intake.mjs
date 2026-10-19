@@ -1,0 +1,568 @@
+// Deterministic, checkout-free issue intake logic for Hoggormino/awcc-rs.
+// All issue titles, bodies, and comments are treated strictly as untrusted data strings
+// and are never interpolated into shell commands or executed.
+
+export const BOT_COMMENT_MARKER = "<!-- awcc-rs:issue-intake:v1 -->";
+
+const BOT_LOGINS = new Set(["github-actions[bot]", "app/github-actions"]);
+
+const MAINTAINER_TRIAGE_LABELS = new Set([
+  "confirmed",
+  "needs-hardware-test",
+  "priority: high",
+  "duplicate",
+  "invalid",
+  "wontfix",
+]);
+
+const AREA_DROPDOWN_MAP = [
+  { match: "area: gui", label: "area: gui" },
+  { match: "GUI (awcc-gui)", label: "area: gui" },
+  { match: "area: thermal", label: "area: thermal" },
+  { match: "area: lighting", label: "area: lighting" },
+  { match: "area: packaging", label: "area: packaging" },
+  { match: "area: hardware", label: "area: hardware" },
+];
+
+const DEFAULT_FEATURE_MATRIX_LINES = [
+  "- Profile match (`awcc-cli device-info`): [works / fails / not in database.json]",
+  "- Thermal mode queries & switching (`Balanced`, `Performance`, `Quiet`, `Cool`, `Full Speed`): [works / fails / untried]",
+  "- G-Mode / GameShift toggle (`awcc-cli g`): [works / fails / untried]",
+  "- Manual fan boost & fan RPM/temp telemetry (`awcc-cli qf`, `awcc-cli bm`): [works / fails / untried]",
+  "- TCC offset / CPU turbo (`awcc-cli qtcc`, `awcc-cli qct`): [works / fails / untried]",
+  "- USB ELC RGB lighting / brightness / stealth (`awcc-cli raw-status`, `awcc-cli lb`): [works / fails / untried]",
+];
+
+export function isBotUser(user) {
+  if (!user || typeof user !== "object") return false;
+  const login = String(user.login || "");
+  const type = String(user.type || "");
+  return BOT_LOGINS.has(login) || (type === "Bot" && login.endsWith("[bot]"));
+}
+
+export function isVerifiedBotComment(comment) {
+  if (!comment || typeof comment.body !== "string") return false;
+  if (!comment.body.includes(BOT_COMMENT_MARKER)) return false;
+  return isBotUser(comment.user);
+}
+
+export function parseFormSections(bodyText) {
+  const sections = new Map();
+  const normalized = String(bodyText || "").replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  let currentHeading = null;
+  let buffer = [];
+
+  for (const line of lines) {
+    if (line.startsWith("### ")) {
+      if (currentHeading !== null) {
+        sections.set(currentHeading, buffer.join("\n").trim());
+      }
+      currentHeading = line.slice(4).trim();
+      buffer = [];
+    } else if (currentHeading !== null) {
+      buffer.push(line);
+    }
+  }
+  if (currentHeading !== null) {
+    sections.set(currentHeading, buffer.join("\n").trim());
+  }
+  return sections;
+}
+
+export function detectFormType(sections) {
+  if (
+    sections.has("Expected vs. actual behavior") ||
+    sections.has("Steps to reproduce") ||
+    sections.has("Diagnostic evidence availability")
+  ) {
+    return "bug";
+  }
+  if (
+    sections.has("Device model name (`product_name`)") ||
+    sections.has("Which features work or fail?")
+  ) {
+    return "hardware";
+  }
+  if (sections.has("Problem or use case") && sections.has("Desired behavior")) {
+    return "feature";
+  }
+  return "blank";
+}
+
+function isMeaninglessValue(raw) {
+  const val = String(raw || "").trim();
+  if (!val) return true;
+  const lower = val.toLowerCase();
+  if (
+    lower === "_no response_" ||
+    lower === "no response" ||
+    lower === "n/a" ||
+    lower === "none" ||
+    lower === "..." ||
+    lower === "tbd"
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isUneditedBugExpectedActual(raw) {
+  if (isMeaninglessValue(raw)) return true;
+  const compact = String(raw)
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .join("\n");
+  return compact === "Expected: ...\nActual: ...";
+}
+
+function isUneditedBugSteps(raw) {
+  if (isMeaninglessValue(raw)) return true;
+  const compact = String(raw)
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .join("\n");
+  return compact === "1. Run `...`\n2. Click `...`\n3. Observe `...`";
+}
+
+function isUneditedFeatureMatrix(raw) {
+  if (isMeaninglessValue(raw)) return true;
+  const lines = String(raw)
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return true;
+  return lines.every((line) => DEFAULT_FEATURE_MATRIX_LINES.includes(line));
+}
+
+export function inferAreaLabel(formType, sections) {
+  if (formType === "hardware") {
+    return "area: hardware";
+  }
+  const rawArea =
+    sections.get("Affected area") || sections.get("Related area") || "";
+  for (const entry of AREA_DROPDOWN_MAP) {
+    if (rawArea.includes(entry.match)) {
+      return entry.label;
+    }
+  }
+  return null;
+}
+
+export function findMissingFields(formType, sections, rawBody) {
+  const missing = [];
+  if (formType === "bug") {
+    const version = sections.get(
+      "Application version (`awcc-cli --version` or `awcc-gui --version`)"
+    );
+    if (isMeaninglessValue(version)) {
+      missing.push(
+        "**Application version**: output of `awcc-cli --version` or `awcc-gui --version` (or the installed package version if neither binary starts)"
+      );
+    }
+
+    const installFormat = sections.get("Installation format");
+    if (isMeaninglessValue(installFormat)) {
+      missing.push(
+        "**Installation format**: `.deb`, `.rpm`, `.pkg.tar.zst`, `.AppImage`, `.tar.gz`, or source build"
+      );
+    }
+
+    const expectedActual = sections.get("Expected vs. actual behavior");
+    if (isUneditedBugExpectedActual(expectedActual)) {
+      missing.push(
+        "**Expected vs. actual behavior**: what you expected to happen and the actual result or error message"
+      );
+    }
+
+    const steps = sections.get("Steps to reproduce");
+    if (isUneditedBugSteps(steps)) {
+      missing.push(
+        "**Steps to reproduce**: the commands or GUI actions that trigger the issue"
+      );
+    }
+
+    const diagStatus = String(
+      sections.get("Diagnostic evidence availability") || ""
+    );
+    const diagBody = sections.get(
+      "Support report (`awcc-support.zip`), diagnostic summary, or terminal output"
+    );
+    if (isMeaninglessValue(diagBody)) {
+      if (diagStatus.toLowerCase().includes("startup")) {
+        missing.push(
+          "**Startup failure output**: terminal output from `awcc-gui -v` or `awcc-cli -v` (since diagnostic export cannot run)"
+        );
+      } else {
+        missing.push(
+          "**Diagnostic evidence**: attach `awcc-support.zip` (`awcc-cli diagnostics export --output awcc-support.zip`), paste `awcc-cli diagnostics summary`, or—if startup failed—paste terminal output from `awcc-gui -v` / `awcc-cli -v`"
+        );
+      }
+    }
+  } else if (formType === "hardware") {
+    const model = sections.get("Device model name (`product_name`)");
+    if (isMeaninglessValue(model)) {
+      missing.push(
+        "**Device model name**: output of `cat /sys/devices/virtual/dmi/id/product_name` or `awcc-cli device-info`"
+      );
+    }
+
+    const matrix = sections.get("Which features work or fail?");
+    if (isUneditedFeatureMatrix(matrix)) {
+      missing.push(
+        "**Feature results**: update the checklist under *Which features work or fail?* to show which controls or sensors work or fail on your model"
+      );
+    }
+
+    const devDiag = sections.get(
+      "`awcc-cli device-info` output or `awcc-support.zip` attachment"
+    );
+    if (isMeaninglessValue(devDiag)) {
+      missing.push(
+        "**Device diagnostics**: paste `awcc-cli device-info` (or attach `awcc-support.zip`), or explain why the binary could not run"
+      );
+    }
+  } else if (formType === "feature") {
+    const problem = sections.get("Problem or use case");
+    if (isMeaninglessValue(problem)) {
+      missing.push(
+        "**Problem or use case**: describe the workflow or limitation this feature would address"
+      );
+    }
+
+    const desired = sections.get("Desired behavior");
+    if (isMeaninglessValue(desired)) {
+      missing.push(
+        "**Desired behavior**: describe the expected CLI, GUI, or service behavior"
+      );
+    }
+  } else if (isMeaninglessValue(rawBody)) {
+    missing.push(
+      "**Issue description**: please describe the bug, hardware model report, or feature request"
+    );
+  }
+  return missing;
+}
+
+export function buildMissingInfoComment(missingFields) {
+  const bullets = missingFields.map((item) => `- ${item}`).join("\n");
+  return `${BOT_COMMENT_MARKER}
+Thanks for opening this issue. To help maintainers investigate without guesswork, please edit the issue description (or reply) with the following missing information:
+
+${bullets}
+
+**Tip**: When \`awcc-cli\` can run, \`awcc-cli diagnostics export --output awcc-support.zip\` (or **Log → Export Support Report** in \`awcc-gui\`) collects build identity, profile match, and redacted logs passively without querying hardware. If the application fails during startup, run \`awcc-gui -v\` or \`awcc-cli -v\` in a terminal and paste the stderr output instead.
+
+*Privacy reminder: Never include your machine serial number or Dell Service Tag.*`;
+}
+
+export function buildResolvedInfoComment() {
+  return `${BOT_COMMENT_MARKER}
+Thanks for updating the issue with the requested details. \`needs-info\` has been removed and this report is queued for maintainer review.`;
+}
+
+function analyzeLabelHistory(issueEvents) {
+  const lastHumanActionByLabel = new Map();
+  let humanRemovedNeedsTriage = false;
+  let humanAddedNeedsInfo = false;
+
+  for (const ev of issueEvents || []) {
+    if (!ev || typeof ev !== "object") continue;
+    if (ev.event !== "labeled" && ev.event !== "unlabeled") continue;
+    const labelName = ev.label?.name;
+    if (!labelName) continue;
+    if (isBotUser(ev.actor)) continue;
+
+    lastHumanActionByLabel.set(labelName, ev.event);
+    if (labelName === "needs-triage" && ev.event === "unlabeled") {
+      humanRemovedNeedsTriage = true;
+    }
+    if (labelName === "needs-info" && ev.event === "labeled") {
+      humanAddedNeedsInfo = true;
+    }
+    if (labelName === "needs-info" && ev.event === "unlabeled") {
+      humanAddedNeedsInfo = false;
+    }
+  }
+
+  const manuallyRemovedLabels = new Set();
+  for (const [labelName, action] of lastHumanActionByLabel.entries()) {
+    if (action === "unlabeled") {
+      manuallyRemovedLabels.add(labelName);
+    }
+  }
+
+  return {
+    manuallyRemovedLabels,
+    humanRemovedNeedsTriage,
+    humanAddedNeedsInfo,
+  };
+}
+
+export function evaluateIssueIntake({
+  payload,
+  existingComments = [],
+  issueEvents = [],
+}) {
+  const action = payload?.action || "";
+  const issue = payload?.issue;
+  if (!issue || typeof issue !== "object") {
+    return {
+      skip: true,
+      reason: "no_issue_payload",
+      labelsToAdd: [],
+      labelsToRemove: [],
+      commentAction: null,
+    };
+  }
+
+  if (issue.pull_request) {
+    return {
+      skip: true,
+      reason: "pull_request",
+      labelsToAdd: [],
+      labelsToRemove: [],
+      commentAction: null,
+    };
+  }
+
+  if (issue.state !== "open") {
+    return {
+      skip: true,
+      reason: "issue_closed",
+      labelsToAdd: [],
+      labelsToRemove: [],
+      commentAction: null,
+    };
+  }
+
+  if (!["opened", "reopened", "edited"].includes(action)) {
+    return {
+      skip: true,
+      reason: `unsupported_action:${action}`,
+      labelsToAdd: [],
+      labelsToRemove: [],
+      commentAction: null,
+    };
+  }
+
+  const currentLabels = new Set(
+    (issue.labels || [])
+      .map((l) => (typeof l === "string" ? l : l?.name))
+      .filter(Boolean)
+  );
+
+  const {
+    manuallyRemovedLabels,
+    humanRemovedNeedsTriage,
+    humanAddedNeedsInfo,
+  } = analyzeLabelHistory(issueEvents);
+
+  const hasMaintainerDecisionLabel = [...currentLabels].some((l) =>
+    MAINTAINER_TRIAGE_LABELS.has(l)
+  );
+  const maintainerTriaged =
+    hasMaintainerDecisionLabel || humanRemovedNeedsTriage;
+
+  const verifiedBotComments = (existingComments || []).filter(
+    isVerifiedBotComment
+  );
+  const existingBotComment =
+    verifiedBotComments.length > 0 ? verifiedBotComments[0] : null;
+
+  const rawBody = String(issue.body || "");
+  const sections = parseFormSections(rawBody);
+  const formType = detectFormType(sections);
+  const inferredArea = inferAreaLabel(formType, sections);
+  const missingFields = findMissingFields(formType, sections, rawBody);
+
+  const labelsToAdd = [];
+  const labelsToRemove = [];
+
+  const maybeAddLabel = (label) => {
+    if (!label) return;
+    if (currentLabels.has(label)) return;
+    if (manuallyRemovedLabels.has(label)) return;
+    if (!labelsToAdd.includes(label)) {
+      labelsToAdd.push(label);
+    }
+  };
+
+  // Type label inference (preserving maintainer choices):
+  if (formType === "bug") {
+    maybeAddLabel("bug");
+  } else if (formType === "feature") {
+    maybeAddLabel("enhancement");
+  }
+
+  // Area label inference: only add if no area:* label is already present (or if this is initial intake)
+  // and the maintainer has not manually removed it.
+  const hasAnyAreaLabel = [...currentLabels].some((l) =>
+    l.startsWith("area: ")
+  );
+  if (inferredArea && !hasAnyAreaLabel) {
+    maybeAddLabel(inferredArea);
+  }
+
+  // Triage status label logic:
+  if (!maintainerTriaged) {
+    maybeAddLabel("needs-triage");
+  }
+
+  let commentAction = null;
+
+  if (missingFields.length > 0) {
+    // Only request missing info if the issue has not already been triaged by a maintainer.
+    if (!maintainerTriaged) {
+      maybeAddLabel("needs-info");
+      const desiredBody = buildMissingInfoComment(missingFields);
+      if (existingBotComment) {
+        if (existingBotComment.body !== desiredBody) {
+          commentAction = {
+            type: "update",
+            commentId: existingBotComment.id,
+            body: desiredBody,
+          };
+        }
+      } else {
+        commentAction = {
+          type: "create",
+          body: desiredBody,
+        };
+      }
+    }
+  } else {
+    // Report has all required fields for its form!
+    if (
+      currentLabels.has("needs-info") &&
+      !humanAddedNeedsInfo &&
+      !maintainerTriaged
+    ) {
+      labelsToRemove.push("needs-info");
+    }
+    if (existingBotComment) {
+      const resolvedBody = buildResolvedInfoComment();
+      if (existingBotComment.body !== resolvedBody) {
+        commentAction = {
+          type: "update",
+          commentId: existingBotComment.id,
+          body: resolvedBody,
+        };
+      }
+    }
+  }
+
+  return {
+    skip: false,
+    formType,
+    inferredArea,
+    maintainerTriaged,
+    missingFields,
+    labelsToAdd,
+    labelsToRemove,
+    commentAction,
+  };
+}
+
+async function listBoundedPages(fetchPage, maxPages = 5) {
+  const items = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const res = await fetchPage(page);
+    const data = Array.isArray(res?.data) ? res.data : [];
+    items.push(...data);
+    if (data.length < 100) {
+      break;
+    }
+  }
+  return items;
+}
+
+export async function runIssueIntake({ github, context }) {
+  const payload = context.payload;
+  const issue = payload?.issue;
+  if (!issue || issue.pull_request || issue.state !== "open") {
+    return { skipped: true };
+  }
+
+  const owner = context.repo.owner;
+  const repo = context.repo.repo;
+  const issue_number = issue.number;
+
+  const [existingComments, issueEvents] = await Promise.all([
+    listBoundedPages((page) =>
+      github.rest.issues.listComments({
+        owner,
+        repo,
+        issue_number,
+        per_page: 100,
+        page,
+      })
+    ),
+    listBoundedPages((page) =>
+      github.rest.issues.listEventsForIssue({
+        owner,
+        repo,
+        issue_number,
+        per_page: 100,
+        page,
+      })
+    ),
+  ]);
+
+  const decision = evaluateIssueIntake({
+    payload,
+    existingComments,
+    issueEvents,
+  });
+
+  if (decision.skip) {
+    return decision;
+  }
+
+  for (const label of decision.labelsToRemove) {
+    try {
+      await github.rest.issues.removeLabel({
+        owner,
+        repo,
+        issue_number,
+        name: label,
+      });
+    } catch (err) {
+      if (err?.status !== 404) {
+        throw err;
+      }
+    }
+  }
+
+  if (decision.labelsToAdd.length > 0) {
+    await github.rest.issues.addLabels({
+      owner,
+      repo,
+      issue_number,
+      labels: decision.labelsToAdd,
+    });
+  }
+
+  if (decision.commentAction?.type === "create") {
+    await github.rest.issues.createComment({
+      owner,
+      repo,
+      issue_number,
+      body: decision.commentAction.body,
+    });
+  } else if (decision.commentAction?.type === "update") {
+    await github.rest.issues.updateComment({
+      owner,
+      repo,
+      comment_id: decision.commentAction.commentId,
+      body: decision.commentAction.body,
+    });
+  }
+
+  return decision;
+}

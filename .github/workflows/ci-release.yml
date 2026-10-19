@@ -55,6 +55,8 @@ jobs:
 
           "${LINT_DIR}/shellcheck" -x packaging/linux/AppRun scripts/*.sh
           "${LINT_DIR}/actionlint" -shellcheck "${LINT_DIR}/shellcheck"
+          ./scripts/setup-github-labels.sh --dry-run >/dev/null
+          node scripts/test-issue-intake.mjs
 
       - name: Install Ubuntu 24.04 native build and packaging dependencies
         run: |

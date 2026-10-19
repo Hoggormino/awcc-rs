@@ -1,0 +1,72 @@
+name: Hardware Compatibility / New Model Report
+description: Report test results for an existing Alienware/Dell G-Series model or request support for an unlisted model.
+title: "[Hardware]: "
+labels: ["area: hardware", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to share hardware test results or request support for an Alienware / Dell G-Series model.
+        - **Privacy**: Do **not** include your machine serial number or Dell Service Tag (`/sys/devices/virtual/dmi/id/product_serial`). Only the model name (`product_name`) and device/USB IDs are needed.
+
+  - type: input
+    id: model_name
+    attributes:
+      label: Device model name (`product_name`)
+      description: Exact model name from `awcc-cli device-info` or `cat /sys/devices/virtual/dmi/id/product_name`.
+      placeholder: "e.g. Alienware m15 R6"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_format
+    attributes:
+      label: Installation format & version
+      description: How did you run awcc-rs?
+      options:
+        - "Debian / Ubuntu package (.deb)"
+        - "Fedora / RPM package (.rpm)"
+        - "Arch Linux / CachyOS package (.pkg.tar.zst)"
+        - "AppImage (.AppImage)"
+        - "Binary archive (.tar.gz)"
+        - "Built from source (cargo)"
+        - "Unknown / other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: feature_matrix
+    attributes:
+      label: Which features work or fail?
+      description: Summarize what works, what fails, and what was not tested on this model.
+      value: |
+        - Profile match (`awcc-cli device-info`): [works / fails / not in database.json]
+        - Thermal mode queries & switching (`Balanced`, `Performance`, `Quiet`, `Cool`, `Full Speed`): [works / fails / untried]
+        - G-Mode / GameShift toggle (`awcc-cli g`): [works / fails / untried]
+        - Manual fan boost & fan RPM/temp telemetry (`awcc-cli qf`, `awcc-cli bm`): [works / fails / untried]
+        - TCC offset / CPU turbo (`awcc-cli qtcc`, `awcc-cli qct`): [works / fails / untried]
+        - USB ELC RGB lighting / brightness / stealth (`awcc-cli raw-status`, `awcc-cli lb`): [works / fails / untried]
+    validations:
+      required: true
+
+  - type: textarea
+    id: device_diagnostics
+    attributes:
+      label: "`awcc-cli device-info` output or `awcc-support.zip` attachment"
+      description: |
+        Paste the output of `awcc-cli device-info` (and `lsusb -d 187c:` if reporting lighting), or attach `awcc-support.zip` from `awcc-cli diagnostics export --output awcc-support.zip`. If the binary cannot run, explain why and paste `cat /sys/devices/virtual/dmi/id/product_name`.
+      placeholder: |
+        Device Name     : ...
+        ACPI Prefix     : ...
+        Matched in DB   : ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: bios_context
+    attributes:
+      label: BIOS version & kernel/ACPI context (optional — include only if relevant)
+      description: Optional. Helpful when ACPI `WMAX` methods reject codes (`0xFFFFFFFF`) or behave differently across BIOS updates (`cat /sys/devices/virtual/dmi/id/bios_version`, `uname -r`, `acpi_call` module version).
+      placeholder: "Optional: BIOS 1.30.0, kernel 6.12.x, acpi_call loaded"
+    validations:
+      required: false
