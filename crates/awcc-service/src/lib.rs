@@ -11,7 +11,6 @@ use awcc_core::{
     lighting::{LightingEffect, ZoneTarget},
     validate_fan_boost, validate_tcc_offset,
 };
-pub use awcc_platform::{resolve_host_device_profile, resolve_simulated_m15_r6_profile};
 use awcc_platform::{
     HwmonProvider, LinuxAcpiTransport, MemoryStateStorage, PosixStateStore, SimBackend,
     StateStorage, ThermalTransport, WriteAuditEntry,
@@ -20,6 +19,7 @@ use awcc_platform::{
         UsbHidTransport,
     },
 };
+pub use awcc_platform::{resolve_host_device_profile, resolve_simulated_m15_r6_profile};
 
 pub mod daemon;
 pub mod keybinder;
@@ -916,7 +916,14 @@ mod tests {
         let snap1 = orch.set_brightness(80);
         let usb_count = snap1.write_audit_log.len();
         assert!(usb_count >= 1);
-        assert!(snap1.write_audit_log.last().unwrap().command.contains("USB HID"));
+        assert!(
+            snap1
+                .write_audit_log
+                .last()
+                .unwrap()
+                .command
+                .contains("USB HID")
+        );
 
         // 2. Next perform an ACPI thermal profile write
         let snap2 = orch.set_thermal_mode(ThermalMode::Performance);
@@ -927,7 +934,14 @@ mod tests {
 
         // 3. Next perform another USB write, then a TCC offset ACPI write
         let snap3 = orch.set_brightness(60);
-        assert!(snap3.write_audit_log.last().unwrap().command.contains("USB HID"));
+        assert!(
+            snap3
+                .write_audit_log
+                .last()
+                .unwrap()
+                .command
+                .contains("USB HID")
+        );
         let snap4 = orch.set_tcc_offset(5);
         let newest = snap4.write_audit_log.last().unwrap();
         assert_eq!(newest.sequence, snap4.write_audit_log.len());

@@ -248,16 +248,15 @@ fn decode_wmax_call(
 
     let meaning = match (subcmd, arg1) {
         (0x15, 0x01) => {
-            let resolved_mode = code_table.and_then(|table| {
-                match table.decode_query_response(u32::from(arg2)) {
+            let resolved_mode =
+                code_table.and_then(|table| match table.decode_query_response(u32::from(arg2)) {
                     ThermalModeState::Known(m) => Some(m.display_name()),
                     ThermalModeState::Unknown { .. } => ThermalMode::ALL
                         .iter()
                         .copied()
                         .find(|&m| table.set_code_for(m) == arg2)
                         .map(ThermalMode::display_name),
-                }
-            });
+                });
             let mode_name = resolved_mode.unwrap_or(match arg2 {
                 0x00 => "Manual",
                 0xA0 => "Balanced",

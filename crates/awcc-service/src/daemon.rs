@@ -218,17 +218,17 @@ impl UnixSocketDaemon {
         if !is_command_allowed(cmd) {
             return "Error: Command not allowed".to_string();
         }
-        if let Some(fc_cmd) = parse_fancurve_ipc_command(cmd) {
-            if let Ok(mut guard) = self.active_fan_curve.lock() {
-                match fc_cmd {
-                    FanCurveIpcCommand::Stop => {
-                        guard.enabled = false;
-                        return "OK: Custom fan curve stopped".to_string();
-                    }
-                    FanCurveIpcCommand::Configure(cfg) => {
-                        *guard = cfg;
-                        return "OK: Custom fan curve active".to_string();
-                    }
+        if let Some(fc_cmd) = parse_fancurve_ipc_command(cmd)
+            && let Ok(mut guard) = self.active_fan_curve.lock()
+        {
+            match fc_cmd {
+                FanCurveIpcCommand::Stop => {
+                    guard.enabled = false;
+                    return "OK: Custom fan curve stopped".to_string();
+                }
+                FanCurveIpcCommand::Configure(cfg) => {
+                    *guard = cfg;
+                    return "OK: Custom fan curve active".to_string();
                 }
             }
         }
