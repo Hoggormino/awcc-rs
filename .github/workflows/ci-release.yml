@@ -331,6 +331,7 @@ jobs:
             dist/arch/awcc-rs-*-x86_64.pkg.tar.zst
             dist/arch/PKGBUILD
             dist/arch/.SRCINFO
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 

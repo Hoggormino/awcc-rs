@@ -190,7 +190,10 @@ if manifest.get("version") != expected_ver:
         f"ERROR: Published release version {manifest.get('version')} != {expected_ver}."
     )
 
-pub_assets = {a["name"]: a for a in rel.get("assets", [])}
+def norm_asset_name(n):
+    return ".SRCINFO" if n == "default.SRCINFO" else n
+
+pub_assets = {norm_asset_name(a["name"]): a for a in rel.get("assets", [])}
 missing = expected_names - set(pub_assets.keys())
 extra = set(pub_assets.keys()) - expected_names
 if missing or extra:
@@ -264,7 +267,10 @@ expected = sys.argv[3:]
 if not rel.get("isDraft"):
     raise SystemExit("ERROR: Expected release to still be in draft state during pre-publication check")
 
-uploaded = {a["name"]: a for a in rel.get("assets", [])}
+def norm_asset_name(n):
+    return ".SRCINFO" if n == "default.SRCINFO" else n
+
+uploaded = {norm_asset_name(a["name"]): a for a in rel.get("assets", [])}
 if len(uploaded) != len(expected) or set(uploaded.keys()) != set(expected):
     raise SystemExit(
         f"ERROR: Draft release asset mismatch. Expected {sorted(expected)}, got {sorted(uploaded.keys())}"
