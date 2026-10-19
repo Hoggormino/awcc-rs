@@ -30,11 +30,21 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use awcc_core::{
-    DeviceProfile, FanCurveConfig, Observation, OperationError, OperationLifecycle,
+    DatabaseSource, DeviceProfile, FanCurveConfig, Observation, OperationError, OperationLifecycle,
     OperationSuccess, SensorReading, SimScenario, TelemetrySnapshot, ThermalMode, ThermalModeState,
     interpolate_curve_boost,
     lighting::{LightingEffect, ZoneTarget},
     validate_fan_boost, validate_tcc_offset,
+};
+use awcc_diagnostics::{
+    export::{
+        BuildIdentityReport, DatabaseProvenance, DeviceProfileEvidence, SessionEvidence,
+        SubsystemHealthEvidence, TelemetryEvidence,
+    },
+    global_diagnostics,
+    hash::sha256_hex,
+    ring::{HasSeq, RingStats, SeqRing},
+    time::{now_unix_millis, rfc3339_millis},
 };
 use awcc_platform::{
     HwmonProvider, LinuxAcpiTransport, MemoryStateStorage, PosixStateStore, SimBackend, SimFaults,
@@ -49,6 +59,18 @@ use thiserror::Error;
 
 pub mod daemon;
 pub mod keybinder;
+
+/// Default bounded capacity of the in-memory hardware write-audit ring.
+pub const DEFAULT_AUDIT_RING_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SequencedAudit(WriteAuditEntry);
+
+impl HasSeq for SequencedAudit {
+    fn seq(&self) -> u64 {
+        self.0.sequence as u64
+    }
+}
 
 /// Immutable snapshot of the system state published to the GUI or CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,19 +112,283 @@ pub struct SystemSnapshot {
     /// specific request has been handled yet.
     pub command_seq: u64,
     pub write_audit_log: Vec<WriteAuditEntry>,
+    /// Sequence-aware accounting for `write_audit_log`: distinguishes lifetime write count,
+    /// currently retained entries, evicted entries, and entries cleared from the visible view.
+    pub audit_stats: RingStats,
 }
 
 impl SystemSnapshot {
-    /// Count of mutating hardware/simulated writes executed since startup.
+    /// Lifetime count of mutating hardware/simulated writes executed since startup.
+    ///
+    /// Survives bounded ring eviction and clearing of the visible audit history.
     #[must_use]
     pub fn write_count(&self) -> usize {
-        self.write_audit_log.len()
+        if self.audit_stats.lifetime_total > 0 || self.write_audit_log.is_empty() {
+            self.audit_stats.lifetime_total as usize
+        } else {
+            self.write_audit_log.len()
+        }
     }
 
     /// `true` only when the latest GameShift query succeeded and reported the latch enabled.
     #[must_use]
     pub fn game_shift_latched(&self) -> bool {
         self.game_shift.fresh() == Some(&true)
+    }
+
+    /// Convert this passive snapshot into a serializable [`SessionEvidence`] record without
+    /// touching hardware.
+    #[must_use]
+    pub fn to_session_evidence(
+        &self,
+        session_id: &str,
+        build_info: BuildIdentityReport,
+        worker_alive: bool,
+    ) -> SessionEvidence {
+        let recorded_unix_ms = now_unix_millis();
+        let recorded_at_utc = rfc3339_millis(recorded_unix_ms);
+
+        let mut capabilities = Vec::new();
+        if self.profile.entry.has_feature_thermal_modes() {
+            capabilities.push("thermal_modes".to_string());
+        }
+        if self.profile.entry.has_feature_fan_boost() {
+            capabilities.push("fan_boost".to_string());
+        }
+        if self.profile.entry.has_feature_auto_boost() {
+            capabilities.push("auto_boost".to_string());
+        }
+        if self.profile.entry.has_feature_cpu_temp() {
+            capabilities.push("cpu_temp".to_string());
+        }
+        if self.profile.entry.has_feature_gpu_temp() {
+            capabilities.push("gpu_temp".to_string());
+        }
+        if self.profile.entry.has_feature_brightness_control() {
+            capabilities.push("brightness_control".to_string());
+        }
+        if self.profile.entry.has_feature_gmode_toggle() {
+            capabilities.push("gmode_toggle".to_string());
+        }
+
+        let (source_kind, source_label, fingerprint_sha256) = match &self.profile.database_source {
+            DatabaseSource::EmbeddedDefault => (
+                "compiled_in_default".to_string(),
+                "<embedded>".to_string(),
+                sha256_hex(awcc_core::DEFAULT_DATABASE_JSON.as_bytes()),
+            ),
+            DatabaseSource::SystemEtc(path) => (
+                "system_etc_awcc".to_string(),
+                path.display().to_string(),
+                std::fs::read(path).map_or_else(
+                    |_| sha256_hex(awcc_core::DEFAULT_DATABASE_JSON.as_bytes()),
+                    |bytes| sha256_hex(&bytes),
+                ),
+            ),
+            DatabaseSource::LocalWorkingDir(path) => (
+                "cwd_override".to_string(),
+                path.display().to_string(),
+                std::fs::read(path).map_or_else(
+                    |_| sha256_hex(awcc_core::DEFAULT_DATABASE_JSON.as_bytes()),
+                    |bytes| sha256_hex(&bytes),
+                ),
+            ),
+            DatabaseSource::EnvVar(path) => (
+                "env_override".to_string(),
+                path.display().to_string(),
+                std::fs::read(path).map_or_else(
+                    |_| sha256_hex(awcc_core::DEFAULT_DATABASE_JSON.as_bytes()),
+                    |bytes| sha256_hex(&bytes),
+                ),
+            ),
+        };
+
+        let acpi_wmax_available = matches!(self.thermal_mode_state, ThermalModeState::Known(_))
+            || self.game_shift.is_observed();
+        let usb_elc_available = self.elc_diagnostics.is_observed();
+        let hwmon_available = self.telemetry.cpu_temp_c.is_available()
+            || self.telemetry.gpu_temp_c.is_available()
+            || self.telemetry.cpu_fan_rpm.is_available();
+
+        let (usb_firmware_version, usb_status_summary) = match &self.elc_diagnostics {
+            Observation::Observed(diag) => {
+                let (maj, min, pat) = diag.firmware_version;
+                (
+                    Some(format!("{maj}.{min}.{pat}")),
+                    Some(format!(
+                        "status=0x{:02X}, animations={}",
+                        diag.status_byte, diag.animation_count
+                    )),
+                )
+            }
+            Observation::Stale {
+                last_value,
+                age_secs,
+                reason,
+            } => {
+                let (maj, min, pat) = last_value.firmware_version;
+                (
+                    Some(format!("{maj}.{min}.{pat} (stale {age_secs}s)")),
+                    Some(format!(
+                        "status=0x{:02X} (stale {age_secs}s: {reason})",
+                        last_value.status_byte
+                    )),
+                )
+            }
+            Observation::Unavailable { reason } => (None, Some(format!("unavailable ({reason})"))),
+            Observation::NotObserved => (None, None),
+        };
+
+        let last_error = match &self.lifecycle {
+            OperationLifecycle::Failed { error, .. } => Some(error.clone()),
+            OperationLifecycle::RolledBack { reason, .. } => Some(reason.clone()),
+            _ => self
+                .elc_diagnostics
+                .problem()
+                .or_else(|| self.game_shift.problem())
+                .or_else(|| self.cpu_turbo.problem())
+                .or_else(|| self.telemetry.cpu_temp_c.problem())
+                .map(ToString::to_string),
+        };
+
+        let g_mode_state = match &self.game_shift {
+            Observation::Observed(true) => "active".to_string(),
+            Observation::Observed(false) => "inactive".to_string(),
+            Observation::Stale {
+                last_value,
+                age_secs,
+                reason,
+            } => format!(
+                "{} (stale {age_secs}s: {reason})",
+                if *last_value { "active" } else { "inactive" }
+            ),
+            Observation::Unavailable { reason } => format!("unavailable ({reason})"),
+            Observation::NotObserved => "not_observed".to_string(),
+        };
+
+        let stealth_source = match self.lighting_state_source {
+            LightingStateSource::AssumedDefault => "assumed_default",
+            LightingStateSource::PersistedBrightness => "persisted_brightness",
+            LightingStateSource::Commanded => "commanded",
+        };
+        let stealth_lights_off = format!(
+            "{} ({stealth_source})",
+            if self.lighting_stealth_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+
+        #[allow(clippy::cast_possible_truncation)]
+        let cpu_temp_c = self.telemetry.cpu_temp_c.fresh_value().map(|v| v as u8);
+        #[allow(clippy::cast_possible_truncation)]
+        let gpu_temp_c = self.telemetry.gpu_temp_c.fresh_value().map(|v| v as u8);
+
+        let telemetry_stale = matches!(self.telemetry.cpu_temp_c, SensorReading::Stale { .. })
+            || matches!(self.telemetry.gpu_temp_c, SensorReading::Stale { .. })
+            || self.game_shift.is_stale()
+            || self.cpu_turbo.is_stale()
+            || self.elc_diagnostics.is_stale();
+        let telemetry_age_ms = match &self.telemetry.cpu_temp_c {
+            SensorReading::Stale { age_secs, .. } => Some(age_secs.saturating_mul(1000)),
+            _ => None,
+        };
+
+        let audit_entries = self
+            .write_audit_log
+            .iter()
+            .map(|e| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("sequence".to_string(), serde_json::json!(e.sequence));
+                obj.insert("op_id".to_string(), serde_json::json!(e.op_id));
+                obj.insert("command".to_string(), serde_json::json!(e.command));
+                obj.insert("outcome".to_string(), serde_json::json!(e.outcome));
+                obj.insert("succeeded".to_string(), serde_json::json!(e.succeeded));
+                obj.insert("ack".to_string(), serde_json::json!(e.ack.describe()));
+                if let Some(raw_hex) = &e.raw_usb_response_hex {
+                    obj.insert(
+                        "raw_usb_response_hex".to_string(),
+                        serde_json::json!(raw_hex),
+                    );
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+
+        let thermal_mode_str = match &self.thermal_mode_state {
+            ThermalModeState::Known(mode) => mode.to_string(),
+            ThermalModeState::Unknown { reason, .. } => format!("unknown ({reason})"),
+        };
+
+        SessionEvidence {
+            session_id: session_id.to_string(),
+            recorded_at_utc,
+            recorded_unix_ms,
+            build_info,
+            device_profile: Some(DeviceProfileEvidence {
+                model_name: self.profile.device_name.clone(),
+                smbios_system_id: self.profile.smbios_system_id.clone(),
+                acpi_prefix: self.profile.acpi_prefix.as_str().to_string(),
+                acpi_wmax_path: self.profile.acpi_prefix.wmax_path(),
+                usb_vid_pid: "187c:0550".to_string(),
+                profile_source: if self.profile.matched_in_database {
+                    "database_exact_match".to_string()
+                } else {
+                    "fallback_default".to_string()
+                },
+                capabilities,
+            }),
+            database_provenance: Some(DatabaseProvenance {
+                source_kind,
+                source_label,
+                fingerprint_sha256,
+                matched_device_name: self
+                    .profile
+                    .matched_in_database
+                    .then(|| self.profile.device_name.clone()),
+            }),
+            subsystem_health: SubsystemHealthEvidence {
+                backend_selection: if self.is_simulated {
+                    format!("simulated ({:?})", self.scenario)
+                } else {
+                    "hardware".to_string()
+                },
+                acpi_wmax_available,
+                usb_elc_available,
+                hwmon_available,
+                worker_alive,
+                g_mode_recovery_pending: self.pre_gmode_restore_target.is_some()
+                    && self.game_shift_latched(),
+                last_error,
+                usb_firmware_version,
+                usb_status_summary,
+            },
+            telemetry: Some(TelemetryEvidence {
+                thermal_mode: thermal_mode_str,
+                g_mode_state,
+                stealth_lights_off,
+                brightness_dim: Some(100_u8.saturating_sub(self.lighting_brightness_pct)),
+                cpu_temp_c,
+                gpu_temp_c,
+                fan_summary: vec![
+                    format!(
+                        "CPU fan: {} (boost {})",
+                        self.telemetry.cpu_fan_rpm.formatted_value(),
+                        self.telemetry.cpu_boost_pct.formatted_value()
+                    ),
+                    format!(
+                        "GPU fan: {} (boost {})",
+                        self.telemetry.gpu_fan_rpm.formatted_value(),
+                        self.telemetry.gpu_boost_pct.formatted_value()
+                    ),
+                ],
+                telemetry_stale,
+                telemetry_age_ms,
+            }),
+            audit_stats: self.audit_stats,
+            audit_entries,
+        }
     }
 }
 
@@ -135,6 +421,7 @@ pub enum ServiceCommand {
         critical_color: u32,
     },
     SetSimScenario(SimScenario),
+    ClearAuditHistory,
     Shutdown,
 }
 
@@ -146,7 +433,11 @@ impl ServiceCommand {
     pub const fn is_state_changing(&self) -> bool {
         !matches!(
             self,
-            Self::Refresh | Self::StepFanCurve | Self::SetSimScenario(_) | Self::Shutdown
+            Self::Refresh
+                | Self::StepFanCurve
+                | Self::SetSimScenario(_)
+                | Self::ClearAuditHistory
+                | Self::Shutdown
         )
     }
 
@@ -178,6 +469,7 @@ impl ServiceCommand {
             Self::ToggleStealth => "Toggle Stealth mode".to_string(),
             Self::SetPowerButtonColors { .. } => "Program power-button LED states".to_string(),
             Self::SetSimScenario(_) => "Change simulation scenario".to_string(),
+            Self::ClearAuditHistory => "Clear visible hardware audit history".to_string(),
             Self::Shutdown => "Shutdown".to_string(),
         }
     }
@@ -417,9 +709,11 @@ pub struct ThermalOrchestrator {
     trackers: Trackers,
     elc_observation: Observation<ElcDiagnosticsSummary>,
     clock: Box<dyn Fn() -> Instant + Send>,
-    chronological_audit_log: Vec<WriteAuditEntry>,
-    synced_acpi_audit_len: usize,
-    synced_usb_audit_len: usize,
+    chronological_audit_log: SeqRing<SequencedAudit>,
+    next_audit_seq: usize,
+    synced_acpi_seq: usize,
+    synced_usb_seq: usize,
+    trace_raw_usb: bool,
 }
 
 impl ThermalOrchestrator {
@@ -444,6 +738,23 @@ impl ThermalOrchestrator {
         storage: Box<dyn StateStorage>,
         usb_transport: Box<dyn UsbHidTransport>,
     ) -> Self {
+        let is_sim = transport.is_simulated();
+        let backend_label = if is_sim { "simulated" } else { "hardware" };
+        tracing::info!(
+            target: "awcc_service::startup",
+            category = "app",
+            action = "select_backend",
+            outcome = backend_label,
+            code = "backend_selected",
+            model = %profile.device_name,
+            acpi_prefix = %profile.acpi_prefix,
+            matched_in_db = profile.matched_in_database,
+            db_source = %profile.database_source,
+            "initialized orchestrator with {backend_label} backend for `{}` (ACPI prefix `{}`, db `{}`)",
+            profile.device_name,
+            profile.acpi_prefix,
+            profile.database_source
+        );
         let zones = profile.entry.keyboard_zones.clone();
         let lighting = EffectController::new(usb_transport, zones);
         Self {
@@ -462,9 +773,11 @@ impl ThermalOrchestrator {
             trackers: Trackers::default(),
             elc_observation: Observation::NotObserved,
             clock: Box::new(Instant::now),
-            chronological_audit_log: Vec::new(),
-            synced_acpi_audit_len: 0,
-            synced_usb_audit_len: 0,
+            chronological_audit_log: SeqRing::new(DEFAULT_AUDIT_RING_CAPACITY),
+            next_audit_seq: 0,
+            synced_acpi_seq: 0,
+            synced_usb_seq: 0,
+            trace_raw_usb: false,
         }
     }
 
@@ -506,6 +819,49 @@ impl ThermalOrchestrator {
         self.transport.set_sim_faults(faults);
     }
 
+    /// Override the bounded capacity of the hardware write-audit ring (used in unit tests).
+    pub fn set_audit_ring_capacity(&mut self, capacity: usize) {
+        self.chronological_audit_log = SeqRing::new(capacity);
+    }
+
+    /// Explicitly opt in or out of retaining raw USB response dumps on synced audit entries.
+    pub fn set_trace_raw_usb(&mut self, enabled: bool) {
+        self.trace_raw_usb = enabled;
+    }
+
+    /// Clear currently visible hardware write-audit rows while preserving `lifetime_total` and
+    /// recording the cleared count in [`RingStats::cleared`].
+    pub fn clear_visible_audit_log(&mut self) -> RingStats {
+        self.chronological_audit_log.clear();
+        let stats = self.chronological_audit_log.stats();
+        tracing::info!(
+            target: "awcc_service::audit",
+            category = "app",
+            action = "clear_audit_history",
+            outcome = "cleared",
+            code = "audit_history_cleared",
+            lifetime_total = stats.lifetime_total,
+            cleared = stats.cleared,
+            "cleared visible hardware write-audit history (lifetime writes={})",
+            stats.lifetime_total
+        );
+        stats
+    }
+
+    /// Sequence-aware delta of hardware write-audit entries since `cursor`.
+    #[must_use]
+    pub fn audit_entries_since(
+        &self,
+        cursor: u64,
+    ) -> awcc_diagnostics::ring::Delta<WriteAuditEntry> {
+        let delta = self.chronological_audit_log.since(cursor);
+        awcc_diagnostics::ring::Delta {
+            items: delta.items.into_iter().map(|s| s.0).collect(),
+            missed: delta.missed,
+            stats: delta.stats,
+        }
+    }
+
     /// Id of the most recent state-changing operation (`0` before the first one).
     #[must_use]
     pub const fn operation_id(&self) -> u64 {
@@ -525,6 +881,16 @@ impl ThermalOrchestrator {
 
     fn record_elc_result(&mut self, result: &Result<ElcDiagnosticsSummary, TransportError>) {
         let now = (self.clock)();
+        if let Err(err) = result {
+            tracing::warn!(
+                target: "awcc_service::usb_elc",
+                category = "diagnostic_read",
+                action = "query_elc_diagnostics",
+                outcome = "failed",
+                code = "elc_query_failed",
+                "ELC USB diagnostic query failed: {err}"
+            );
+        }
         self.elc_observation = self
             .trackers
             .elc
@@ -532,28 +898,71 @@ impl ThermalOrchestrator {
     }
 
     fn sync_chronological_audit_log(&mut self) {
+        let current_op = (self.operation_id > 0).then_some(self.operation_id);
+        let include_raw_usb =
+            self.trace_raw_usb || global_diagnostics().is_some_and(|d| d.trace_raw_usb());
+
+        let prev_acpi_seq = self.synced_acpi_seq;
         let acpi_log = self.transport.write_audit_log();
-        if self.synced_acpi_audit_len < acpi_log.len() {
-            for entry in &acpi_log[self.synced_acpi_audit_len..] {
-                let seq = self.chronological_audit_log.len() + 1;
-                self.chronological_audit_log.push(WriteAuditEntry {
-                    sequence: seq,
-                    ..entry.clone()
-                });
-            }
-            self.synced_acpi_audit_len = acpi_log.len();
+        for entry in acpi_log.iter().filter(|e| e.sequence > prev_acpi_seq) {
+            self.next_audit_seq += 1;
+            let seq = self.next_audit_seq;
+            let op_id = entry.op_id.or(current_op);
+            let synced = WriteAuditEntry {
+                sequence: seq,
+                op_id,
+                raw_usb_response_hex: None,
+                ..entry.clone()
+            };
+            tracing::info!(
+                target: "awcc_service::audit",
+                category = "hardware_write",
+                op_id = op_id.unwrap_or(0),
+                seq = seq as u64,
+                action = %synced.command,
+                outcome = %synced.outcome,
+                code = if synced.succeeded { "acpi_write_ok" } else { "acpi_write_err" },
+                "ACPI write #{seq}: {} -> {}",
+                synced.command,
+                synced.outcome
+            );
+            self.chronological_audit_log.push(SequencedAudit(synced));
+            self.synced_acpi_seq = entry.sequence;
         }
 
+        let prev_usb_seq = self.synced_usb_seq;
         let usb_log = self.lighting.transport().write_audit_log();
-        if self.synced_usb_audit_len < usb_log.len() {
-            for entry in &usb_log[self.synced_usb_audit_len..] {
-                let seq = self.chronological_audit_log.len() + 1;
-                self.chronological_audit_log.push(WriteAuditEntry {
-                    sequence: seq,
-                    ..entry.clone()
-                });
-            }
-            self.synced_usb_audit_len = usb_log.len();
+        for entry in usb_log.iter().filter(|e| e.sequence > prev_usb_seq) {
+            self.next_audit_seq += 1;
+            let seq = self.next_audit_seq;
+            let op_id = entry.op_id.or(current_op);
+            let raw_usb_response_hex = if include_raw_usb {
+                entry.raw_usb_response_hex.clone()
+            } else {
+                None
+            };
+            let synced = WriteAuditEntry {
+                sequence: seq,
+                op_id,
+                raw_usb_response_hex,
+                ..entry.clone()
+            };
+            let ack_desc = synced.ack.describe();
+            tracing::info!(
+                target: "awcc_service::audit",
+                category = "hardware_write",
+                op_id = op_id.unwrap_or(0),
+                seq = seq as u64,
+                action = %synced.command,
+                outcome = %synced.outcome,
+                ack = %ack_desc,
+                code = if synced.succeeded { "usb_write_ok" } else { "usb_write_err" },
+                "USB write #{seq}: {} -> {} ({ack_desc})",
+                synced.command,
+                synced.outcome
+            );
+            self.chronological_audit_log.push(SequencedAudit(synced));
+            self.synced_usb_seq = entry.sequence;
         }
     }
 
@@ -570,17 +979,80 @@ impl ThermalOrchestrator {
                 .transport
                 .query_game_shift_status()
                 .map_err(|e| e.to_string());
+            if let Err(reason) = &result {
+                tracing::warn!(
+                    target: "awcc_service::telemetry",
+                    category = "diagnostic_read",
+                    action = "query_game_shift",
+                    outcome = "unavailable",
+                    code = "gameshift_query_failed",
+                    "GameShift latch query failed: {reason}"
+                );
+            }
             self.trackers.game_shift.resolve(result, now)
         };
         let thermal_mode_state = match self.transport.query_raw_thermal_mode() {
-            Ok(raw) => self.profile.code_table.decode_query_response(raw),
-            Err(err) => ThermalModeState::Unknown {
-                raw_code: None,
-                reason: err.to_string(),
-            },
+            Ok(raw) => {
+                let decoded = self.profile.code_table.decode_query_response(raw);
+                if let ThermalModeState::Unknown { reason, .. } = &decoded {
+                    tracing::warn!(
+                        target: "awcc_service::telemetry",
+                        category = "diagnostic_read",
+                        action = "query_thermal_mode",
+                        outcome = "unknown",
+                        code = "thermal_mode_unknown",
+                        "thermal mode query returned unmapped/error code: {reason}"
+                    );
+                }
+                decoded
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "awcc_service::telemetry",
+                    category = "diagnostic_read",
+                    action = "query_thermal_mode",
+                    outcome = "unavailable",
+                    code = "thermal_mode_query_failed",
+                    "thermal mode query failed: {err}"
+                );
+                ThermalModeState::Unknown {
+                    raw_code: None,
+                    reason: err.to_string(),
+                }
+            }
         };
 
         let raw = self.transport.query_telemetry();
+        if let Some(problem) = raw
+            .cpu_temp_c
+            .problem()
+            .or_else(|| raw.gpu_temp_c.problem())
+            .or_else(|| raw.cpu_fan_rpm.problem())
+            .or_else(|| raw.gpu_fan_rpm.problem())
+        {
+            tracing::warn!(
+                target: "awcc_service::telemetry",
+                category = "diagnostic_read",
+                action = "query_telemetry",
+                outcome = "degraded",
+                code = "telemetry_degraded",
+                "telemetry sample degraded: {problem}"
+            );
+        } else {
+            // Normal telemetry samples are logged only at DEBUG (never at INFO).
+            tracing::debug!(
+                target: "awcc_service::telemetry",
+                category = "diagnostic_read",
+                action = "query_telemetry",
+                outcome = "ok",
+                code = "telemetry_sample",
+                cpu_temp = %raw.cpu_temp_c.formatted_value(),
+                gpu_temp = %raw.gpu_temp_c.formatted_value(),
+                cpu_rpm = %raw.cpu_fan_rpm.formatted_value(),
+                gpu_rpm = %raw.gpu_fan_rpm.formatted_value(),
+                "telemetry sample collected"
+            );
+        }
         let telemetry = TelemetrySnapshot {
             cpu_temp_c: self.trackers.cpu_temp.resolve(raw.cpu_temp_c, now),
             gpu_temp_c: self.trackers.gpu_temp.resolve(raw.gpu_temp_c, now),
@@ -591,6 +1063,16 @@ impl ThermalOrchestrator {
         };
         let cpu_turbo = {
             let result = self.transport.query_cpu_turbo().map_err(|e| e.to_string());
+            if let Err(reason) = &result {
+                tracing::warn!(
+                    target: "awcc_service::telemetry",
+                    category = "diagnostic_read",
+                    action = "query_cpu_turbo",
+                    outcome = "unavailable",
+                    code = "turbo_query_failed",
+                    "CPU turbo query failed: {reason}"
+                );
+            }
             self.trackers.cpu_turbo.resolve(result, now)
         };
         let tcc_offset_c = {
@@ -603,9 +1085,15 @@ impl ThermalOrchestrator {
         }
 
         self.sync_chronological_audit_log();
-        let combined_audit = self.chronological_audit_log.clone();
+        let combined_audit: Vec<WriteAuditEntry> = self
+            .chronological_audit_log
+            .as_slice()
+            .iter()
+            .map(|s| s.0.clone())
+            .collect();
+        let audit_stats = self.chronological_audit_log.stats();
 
-        SystemSnapshot {
+        let snap = SystemSnapshot {
             profile: self.profile.clone(),
             is_simulated: self.transport.is_simulated(),
             scenario: self.transport.scenario(),
@@ -629,7 +1117,16 @@ impl ThermalOrchestrator {
             operation_id: self.operation_id,
             command_seq: 0,
             write_audit_log: combined_audit,
+            audit_stats,
+        };
+
+        if let Some(diag) = global_diagnostics() {
+            let evidence =
+                snap.to_session_evidence(diag.session_id(), diag.build_info().clone(), true);
+            diag.publish_evidence(&evidence);
         }
+
+        snap
     }
 
     fn probe_elc_diagnostics(&mut self) {
@@ -647,6 +1144,7 @@ impl ThermalOrchestrator {
     ) -> SystemSnapshot {
         self.operation_id += 1;
         let id = self.operation_id;
+        let started = (self.clock)();
         self.lifecycle = OperationLifecycle::Pending {
             description: label.to_string(),
         };
@@ -680,9 +1178,74 @@ impl ThermalOrchestrator {
                 }
             },
         };
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = (self.clock)()
+            .saturating_duration_since(started)
+            .as_millis() as u64;
+        match &lifecycle {
+            OperationLifecycle::Confirmed { summary } => {
+                tracing::info!(
+                    target: "awcc_service::operation",
+                    category = "app",
+                    op_id = id,
+                    action = label,
+                    outcome = "confirmed",
+                    code = "operation_confirmed",
+                    elapsed_ms = elapsed_ms,
+                    "{summary}"
+                );
+            }
+            OperationLifecycle::Accepted { summary, caveat } => {
+                tracing::info!(
+                    target: "awcc_service::operation",
+                    category = "app",
+                    op_id = id,
+                    action = label,
+                    outcome = "accepted",
+                    code = "operation_accepted",
+                    elapsed_ms = elapsed_ms,
+                    caveat = %caveat,
+                    "{summary} ({caveat})"
+                );
+            }
+            OperationLifecycle::RolledBack { summary, reason } => {
+                tracing::warn!(
+                    target: "awcc_service::operation",
+                    category = "app",
+                    op_id = id,
+                    action = label,
+                    outcome = "rolled_back",
+                    code = "operation_rolled_back",
+                    elapsed_ms = elapsed_ms,
+                    reason = %reason,
+                    "{summary}: {reason}"
+                );
+            }
+            OperationLifecycle::Failed { summary, error } => {
+                tracing::error!(
+                    target: "awcc_service::operation",
+                    category = "app",
+                    op_id = id,
+                    action = label,
+                    outcome = "failed",
+                    code = "operation_failed",
+                    elapsed_ms = elapsed_ms,
+                    error = %error,
+                    "{summary}: {error}"
+                );
+            }
+            OperationLifecycle::Idle
+            | OperationLifecycle::Requested { .. }
+            | OperationLifecycle::Pending { .. } => {}
+        }
         self.lifecycle = lifecycle.clone();
         snap.lifecycle = lifecycle;
         snap.operation_id = id;
+        if let Some(diag) = global_diagnostics() {
+            let evidence =
+                snap.to_session_evidence(diag.session_id(), diag.build_info().clone(), true);
+            diag.publish_evidence(&evidence);
+        }
         snap
     }
 
@@ -1323,6 +1886,10 @@ impl ThermalOrchestrator {
                 critical_color,
             } => self.set_power_button_colors(ac_color, dc_color, charging_color, critical_color),
             ServiceCommand::SetSimScenario(scenario) => self.set_sim_scenario(scenario),
+            ServiceCommand::ClearAuditHistory => {
+                self.clear_visible_audit_log();
+                self.query_snapshot()
+            }
             ServiceCommand::Shutdown => self.query_snapshot(),
         }
     }
@@ -1457,6 +2024,14 @@ impl ThermalServiceHandle {
             let mut processed = 0_u64;
             while let Ok(cmd) = cmd_rx.recv() {
                 if cmd == ServiceCommand::Shutdown {
+                    tracing::info!(
+                        target: "awcc_service::worker",
+                        category = "app",
+                        action = "worker_shutdown",
+                        outcome = "stopped",
+                        code = "worker_shutdown",
+                        "service worker stopped cleanly"
+                    );
                     break;
                 }
                 processed += 1;
@@ -1467,7 +2042,17 @@ impl ThermalServiceHandle {
                 }
             }
         });
-        let join = spawner(body).map_err(ServiceError::ThreadStart)?;
+        let join = spawner(body).map_err(|err| {
+            tracing::error!(
+                target: "awcc_service::worker",
+                category = "app",
+                action = "worker_spawn",
+                outcome = "failed",
+                code = "worker_spawn_failed",
+                "failed to start service worker thread: {err}"
+            );
+            ServiceError::ThreadStart(err)
+        })?;
 
         Ok(Self {
             cmd_tx: Some(cmd_tx),
@@ -1490,10 +2075,19 @@ impl ThermalServiceHandle {
         if slot.as_ref().is_some_and(JoinHandle::is_finished)
             && let Some(handle) = slot.take()
         {
-            *failure = Some(match handle.join() {
+            let detected = match handle.join() {
                 Err(payload) => WorkerFailure::Panicked(panic_message(payload.as_ref())),
                 Ok(()) => WorkerFailure::ExitedUnexpectedly,
-            });
+            };
+            tracing::error!(
+                target: "awcc_service::worker",
+                category = "app",
+                action = "worker_exit",
+                outcome = "terminated",
+                code = "worker_terminated",
+                "service worker terminated: {detected}"
+            );
+            *failure = Some(detected);
         }
         failure.clone()
     }
@@ -1508,6 +2102,7 @@ impl ThermalServiceHandle {
     ///
     /// `Ok` means *queued*. A rejected command is returned as an error and is never replayed.
     pub fn send(&self, cmd: ServiceCommand) -> Result<CommandTicket, SendError> {
+        let label = cmd.label();
         let Some(tx) = &self.cmd_tx else {
             return Err(SendError::WorkerDisconnected(
                 "the service handle is closed".to_string(),
@@ -1519,14 +2114,35 @@ impl ThermalServiceHandle {
                 *submitted += 1;
                 Ok(CommandTicket { seq: *submitted })
             }
-            Err(TrySendError::Full(_)) => Err(SendError::QueueFull {
-                capacity: self.capacity,
-            }),
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!(
+                    target: "awcc_service::queue",
+                    category = "app",
+                    action = %label,
+                    outcome = "rejected_queue_full",
+                    code = "queue_full",
+                    capacity = self.capacity as u64,
+                    "command `{label}` rejected: queue is full ({} commands pending)",
+                    self.capacity
+                );
+                Err(SendError::QueueFull {
+                    capacity: self.capacity,
+                })
+            }
             Err(TrySendError::Disconnected(_)) => {
                 drop(submitted);
                 let reason = self
                     .reap_worker()
                     .map_or_else(|| "its queue is closed".to_string(), |f| f.to_string());
+                tracing::error!(
+                    target: "awcc_service::queue",
+                    category = "app",
+                    action = %label,
+                    outcome = "rejected_worker_disconnected",
+                    code = "worker_disconnected",
+                    reason = %reason,
+                    "command `{label}` rejected: service worker is not running ({reason})"
+                );
                 Err(SendError::WorkerDisconnected(reason))
             }
         }
@@ -2524,5 +3140,138 @@ mod tests {
             OperationLifecycle::Confirmed { .. }
         ));
         assert_eq!(snap.operation_id, 1);
+    }
+
+    #[test]
+    fn full_audit_ring_continues_delivering_new_writes_at_constant_capacity_and_across_transport_eviction()
+     {
+        let mut orch = sim();
+        orch.set_audit_ring_capacity(4);
+        let mut cursor = 0_u64;
+
+        // Execute 300 TCC offset writes so we exceed both the 4-entry orchestrator ring capacity
+        // AND the 256-entry transport audit buffer (`MAX_TRANSPORT_AUDIT_ENTRIES`).
+        for i in 1..=300_usize {
+            let offset = u8::try_from(i % 15).unwrap();
+            let snap = orch.set_tcc_offset(offset);
+            assert!(
+                snap.write_audit_log.len() <= 4,
+                "retained ring stays bounded at capacity 4"
+            );
+            assert_eq!(
+                snap.write_count(),
+                i,
+                "lifetime write_count grows monotonically"
+            );
+            assert_eq!(snap.audit_stats.lifetime_total, i as u64);
+            assert_eq!(snap.audit_stats.last_seq, i as u64);
+
+            let delta = orch.audit_entries_since(cursor);
+            assert_eq!(
+                delta.items.len(),
+                1,
+                "sequence cursor receives every new write at step {i}"
+            );
+            assert_eq!(delta.items[0].sequence, i);
+            assert_eq!(delta.missed, 0);
+            cursor = delta.items[0].sequence as u64;
+        }
+    }
+
+    #[test]
+    fn clear_visible_audit_log_preserves_lifetime_write_count_and_tracks_cleared_entries() {
+        let mut orch = sim();
+        orch.set_tcc_offset(4);
+        orch.set_tcc_offset(6);
+        let before = orch.set_tcc_offset(8);
+        assert_eq!(before.write_audit_log.len(), 3);
+        assert_eq!(before.write_count(), 3);
+
+        let cleared = orch.handle_command(ServiceCommand::ClearAuditHistory);
+        assert!(cleared.write_audit_log.is_empty());
+        assert_eq!(
+            cleared.write_count(),
+            3,
+            "lifetime write_count survives clearing visible history"
+        );
+        assert_eq!(cleared.audit_stats.lifetime_total, 3);
+        assert_eq!(cleared.audit_stats.retained, 0);
+        assert_eq!(cleared.audit_stats.cleared, 3);
+
+        // Next write gets sequence 4, never resetting to 1
+        let after = orch.set_tcc_offset(10);
+        assert_eq!(after.write_audit_log.len(), 1);
+        assert_eq!(after.write_audit_log[0].sequence, 4);
+        assert_eq!(after.write_count(), 4);
+    }
+
+    #[test]
+    fn operation_id_propagates_to_hardware_write_audit_entries_including_gmode_rollback() {
+        let mut orch = sim();
+        let snap1 = orch.set_thermal_mode(ThermalMode::Performance);
+        assert_eq!(snap1.operation_id, 1);
+        assert_eq!(snap1.write_audit_log.last().unwrap().op_id, Some(1));
+
+        orch.set_sim_scenario(SimScenario::AcpiSetFailureRollback);
+        let snap2 = orch.toggle_gmode();
+        assert_eq!(snap2.operation_id, 2);
+        assert!(matches!(
+            snap2.lifecycle,
+            OperationLifecycle::RolledBack { .. }
+        ));
+        let op2_entries: Vec<_> = snap2
+            .write_audit_log
+            .iter()
+            .filter(|e| e.op_id == Some(2))
+            .collect();
+        assert_eq!(
+            op2_entries.len(),
+            3,
+            "Step 1, failed Step 2, and rollback Step 3 all share op_id=2"
+        );
+    }
+
+    #[test]
+    fn raw_usb_response_hex_is_omitted_by_default_and_included_when_opted_in() {
+        let mut orch = sim();
+        let snap_default = orch.set_brightness(70);
+        assert!(
+            snap_default
+                .write_audit_log
+                .iter()
+                .all(|e| e.raw_usb_response_hex.is_none()),
+            "verbose raw USB response dumps must be omitted by default"
+        );
+
+        let mut orch_opt_in = sim();
+        orch_opt_in.set_trace_raw_usb(true);
+        let snap_opt_in = orch_opt_in.set_brightness(70);
+        assert!(
+            snap_opt_in
+                .write_audit_log
+                .iter()
+                .any(|e| e.raw_usb_response_hex.is_some()),
+            "explicit opt-in includes raw USB response hex"
+        );
+    }
+
+    #[test]
+    fn to_session_evidence_records_database_fingerprint_and_subsystem_health() {
+        let mut orch = sim();
+        let snap = orch.set_thermal_mode(ThermalMode::Performance);
+        let build = BuildIdentityReport::current("awcc-test");
+        let evidence = snap.to_session_evidence("s-test", build, true);
+        assert_eq!(evidence.session_id, "s-test");
+        let prof = evidence.device_profile.expect("device profile present");
+        assert_eq!(prof.model_name, "Alienware m15 R6");
+        assert_eq!(prof.acpi_prefix, "AMWW");
+        let db = evidence
+            .database_provenance
+            .expect("database provenance present");
+        assert_eq!(db.source_kind, "compiled_in_default");
+        assert_eq!(db.fingerprint_sha256.len(), 64);
+        assert!(evidence.subsystem_health.acpi_wmax_available);
+        assert!(evidence.subsystem_health.usb_elc_available);
+        assert!(!evidence.audit_entries.is_empty());
     }
 }

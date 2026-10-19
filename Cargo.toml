@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/awcc-build-info",
     "crates/awcc-core",
+    "crates/awcc-diagnostics",
     "crates/awcc-platform",
     "crates/awcc-service",
     "crates/awcc-gui",
@@ -21,6 +22,7 @@ description = "Unofficial Alienware Command Center for Linux (Rust + Slint Mater
 [workspace.dependencies]
 awcc-build-info = { path = "crates/awcc-build-info" }
 awcc-core = { path = "crates/awcc-core" }
+awcc-diagnostics = { path = "crates/awcc-diagnostics" }
 awcc-platform = { path = "crates/awcc-platform" }
 awcc-service = { path = "crates/awcc-service" }
 anyhow = "1.0"
@@ -32,6 +34,8 @@ slint = { version = "1.18.1", default-features = true, features = ["renderer-sof
 slint-build = "1.18.1"
 i-slint-backend-testing = "1.18.1"
 thiserror = "2.0"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry", "smallvec"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -1,10 +1,12 @@
 //! AWCC Linux — Slint Material 3 (`@material`) desktop application & headless verification runner.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -12,6 +14,11 @@ use awcc_core::{
     FanCurveConfig, FanCurvePoint, Observation, OperationLifecycle, SimScenario, ThermalMode,
     ThermalModeState,
     lighting::{LightingEffect, PowerStateSlot, ZoneTarget},
+};
+use awcc_diagnostics::{
+    DiagnosticsConfig, DiagnosticsRuntime, export::BuildIdentityReport, global_diagnostics,
+    init_global_diagnostics, install_panic_hook, redact::Redactor, resolve_log_level,
+    resolve_raw_usb_opt_in,
 };
 use awcc_platform::WriteAuditEntry;
 use awcc_platform::usb_elc::{ElcDiagnosticsSummary, LightingStateSource};
@@ -44,6 +51,9 @@ struct CliOptions {
     width: u32,
     height: u32,
     scenario: String,
+    log_level: Option<String>,
+    verbose: bool,
+    trace_raw_usb: bool,
 }
 
 fn parse_cli_args<I>(args: I) -> Result<CliOptions>
@@ -63,6 +73,20 @@ where
             "-h" | "--help" | "help" => opts.show_help = true,
             "-V" | "--version" => opts.show_version = true,
             "--sim" | "--test-mode" => opts.sim_mode = true,
+            "-v" | "--verbose" => opts.verbose = true,
+            "--trace-raw-usb" => opts.trace_raw_usb = true,
+            "--log-level" => {
+                let Some(val) = iter.next() else {
+                    bail!("--log-level requires a value (error, warn, info, debug, trace)");
+                };
+                resolve_log_level(Some(&val), false, None).map_err(|e| anyhow::anyhow!("{e}"))?;
+                opts.log_level = Some(val);
+            }
+            s if s.starts_with("--log-level=") => {
+                let val = s["--log-level=".len()..].to_string();
+                resolve_log_level(Some(&val), false, None).map_err(|e| anyhow::anyhow!("{e}"))?;
+                opts.log_level = Some(val);
+            }
             "device-info" | "--device-info" => opts.device_info = true,
             "query-mode" | "--query-mode" => opts.query_mode = true,
             "--screenshot" => {
@@ -113,6 +137,10 @@ PASSIVE COMMANDS (0 hardware writes):
 
 OPTIONS:
   --sim                      Run against the in-memory Alienware m15 R6 simulator (with fault-injection bar)
+  -v, --verbose              Set console/session log filter to DEBUG (overridden by --log-level)
+  --log-level <LEVEL>        Set log filter explicitly: error | warn | info | debug | trace
+                             Precedence: --log-level > -v/--verbose > AWCC_LOG env > info (default)
+  --trace-raw-usb            Opt in to recording raw 33-byte USB HID response frames in audit logs
   --screenshot <PATH>        Render a deterministic PNG screenshot using the Slint software renderer
   --width <PX>               Window width for screenshot rendering (default: 1120)
   --height <PX>              Window height for screenshot rendering (default: 720)
@@ -655,8 +683,73 @@ fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_slide
         &snap.elc_diagnostics,
     )));
 
-    // Only rebuild the virtualized Log model when the number of recorded entries changes.
-    if sync_staged_sliders || ui.get_audit_rows().row_count() != snap.write_audit_log.len() {
+    let latest_seq = i32::try_from(snap.audit_stats.last_seq).unwrap_or(i32::MAX);
+    let retained_count = i32::try_from(snap.audit_stats.retained).unwrap_or(i32::MAX);
+    let evicted_count = i32::try_from(snap.audit_stats.evicted).unwrap_or(i32::MAX);
+    let cleared_count = i32::try_from(snap.audit_stats.cleared).unwrap_or(i32::MAX);
+
+    let counter_summary = if snap.audit_stats.lifetime_total == 0 {
+        "Zero unsolicited writes since startup".to_string()
+    } else if snap.audit_stats.evicted > 0 && snap.audit_stats.cleared > 0 {
+        format!(
+            "{} lifetime · {} retained · {} evicted · {} cleared",
+            snap.audit_stats.lifetime_total,
+            snap.audit_stats.retained,
+            snap.audit_stats.evicted,
+            snap.audit_stats.cleared
+        )
+    } else if snap.audit_stats.evicted > 0 {
+        format!(
+            "{} lifetime · {} retained · {} evicted",
+            snap.audit_stats.lifetime_total, snap.audit_stats.retained, snap.audit_stats.evicted
+        )
+    } else if snap.audit_stats.cleared > 0 {
+        format!(
+            "{} lifetime · {} retained · {} cleared",
+            snap.audit_stats.lifetime_total, snap.audit_stats.retained, snap.audit_stats.cleared
+        )
+    } else {
+        format!(
+            "{} explicit commands recorded ({} retained)",
+            snap.audit_stats.lifetime_total, snap.audit_stats.retained
+        )
+    };
+    ui.set_audit_counter_summary(SharedString::from(counter_summary));
+
+    let eviction_notice = if snap.audit_stats.evicted > 0 {
+        format!(
+            "Ring buffer gap: {} older write entries evicted at constant {} capacity (oldest retained #{:02}).",
+            snap.audit_stats.evicted,
+            snap.audit_stats.capacity,
+            snap.audit_stats.first_retained_seq.unwrap_or(0)
+        )
+    } else if snap.audit_stats.cleared > 0 {
+        format!(
+            "Visible history cleared ({} earlier entries hidden; lifetime counter preserved).",
+            snap.audit_stats.cleared
+        )
+    } else {
+        String::new()
+    };
+    ui.set_audit_eviction_notice(SharedString::from(eviction_notice));
+
+    // Rebuild the virtualized Log model whenever the newest sequence, cleared count, or retained
+    // row count changes (never relying solely on `row_count() != len()`, which stalls at full ring capacity).
+    let needs_audit_rebuild = sync_staged_sliders
+        || ui.get_audit_latest_seq() != latest_seq
+        || ui.get_audit_cleared_count() != cleared_count
+        || ui.get_audit_rows().row_count() != snap.write_audit_log.len();
+
+    ui.set_audit_latest_seq(latest_seq);
+    ui.set_audit_retained_count(retained_count);
+    ui.set_audit_evicted_count(evicted_count);
+    ui.set_audit_cleared_count(cleared_count);
+
+    if needs_audit_rebuild {
+        let redactor = Redactor::from_environment();
+        let selected_seq = ui.get_selected_audit_seq();
+        let mut refreshed_selected_detail: Option<String> = None;
+
         let rows: Vec<AuditRow> = snap
             .write_audit_log
             .iter()
@@ -664,16 +757,56 @@ fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_slide
             .map(|entry| {
                 let (command_str, outcome_str) =
                     format_log_entry(entry, Some(&snap.profile.code_table));
+                let detail_str = format_audit_detail(entry, &command_str, &outcome_str, &redactor);
+                let seq_num = i32::try_from(entry.sequence).unwrap_or(i32::MAX);
+                if selected_seq > 0 && seq_num == selected_seq {
+                    refreshed_selected_detail = Some(detail_str.clone());
+                }
                 AuditRow {
+                    seq_num,
                     seq_text: SharedString::from(format!("#{:02}", entry.sequence)),
                     command: SharedString::from(command_str),
                     outcome: SharedString::from(outcome_str),
+                    detail: SharedString::from(detail_str),
                     succeeded: entry.succeeded,
                 }
             })
             .collect();
         ui.set_audit_rows(ModelRc::new(VecModel::from(rows)));
+
+        if selected_seq > 0 {
+            if let Some(detail) = refreshed_selected_detail {
+                ui.set_selected_audit_detail(SharedString::from(detail));
+            } else {
+                ui.set_selected_audit_seq(0);
+                ui.set_selected_audit_detail(SharedString::default());
+            }
+        }
     }
+}
+
+/// Format the full, copyable detail string for a single `WriteAuditEntry` (redacting PII).
+#[must_use]
+pub fn format_audit_detail(
+    entry: &WriteAuditEntry,
+    decoded_command: &str,
+    decoded_outcome: &str,
+    redactor: &Redactor,
+) -> String {
+    let op_str = entry
+        .op_id
+        .map_or_else(|| "none".to_string(), |id| format!("op#{id}"));
+    let raw_cmd = redactor.redact_text(&entry.command);
+    let raw_outcome = redactor.redact_text(&entry.outcome);
+    let ack_desc = redactor.redact_text(&entry.ack.describe());
+    let raw_usb_suffix = match &entry.raw_usb_response_hex {
+        Some(hex) => format!(" | raw_usb_in=[{hex}]"),
+        None => String::new(),
+    };
+    format!(
+        "#{:02} ({op_str}) {decoded_command} -> {decoded_outcome} | raw=\"{raw_cmd}\" | outcome=\"{raw_outcome}\" | ack={ack_desc}{raw_usb_suffix}",
+        entry.sequence
+    )
 }
 
 fn elc_report_text(diag: &ElcDiagnosticsSummary) -> String {
@@ -788,15 +921,82 @@ struct PendingRequest {
     label: String,
 }
 
-/// UI-side bookkeeping for requests in flight and for the one-time worker-failure notice.
-#[derive(Debug, Default)]
+/// UI-side bookkeeping for requests in flight, worker-failure notices, and passive diagnostics.
 struct UiOps {
     pending: Option<PendingRequest>,
     worker_failure_shown: bool,
+    diagnostics: Arc<DiagnosticsRuntime>,
+    export_output_override: Option<PathBuf>,
+}
+
+impl Default for UiOps {
+    fn default() -> Self {
+        let diagnostics = global_diagnostics().cloned().unwrap_or_else(|| {
+            let resolved = resolve_log_level(None, false, None)
+                .unwrap_or_else(|_| unreachable!("default INFO level is valid"));
+            let mut cfg = DiagnosticsConfig::from_env_and_cli("awcc-gui", resolved, false);
+            cfg.enable_file_sink = false;
+            cfg.enable_stderr_console = false;
+            DiagnosticsRuntime::new(cfg)
+        });
+        Self {
+            pending: None,
+            worker_failure_shown: false,
+            diagnostics,
+            export_output_override: None,
+        }
+    }
 }
 
 type SharedOps = Rc<RefCell<UiOps>>;
 type SharedService = Rc<RefCell<ThermalServiceHandle>>;
+
+fn sync_recording_state_to_ui(ui: &MainWindow, diag: &DiagnosticsRuntime) {
+    let active = diag.is_recording_active();
+    if ui.get_diagnostic_recording_active() != active {
+        ui.set_diagnostic_recording_active(active);
+        if active {
+            ui.set_diagnostic_recording_label(SharedString::from("Stop DEBUG Recording"));
+        } else {
+            ui.set_diagnostic_recording_label(SharedString::from("Start DEBUG Recording"));
+        }
+    }
+}
+
+fn collect_gui_settings(ui: &MainWindow) -> BTreeMap<String, String> {
+    let mut settings = BTreeMap::new();
+    settings.insert(
+        "auto_refresh_enabled".to_string(),
+        ui.get_auto_refresh_enabled().to_string(),
+    );
+    settings.insert(
+        "refresh_interval_ms".to_string(),
+        ui.get_refresh_interval_ms().to_string(),
+    );
+    settings.insert(
+        "staged_lighting_persist_boot".to_string(),
+        ui.get_staged_lighting_persist_boot().to_string(),
+    );
+    settings.insert("sim_mode".to_string(), ui.get_is_simulated().to_string());
+    settings
+}
+
+fn default_support_export_path(session_id: &str) -> PathBuf {
+    if let Ok(custom) = std::env::var("AWCC_SUPPORT_EXPORT_PATH") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    let filename = format!(
+        "awcc-support-{}-{session_id}.zip",
+        awcc_diagnostics::time::compact_utc(awcc_diagnostics::time::now_unix_millis())
+    );
+    if let Some(dir) = awcc_diagnostics::default_log_dir() {
+        return dir.join(filename);
+    }
+    std::env::temp_dir().join(filename)
+}
 
 fn show_lifecycle(ui: &MainWindow, badge: &str, message: &str, is_error: bool) {
     ui.set_lifecycle_badge(SharedString::from(badge));
@@ -890,6 +1090,8 @@ fn submit_background(
 /// `REQUESTED` instead of letting an older outcome stand in for it.
 fn apply_polled_snapshot(ui: &MainWindow, snap: &SystemSnapshot, ops: &SharedOps) {
     sync_snapshot_to_ui(ui, snap, false);
+    let diag = Arc::clone(&ops.borrow().diagnostics);
+    sync_recording_state_to_ui(ui, &diag);
     let pending = ops.borrow().pending.clone();
     if let Some(pending) = pending {
         if snap.command_seq >= pending.seq {
@@ -1237,6 +1439,178 @@ fn wire_ui_callbacks(
             }
         });
     }
+
+    {
+        let ui_weak = ui.as_weak();
+        let ops = Rc::clone(ops);
+        ui.on_toggle_diagnostic_recording(move || {
+            let Some(w) = ui_weak.upgrade() else {
+                return;
+            };
+            let diag = Arc::clone(&ops.borrow().diagnostics);
+            if diag.is_recording_active() {
+                diag.stop_recording();
+                sync_recording_state_to_ui(&w, &diag);
+                w.set_diagnostics_status_text(SharedString::from(
+                    "Stopped temporary DEBUG recording — restored prior log filter.",
+                ));
+            } else {
+                diag.start_recording(Duration::from_secs(300));
+                sync_recording_state_to_ui(&w, &diag);
+                w.set_diagnostics_status_text(SharedString::from(
+                    "Temporary DEBUG recording active (5m timeout, 0 extra hardware polls).",
+                ));
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let svc = Rc::clone(service);
+        let ops = Rc::clone(ops);
+        ui.on_copy_diagnostic_summary(move || {
+            let Some(w) = ui_weak.upgrade() else {
+                return;
+            };
+            // Strictly passive: uses the cached snapshot already held in memory without
+            // sending Refresh or touching hardware.
+            let (snap, worker_alive) = {
+                let handle = svc.borrow();
+                (
+                    handle.current_snapshot().clone(),
+                    handle.worker_failure().is_none(),
+                )
+            };
+            let diag = Arc::clone(&ops.borrow().diagnostics);
+            let evidence = snap.to_session_evidence(
+                diag.session_id(),
+                BuildIdentityReport::current("awcc-gui"),
+                worker_alive,
+            );
+            match diag.assemble_support_bundle(Some(evidence), collect_gui_settings(&w)) {
+                Ok(bundle) => {
+                    w.set_last_copied_text(SharedString::from(bundle.summary_txt.as_str()));
+                    w.set_diagnostics_status_text(SharedString::from(
+                        "Copied redacted diagnostic summary.",
+                    ));
+                }
+                Err(err) => {
+                    w.set_diagnostics_status_text(SharedString::from(format!(
+                        "Failed to assemble diagnostic summary: {err}"
+                    )));
+                }
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let svc = Rc::clone(service);
+        let ops = Rc::clone(ops);
+        ui.on_export_support_report(move || {
+            let Some(w) = ui_weak.upgrade() else {
+                return;
+            };
+            // Strictly passive: uses the cached snapshot already held in memory without
+            // sending Refresh or touching hardware.
+            let (snap, worker_alive) = {
+                let handle = svc.borrow();
+                (
+                    handle.current_snapshot().clone(),
+                    handle.worker_failure().is_none(),
+                )
+            };
+            let (diag, override_path) = {
+                let borrowed = ops.borrow();
+                (
+                    Arc::clone(&borrowed.diagnostics),
+                    borrowed.export_output_override.clone(),
+                )
+            };
+            let out_path =
+                override_path.unwrap_or_else(|| default_support_export_path(diag.session_id()));
+            let evidence = snap.to_session_evidence(
+                diag.session_id(),
+                BuildIdentityReport::current("awcc-gui"),
+                worker_alive,
+            );
+            match diag
+                .assemble_support_bundle(Some(evidence), collect_gui_settings(&w))
+                .and_then(|bundle| bundle.write_to_path(&out_path))
+            {
+                Ok(bytes) => {
+                    w.set_last_export_path(SharedString::from(out_path.display().to_string()));
+                    w.set_diagnostics_status_text(SharedString::from(format!(
+                        "Exported passive support report -> {} ({bytes} B)",
+                        out_path.display()
+                    )));
+                }
+                Err(err) => {
+                    w.set_diagnostics_status_text(SharedString::from(format!(
+                        "Support report export failed: {err}"
+                    )));
+                }
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let ops = Rc::clone(ops);
+        let submit_cmd = Rc::clone(&submit_cmd);
+        ui.on_clear_audit_history(move || {
+            let Some(w) = ui_weak.upgrade() else {
+                return;
+            };
+            ops.borrow().diagnostics.clear_visible_events();
+            if submit_cmd(ServiceCommand::ClearAuditHistory) {
+                w.set_selected_audit_seq(0);
+                w.set_selected_audit_detail(SharedString::default());
+                w.set_diagnostics_status_text(SharedString::from(
+                    "Cleared visible history (lifetime counters preserved).",
+                ));
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_select_audit_row(move |seq_num| {
+            let Some(w) = ui_weak.upgrade() else {
+                return;
+            };
+            let rows = w.get_audit_rows();
+            for idx in 0..rows.row_count() {
+                if let Some(row) = rows.row_data(idx)
+                    && row.seq_num == seq_num
+                {
+                    w.set_selected_audit_seq(seq_num);
+                    w.set_selected_audit_detail(row.detail.clone());
+                    w.set_diagnostics_status_text(SharedString::from(format!(
+                        "Selected command #{seq_num:02} — click Copy Row to copy full payload."
+                    )));
+                    break;
+                }
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_copy_selected_audit_row(move || {
+            let Some(w) = ui_weak.upgrade() else {
+                return;
+            };
+            let detail = w.get_selected_audit_detail();
+            if !detail.is_empty() {
+                let seq = w.get_selected_audit_seq();
+                w.set_last_copied_text(detail);
+                w.set_diagnostics_status_text(SharedString::from(format!(
+                    "Copied full audit detail for command #{seq:02}."
+                )));
+            }
+        });
+    }
 }
 
 /// Software-renderer platform for deterministic headless screenshot generation.
@@ -1332,6 +1706,16 @@ fn render_headless_screenshot(
             );
             sync_snapshot_to_ui(&ui, &s, true);
             ui.set_active_nav_index(2);
+            let rows = ui.get_audit_rows();
+            for idx in 0..rows.row_count() {
+                if let Some(row) = rows.row_data(idx)
+                    && row.seq_num == 2
+                {
+                    ui.set_selected_audit_seq(2);
+                    ui.set_selected_audit_detail(row.detail.clone());
+                    break;
+                }
+            }
             s
         }
         "settings" => {
@@ -1488,6 +1872,9 @@ fn run_interactive(sim_mode: bool) -> Result<()> {
             };
             if let Some(snap) = svc.borrow_mut().poll_latest() {
                 apply_polled_snapshot(&w, snap, &ops);
+            } else {
+                let diag = Arc::clone(&ops.borrow().diagnostics);
+                sync_recording_state_to_ui(&w, &diag);
             }
             report_worker_failure_once(&w, &svc, &ops, &refresh_timer);
         });
@@ -1499,9 +1886,28 @@ fn run_interactive(sim_mode: bool) -> Result<()> {
 
 fn main() -> std::process::ExitCode {
     let result = parse_cli_args(std::env::args().skip(1)).and_then(|opts| {
+        if !opts.show_help && !opts.show_version {
+            let resolved_level = resolve_log_level(
+                opts.log_level.as_deref(),
+                opts.verbose,
+                std::env::var("AWCC_LOG").ok().as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let trace_raw_usb = resolve_raw_usb_opt_in(
+                opts.trace_raw_usb,
+                std::env::var("AWCC_TRACE_RAW_USB").ok().as_deref(),
+            );
+            let cfg =
+                DiagnosticsConfig::from_env_and_cli("awcc-gui", resolved_level, trace_raw_usb);
+            let runtime = init_global_diagnostics(cfg);
+            install_panic_hook(runtime);
+        }
         let mut stdout = std::io::stdout().lock();
         dispatch(&opts, &mut stdout, &mut RealRuntime)
     });
+    if let Some(diag) = global_diagnostics() {
+        diag.shutdown(Duration::from_millis(250));
+    }
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
@@ -1540,10 +1946,12 @@ mod tests {
     fn format_log_entry_strips_pkexec_and_includes_meaning_and_hex() {
         let pkexec_entry = WriteAuditEntry {
             sequence: 1,
+            op_id: None,
             command: "pkexec sh -c 'echo \"\\_SB.AMWW.WMAX 0 0x15 {0x1,0xa3,0x0,0x00}\" > /proc/acpi/call && cat /proc/acpi/call'".to_string(),
             outcome: "0x0".to_string(),
             succeeded: true,
             ack: awcc_platform::AckStatus::NotApplicable,
+            raw_usb_response_hex: None,
         };
         let (cmd, out) = format_log_entry(&pkexec_entry, None);
         assert!(!cmd.contains("pkexec"));
@@ -1553,10 +1961,12 @@ mod tests {
 
         let usb_entry = WriteAuditEntry {
             sequence: 2,
+            op_id: Some(7),
             command: "USB HID 187c:0550 OUT [03 24 02 07 d0 00 fa f5 9e 0b]".to_string(),
             outcome: "33 bytes transferred".to_string(),
             succeeded: true,
             ack: awcc_platform::AckStatus::Received,
+            raw_usb_response_hex: None,
         };
         let (usb_cmd, usb_out) = format_log_entry(&usb_entry, None);
         assert!(usb_cmd.contains("Set Lighting Keyframe → Static Color #F59E0B (2000 ms)"));
@@ -1994,5 +2404,213 @@ mod tests {
             ui.get_lifecycle_message()
                 .contains("simulated worker crash")
         );
+    }
+
+    #[test]
+    fn full_audit_ring_continues_updating_gui_rows_and_shows_eviction_gap_and_clear_history() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().expect("window");
+        let mut orch = ThermalOrchestrator::new_simulated_m15_r6().expect("sim");
+
+        // Fill the 256-entry ring exactly to capacity:
+        for _ in 0..256 {
+            let snap = orch.set_thermal_mode(ThermalMode::Balanced);
+            sync_snapshot_to_ui(&ui, &snap, false);
+        }
+        assert_eq!(ui.get_write_count(), 256);
+        assert_eq!(ui.get_audit_retained_count(), 256);
+        assert_eq!(ui.get_audit_evicted_count(), 0);
+        assert_eq!(ui.get_audit_rows().row_count(), 256);
+        assert_eq!(
+            ui.get_audit_rows().row_data(0).unwrap().seq_text.as_str(),
+            "#256"
+        );
+        assert!(ui.get_audit_eviction_notice().is_empty());
+
+        // Issue 10 more writes at constant ring capacity (row_count remains 256!):
+        for i in 1..=10 {
+            let mode = if i % 2 == 0 {
+                ThermalMode::Performance
+            } else {
+                ThermalMode::Quiet
+            };
+            let snap = orch.set_thermal_mode(mode);
+            // `sync_staged_sliders = false` exercises the normal polled update path!
+            sync_snapshot_to_ui(&ui, &snap, false);
+        }
+        assert_eq!(ui.get_write_count(), 266);
+        assert_eq!(ui.get_audit_retained_count(), 256);
+        assert_eq!(ui.get_audit_evicted_count(), 10);
+        assert_eq!(ui.get_audit_rows().row_count(), 256);
+        assert_eq!(
+            ui.get_audit_rows().row_data(0).unwrap().seq_text.as_str(),
+            "#266",
+            "newest row must advance past #256 even when row_count() stays 256"
+        );
+        assert_eq!(
+            ui.get_audit_rows().row_data(255).unwrap().seq_text.as_str(),
+            "#11",
+            "oldest retained row must advance to #11 after 10 evictions"
+        );
+        assert!(
+            ui.get_audit_eviction_notice()
+                .contains("10 older write entries evicted"),
+            "notice: {}",
+            ui.get_audit_eviction_notice()
+        );
+        assert!(
+            ui.get_audit_counter_summary()
+                .contains("266 lifetime · 256 retained · 10 evicted"),
+            "summary: {}",
+            ui.get_audit_counter_summary()
+        );
+
+        // Clearing visible history empties `audit-rows` while preserving `write-count` (266)
+        // and allowing subsequent writes (#267) to appear immediately.
+        let cleared_snap = orch.execute(ServiceCommand::ClearAuditHistory).snapshot;
+        sync_snapshot_to_ui(&ui, &cleared_snap, false);
+        assert_eq!(ui.get_write_count(), 266);
+        assert_eq!(ui.get_audit_retained_count(), 0);
+        assert_eq!(ui.get_audit_cleared_count(), 256);
+        assert_eq!(ui.get_audit_rows().row_count(), 0);
+
+        let after_clear = orch.set_thermal_mode(ThermalMode::Cool);
+        sync_snapshot_to_ui(&ui, &after_clear, false);
+        assert_eq!(ui.get_write_count(), 267);
+        assert_eq!(ui.get_audit_retained_count(), 1);
+        assert_eq!(ui.get_audit_rows().row_count(), 1);
+        assert_eq!(
+            ui.get_audit_rows().row_data(0).unwrap().seq_text.as_str(),
+            "#267"
+        );
+    }
+
+    #[test]
+    fn gui_support_export_copy_summary_recording_toggle_and_row_detail_are_strictly_passive() {
+        let mut orch = ThermalOrchestrator::new_simulated_m15_r6().expect("sim");
+        // Seed one write before spawning the worker so there is an audit row to inspect:
+        let _ = orch.set_thermal_mode(ThermalMode::Performance);
+
+        let service: SharedService = Rc::new(RefCell::new(
+            ThermalServiceHandle::spawn(orch).expect("worker"),
+        ));
+        let (ui, ops, _timer) = wired_ui(&service);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "awcc-gui-support-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let zip_path = tmp.join("gui-support.zip");
+        ops.borrow_mut().export_output_override = Some(zip_path.clone());
+
+        assert_eq!(ui.get_write_count(), 1);
+        assert_eq!(ui.get_audit_rows().row_count(), 1);
+
+        // 1. Select and copy audit row #1:
+        ui.invoke_select_audit_row(1);
+        assert_eq!(ui.get_selected_audit_seq(), 1);
+        assert!(
+            ui.get_selected_audit_detail()
+                .contains("Set Thermal Profile → Performance"),
+            "detail: {}",
+            ui.get_selected_audit_detail()
+        );
+        ui.invoke_copy_selected_audit_row();
+        assert_eq!(ui.get_last_copied_text(), ui.get_selected_audit_detail());
+
+        // 2. Toggle temporary DEBUG recording on and off (and verify auto-expiry):
+        assert!(!ui.get_diagnostic_recording_active());
+        ui.invoke_toggle_diagnostic_recording();
+        assert!(ui.get_diagnostic_recording_active());
+        assert!(ops.borrow().diagnostics.is_recording_active());
+        assert_eq!(
+            ops.borrow().diagnostics.active_level(),
+            awcc_diagnostics::event::Severity::Debug
+        );
+        ui.invoke_toggle_diagnostic_recording();
+        assert!(!ui.get_diagnostic_recording_active());
+        assert!(!ops.borrow().diagnostics.is_recording_active());
+        assert_eq!(
+            ops.borrow().diagnostics.active_level(),
+            awcc_diagnostics::event::Severity::Info
+        );
+
+        // Short-duration recording expires and `apply_polled_snapshot` updates UI state:
+        ops.borrow()
+            .diagnostics
+            .start_recording(Duration::from_millis(50));
+        sync_recording_state_to_ui(&ui, &ops.borrow().diagnostics);
+        assert!(ui.get_diagnostic_recording_active());
+        std::thread::sleep(Duration::from_millis(65));
+        let snap = service.borrow().current_snapshot().clone();
+        apply_polled_snapshot(&ui, &snap, &ops);
+        assert!(!ui.get_diagnostic_recording_active());
+
+        // 3. Copy diagnostic summary and export support report — neither may enqueue any worker
+        //    command or change `write_count` / `command_seq`:
+        let seq_before = service.borrow().current_snapshot().command_seq;
+        ui.invoke_copy_diagnostic_summary();
+        assert!(
+            ui.get_last_copied_text()
+                .contains("AWCC Diagnostic Summary"),
+            "copied summary: {}",
+            ui.get_last_copied_text()
+        );
+        assert!(
+            ui.get_last_copied_text().contains("worker_alive=true"),
+            "copied summary: {}",
+            ui.get_last_copied_text()
+        );
+        ui.invoke_export_support_report();
+        assert_eq!(
+            ui.get_last_export_path().as_str(),
+            zip_path.display().to_string()
+        );
+        assert_eq!(
+            service.borrow().current_snapshot().command_seq,
+            seq_before,
+            "passive summary/export must not enqueue any service command"
+        );
+        assert_eq!(ui.get_write_count(), 1);
+
+        let entries =
+            awcc_diagnostics::zip::read_stored_zip(&std::fs::read(&zip_path).unwrap()).unwrap();
+        for expected in [
+            "summary.txt",
+            "report.json",
+            "events.jsonl",
+            "hardware-audit.jsonl",
+            "build-info.json",
+            "settings.json",
+        ] {
+            assert!(
+                entries.iter().any(|e| e.name == expected),
+                "missing {expected} in GUI support zip"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn verbose_and_log_level_cli_flags_parse_and_reject_invalid_values() {
+        let opts = parse_cli_args(vec![
+            "-v".to_string(),
+            "--log-level".to_string(),
+            "debug".to_string(),
+            "--trace-raw-usb".to_string(),
+            "--sim".to_string(),
+        ])
+        .expect("valid flags");
+        assert!(opts.verbose);
+        assert_eq!(opts.log_level.as_deref(), Some("debug"));
+        assert!(opts.trace_raw_usb);
+
+        let bad = parse_cli_args(vec!["--log-level=not-valid".to_string()]);
+        assert!(bad.is_err());
     }
 }

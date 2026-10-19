@@ -12,7 +12,10 @@
 //!   confirmed. `Failed`/`RolledBack` operations, unreadable single-value queries, and backend
 //!   start-up failures exit `1` with an `error:` line on stderr and nothing on stdout.
 
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use awcc_core::{
@@ -20,9 +23,16 @@ use awcc_core::{
     lighting::{LightingEffect, ZoneTarget},
     validate_fan_boost, validate_tcc_offset,
 };
+use awcc_diagnostics::{
+    DiagnosticsConfig, DiagnosticsRuntime, Severity, default_log_dir, global_diagnostics,
+    init_global_diagnostics, install_panic_hook, resolve_log_level, resolve_raw_usb_opt_in,
+};
 use awcc_service::{
     CommandOutcome, ServiceCommand, ThermalOrchestrator, daemon::parse_fancurve_ipc_command,
 };
+
+/// Default output archive path for `awcc-cli diagnostics export`.
+pub const DEFAULT_SUPPORT_ARCHIVE_FILENAME: &str = "awcc-support.zip";
 
 /// Parsed CLI action.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +40,13 @@ pub enum CliCommand {
     Help,
     Version,
     DeviceInfo,
+    DiagnosticsSummary {
+        json: bool,
+    },
+    DiagnosticsExport {
+        output: PathBuf,
+        json: bool,
+    },
     DaemonMode,
     GuiMode,
     QueryMode,
@@ -70,6 +87,16 @@ pub enum CliCommand {
     TestZones,
 }
 
+/// Complete parsed CLI invocation including logging and diagnostic flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliInvocation {
+    pub command: CliCommand,
+    pub sim_mode: bool,
+    pub cli_log_level: Option<String>,
+    pub cli_verbose: bool,
+    pub cli_trace_raw_usb: bool,
+}
+
 fn parse_rgb_triplet(r_s: &str, g_s: &str, b_s: &str) -> Result<u32> {
     let r = r_s.parse::<u8>().context("invalid R component (0..=255)")?;
     let g = g_s.parse::<u8>().context("invalid G component (0..=255)")?;
@@ -79,23 +106,100 @@ fn parse_rgb_triplet(r_s: &str, g_s: &str, b_s: &str) -> Result<u32> {
 
 /// Parse command-line arguments into a `CliCommand` without touching hardware.
 pub fn parse_cli_args(args: &[String]) -> Result<CliCommand> {
+    parse_cli_invocation(args).map(|inv| inv.command)
+}
+
+/// Parse command-line arguments and diagnostic/logging flags without touching hardware.
+pub fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation> {
     if args.is_empty() {
-        return Ok(CliCommand::Help);
+        return Ok(CliInvocation {
+            command: CliCommand::Help,
+            sim_mode: false,
+            cli_log_level: None,
+            cli_verbose: false,
+            cli_trace_raw_usb: false,
+        });
+    }
+
+    // Fast-path scan for `--help` / `--version` so they always succeed immediately.
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                return Ok(CliInvocation {
+                    command: CliCommand::Help,
+                    sim_mode: false,
+                    cli_log_level: None,
+                    cli_verbose: false,
+                    cli_trace_raw_usb: false,
+                });
+            }
+            "-V" | "--version" => {
+                return Ok(CliInvocation {
+                    command: CliCommand::Version,
+                    sim_mode: false,
+                    cli_log_level: None,
+                    cli_verbose: false,
+                    cli_trace_raw_usb: false,
+                });
+            }
+            _ => {}
+        }
     }
 
     let mut zone_target = ZoneTarget::All;
     let mut persist_boot = true;
+    let mut sim_mode = false;
+    let mut cli_log_level: Option<String> = None;
+    let mut cli_verbose = false;
+    let mut cli_trace_raw_usb = false;
     let mut positional = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
+        if let Some(level_val) = arg.strip_prefix("--log-level=") {
+            cli_log_level = Some(level_val.to_string());
+            i += 1;
+            continue;
+        }
         match arg {
-            "-h" | "--help" | "help" => return Ok(CliCommand::Help),
-            "-V" | "--version" => return Ok(CliCommand::Version),
-            "--test-mode" | "-v" | "--sim" => {}
-            "-d" | "--daemon" => return Ok(CliCommand::DaemonMode),
-            "-g" | "--gui" => return Ok(CliCommand::GuiMode),
+            "help" if positional.is_empty() => {
+                return Ok(CliInvocation {
+                    command: CliCommand::Help,
+                    sim_mode,
+                    cli_log_level,
+                    cli_verbose,
+                    cli_trace_raw_usb,
+                });
+            }
+            "--test-mode" | "--sim" => sim_mode = true,
+            "-v" | "--verbose" => cli_verbose = true,
+            "--trace-raw-usb" => cli_trace_raw_usb = true,
+            "--log-level" => {
+                i += 1;
+                let val = args.get(i).context(
+                    "missing value for `--log-level` (expected error|warn|info|debug|trace)",
+                )?;
+                cli_log_level = Some(val.clone());
+            }
+            "-d" | "--daemon" => {
+                return Ok(CliInvocation {
+                    command: CliCommand::DaemonMode,
+                    sim_mode,
+                    cli_log_level,
+                    cli_verbose,
+                    cli_trace_raw_usb,
+                });
+            }
+            "-g" | "--gui" => {
+                return Ok(CliInvocation {
+                    command: CliCommand::GuiMode,
+                    sim_mode,
+                    cli_log_level,
+                    cli_verbose,
+                    cli_trace_raw_usb,
+                });
+            }
             "--volatile" => persist_boot = false,
             "--persist" => persist_boot = true,
             "--zone" => {
@@ -108,12 +212,25 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand> {
         i += 1;
     }
 
+    // Validate `--log-level` explicitly if provided on the CLI.
+    if let Some(level_str) = &cli_log_level {
+        resolve_log_level(Some(level_str.as_str()), cli_verbose, None)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
     let Some(cmd) = positional.first().map(String::as_str) else {
-        return Ok(CliCommand::Help);
+        return Ok(CliInvocation {
+            command: CliCommand::Help,
+            sim_mode,
+            cli_log_level,
+            cli_verbose,
+            cli_trace_raw_usb,
+        });
     };
 
-    match cmd {
+    let command = match cmd {
         "device-info" => Ok(CliCommand::DeviceInfo),
+        "diagnostics" | "diag" => parse_diagnostics_subcommand(&positional[1..]),
         "qm" | "query-mode" => Ok(CliCommand::QueryMode),
         "q" | "quiet" => Ok(CliCommand::SetMode(ThermalMode::Quiet)),
         "bs" | "battery-saver" => Ok(CliCommand::SetMode(ThermalMode::BatterySaver)),
@@ -163,19 +280,20 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand> {
                 );
             };
             if arg1.eq_ignore_ascii_case("stop") || arg1.eq_ignore_ascii_case("off") {
-                return Ok(CliCommand::StopFanCurve);
-            }
-            let joined = format!("FANCURVE {}", positional[1..].join(" "));
-            match parse_fancurve_ipc_command(&joined) {
-                Some(awcc_service::daemon::FanCurveIpcCommand::Stop) => {
-                    Ok(CliCommand::StopFanCurve)
+                Ok(CliCommand::StopFanCurve)
+            } else {
+                let joined = format!("FANCURVE {}", positional[1..].join(" "));
+                match parse_fancurve_ipc_command(&joined) {
+                    Some(awcc_service::daemon::FanCurveIpcCommand::Stop) => {
+                        Ok(CliCommand::StopFanCurve)
+                    }
+                    Some(awcc_service::daemon::FanCurveIpcCommand::Configure(cfg)) => {
+                        Ok(CliCommand::ConfigureFanCurve(cfg))
+                    }
+                    None => bail!(
+                        "invalid fancurve arguments; expected 4 <temp 20..105> <boost 0..100> pairs"
+                    ),
                 }
-                Some(awcc_service::daemon::FanCurveIpcCommand::Configure(cfg)) => {
-                    Ok(CliCommand::ConfigureFanCurve(cfg))
-                }
-                None => bail!(
-                    "invalid fancurve arguments; expected 4 <temp 20..105> <boost 0..100> pairs"
-                ),
             }
         }
         "static" => {
@@ -301,6 +419,82 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand> {
         "test-modes" => Ok(CliCommand::TestModes),
         "test-zones" => Ok(CliCommand::TestZones),
         other => bail!("unknown command `{other}` (run with `--help` for usage)"),
+    }?;
+
+    Ok(CliInvocation {
+        command,
+        sim_mode,
+        cli_log_level,
+        cli_verbose,
+        cli_trace_raw_usb,
+    })
+}
+
+fn parse_diagnostics_subcommand(rest: &[String]) -> Result<CliCommand> {
+    let mut sub = "summary";
+    let mut idx = 0;
+    if let Some(first) = rest.first().map(String::as_str)
+        && !first.starts_with('-')
+    {
+        sub = first;
+        idx = 1;
+    }
+
+    match sub {
+        "summary" | "status" => {
+            let mut json = false;
+            while idx < rest.len() {
+                match rest[idx].as_str() {
+                    "--json" => json = true,
+                    other => bail!(
+                        "unknown `diagnostics summary` option `{other}` (usage: `awcc-cli diagnostics summary [--json]`)"
+                    ),
+                }
+                idx += 1;
+            }
+            Ok(CliCommand::DiagnosticsSummary { json })
+        }
+        "export" => {
+            let mut output: Option<PathBuf> = None;
+            let mut json = false;
+            while idx < rest.len() {
+                let arg = rest[idx].as_str();
+                if let Some(val) = arg.strip_prefix("--output=") {
+                    if val.trim().is_empty() {
+                        bail!("`--output` path must not be empty");
+                    }
+                    output = Some(PathBuf::from(val));
+                } else {
+                    match arg {
+                        "-o" | "--output" => {
+                            idx += 1;
+                            let val = rest
+                                .get(idx)
+                                .context("missing archive path for `--output`")?;
+                            if val.trim().is_empty() {
+                                bail!("`--output` path must not be empty");
+                            }
+                            output = Some(PathBuf::from(val));
+                        }
+                        "--json" => json = true,
+                        other if !other.starts_with('-') && output.is_none() => {
+                            output = Some(PathBuf::from(other));
+                        }
+                        other => bail!(
+                            "unknown `diagnostics export` option `{other}` (usage: `awcc-cli diagnostics export [--output awcc-support.zip] [--json]`)"
+                        ),
+                    }
+                }
+                idx += 1;
+            }
+            Ok(CliCommand::DiagnosticsExport {
+                output: output.unwrap_or_else(|| PathBuf::from(DEFAULT_SUPPORT_ARCHIVE_FILENAME)),
+                json,
+            })
+        }
+        other => {
+            bail!("unknown `diagnostics` subcommand `{other}` (expected `export` or `summary`)")
+        }
     }
 }
 
@@ -312,10 +506,13 @@ pub fn format_help() -> String {
         "",
         "Usage: awcc-cli <command> [options]",
         "",
-        "Passive Commands (zero hardware writes):",
+        "Passive Commands (zero hardware probes or writes):",
         "  --help, -h               Show this help message",
         "  --version, -V            Show version, source revision, target, toolchain, and package format",
         "  device-info              Show resolved device database profile and capabilities",
+        "  diagnostics summary      Print passive redacted diagnostic summary (`--json` for report.json)",
+        "  diagnostics export [--output awcc-support.zip]",
+        "                           Export bounded passive support archive (.zip) without probing hardware",
         "",
         "Thermal & Fan Commands:",
         "  qm                       Query active thermal mode and telemetry",
@@ -342,6 +539,11 @@ pub fn format_help() -> String {
         "  raw-status [--all]       Query ELC 0x20 status, firmware version, and 0x0F01 config",
         "  --zone <all|keyboard|logo|tron|0,1..>  Target specific ELC zone group",
         "  --volatile | --persist   Apply volatilely (live session) or persist to boot slot 0x0061",
+        "",
+        "Logging & Diagnostics Options (precedence: --log-level > -v > AWCC_LOG > info):",
+        "  --log-level <level>      Set log filter level: error | warn | info | debug | trace",
+        "  -v, --verbose            Enable verbose DEBUG diagnostics on stderr",
+        "  --trace-raw-usb          Opt in to verbose raw 33-byte USB input report hex in audit/exports",
     ]
     .join("\n")
 }
@@ -428,6 +630,77 @@ fn unreadable<T: std::fmt::Display + Copy>(
     )
 }
 
+/// Execute passive `diagnostics summary` or `diagnostics export` without constructing any
+/// hardware or simulated backends.
+fn execute_passive_diagnostics_command(
+    cmd: &CliCommand,
+    inv: &CliInvocation,
+    log_dir: Option<&Path>,
+) -> Result<CliOutput> {
+    let resolved_level = resolve_log_level(
+        inv.cli_log_level.as_deref(),
+        inv.cli_verbose,
+        std::env::var("AWCC_LOG").ok().as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let trace_raw_usb = resolve_raw_usb_opt_in(
+        inv.cli_trace_raw_usb,
+        std::env::var("AWCC_TRACE_RAW_USB").ok().as_deref(),
+    );
+
+    let mut cfg = DiagnosticsConfig::from_env_and_cli("awcc-cli", resolved_level, trace_raw_usb);
+    cfg.enable_file_sink = false;
+    cfg.log_dir = log_dir.map(Path::to_path_buf);
+    cfg.enable_stderr_console = false;
+    let runtime = DiagnosticsRuntime::new(cfg);
+
+    let mut extra_settings = BTreeMap::new();
+    extra_settings.insert(
+        "cli_mode".to_string(),
+        if inv.sim_mode { "simulated" } else { "default" }.to_string(),
+    );
+    let bundle = runtime
+        .assemble_support_bundle(None, extra_settings)
+        .context("failed to assemble passive support bundle")?;
+
+    match cmd {
+        CliCommand::DiagnosticsSummary { json: true } => Ok(CliOutput::line(bundle.report_json)),
+        CliCommand::DiagnosticsSummary { json: false } => Ok(CliOutput::line(bundle.summary_txt)),
+        CliCommand::DiagnosticsExport { output, json } => {
+            let bytes = bundle.write_to_path(output).with_context(|| {
+                format!("failed to write support archive to {}", output.display())
+            })?;
+            let origin = bundle.report.evidence.origin.as_str();
+            if *json {
+                let payload = serde_json::json!({
+                    "status": "exported",
+                    "output": output.display().to_string(),
+                    "bytes": bytes,
+                    "schema_version": bundle.report.schema_version,
+                    "export_mode": bundle.report.export_mode,
+                    "evidence_origin": origin,
+                    "observation_age_ms": bundle.report.evidence.observation_age_ms,
+                });
+                Ok(CliOutput::line(serde_json::to_string_pretty(&payload)?))
+            } else {
+                let mut notes = Vec::new();
+                notes.push(format!(
+                    "passive export completed with zero hardware queries (evidence origin: {origin})"
+                ));
+                Ok(CliOutput {
+                    stdout: format!(
+                        "Exported support report to {} ({bytes} bytes, schema v{}, origin={origin})",
+                        output.display(),
+                        bundle.report.schema_version
+                    ),
+                    notes,
+                })
+            }
+        }
+        _ => unreachable!("only called for passive diagnostics commands"),
+    }
+}
+
 /// Execute a parsed `CliCommand` against an `ThermalOrchestrator` (only invoked for active commands).
 pub fn execute_active_cli_command(
     cmd: CliCommand,
@@ -439,6 +712,16 @@ pub fn execute_active_cli_command(
         CliCommand::DeviceInfo => {
             let snap = orch.query_snapshot();
             Ok(CliOutput::line(format_device_info(&snap.profile)))
+        }
+        CliCommand::DiagnosticsSummary { .. } | CliCommand::DiagnosticsExport { .. } => {
+            let default_inv = CliInvocation {
+                command: cmd.clone(),
+                sim_mode: false,
+                cli_log_level: None,
+                cli_verbose: false,
+                cli_trace_raw_usb: false,
+            };
+            execute_passive_diagnostics_command(&cmd, &default_inv, default_log_dir().as_deref())
         }
         CliCommand::QueryMode => {
             let snap = orch.query_snapshot();
@@ -724,31 +1007,118 @@ pub fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let sim_mode = raw_args.iter().any(|a| a == "--sim" || a == "--test-mode");
-    let cmd = match parse_cli_args(raw_args) {
-        Ok(cmd) => cmd,
+    run_with_log_dir(raw_args, backends, default_log_dir().as_deref(), out, err)
+}
+
+/// Like [`run`] but with an explicit session-log directory for passive diagnostics export/summary.
+pub fn run_with_log_dir(
+    raw_args: &[String],
+    backends: &mut dyn CliBackends,
+    log_dir: Option<&Path>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let inv = match parse_cli_invocation(raw_args) {
+        Ok(inv) => inv,
         Err(e) => return emit(out, err, Err(e)),
     };
 
-    let result = match cmd {
-        CliCommand::Help => Ok(CliOutput::line(format_help())),
-        CliCommand::Version => Ok(CliOutput::line(awcc_build_info::version_text("awcc-cli"))),
+    // Fast-paths return before any logger or backend is initialized.
+    match &inv.command {
+        CliCommand::Help => return emit(out, err, Ok(CliOutput::line(format_help()))),
+        CliCommand::Version => {
+            return emit(
+                out,
+                err,
+                Ok(CliOutput::line(awcc_build_info::version_text("awcc-cli"))),
+            );
+        }
+        _ => {}
+    }
+
+    let resolved_level = match resolve_log_level(
+        inv.cli_log_level.as_deref(),
+        inv.cli_verbose,
+        std::env::var("AWCC_LOG").ok().as_deref(),
+    ) {
+        Ok(r) => r,
+        Err(e) => return emit(out, err, Err(anyhow::anyhow!("{e}"))),
+    };
+    let trace_raw_usb = resolve_raw_usb_opt_in(
+        inv.cli_trace_raw_usb,
+        std::env::var("AWCC_TRACE_RAW_USB").ok().as_deref(),
+    );
+
+    if let Some(warn_msg) = &resolved_level.env_warning {
+        let _ = writeln!(
+            err,
+            "[WARN] awcc::diagnostics [invalid_log_env]: {warn_msg}"
+        );
+    }
+    if resolved_level.level >= Severity::Debug {
+        let _ = writeln!(
+            err,
+            "[DEBUG] awcc::cli [log_config]: level={} (source={}), sim={}, trace_raw_usb={}, cmd={:?}",
+            resolved_level.level.as_str(),
+            resolved_level.source,
+            inv.sim_mode,
+            trace_raw_usb,
+            inv.command
+        );
+    }
+
+    let result = match inv.command.clone() {
+        CliCommand::Help | CliCommand::Version => unreachable!("handled above"),
         // Passive commands must never instantiate USB or ACPI hardware!
         CliCommand::DeviceInfo => backends
-            .device_profile(sim_mode)
+            .device_profile(inv.sim_mode)
             .map(|profile| CliOutput::line(format_device_info(&profile))),
-        other => backends
-            .orchestrator(sim_mode)
-            .and_then(|mut orch| execute_active_cli_command(other, &mut orch)),
+        CliCommand::DiagnosticsSummary { .. } | CliCommand::DiagnosticsExport { .. } => {
+            execute_passive_diagnostics_command(&inv.command, &inv, log_dir)
+        }
+        other => backends.orchestrator(inv.sim_mode).and_then(|mut orch| {
+            orch.set_trace_raw_usb(trace_raw_usb);
+            execute_active_cli_command(other, &mut orch)
+        }),
     };
     emit(out, err, result)
 }
 
 fn main() -> std::process::ExitCode {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Only initialize global file/tracing diagnostics and panic hook when not running a pure
+    // fast-path (`--help`, `--version`) or passive `diagnostics` export.
+    if let Ok(inv) = parse_cli_invocation(&raw_args)
+        && !matches!(
+            inv.command,
+            CliCommand::Help
+                | CliCommand::Version
+                | CliCommand::DiagnosticsSummary { .. }
+                | CliCommand::DiagnosticsExport { .. }
+        )
+        && let Ok(resolved_level) = resolve_log_level(
+            inv.cli_log_level.as_deref(),
+            inv.cli_verbose,
+            std::env::var("AWCC_LOG").ok().as_deref(),
+        )
+    {
+        let trace_raw_usb = resolve_raw_usb_opt_in(
+            inv.cli_trace_raw_usb,
+            std::env::var("AWCC_TRACE_RAW_USB").ok().as_deref(),
+        );
+        let cfg = DiagnosticsConfig::from_env_and_cli("awcc-cli", resolved_level, trace_raw_usb);
+        let runtime = init_global_diagnostics(cfg);
+        install_panic_hook(runtime);
+    }
+
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
-    std::process::ExitCode::from(run(&raw_args, &mut RealBackends, &mut stdout, &mut stderr))
+    let code = run(&raw_args, &mut RealBackends, &mut stdout, &mut stderr);
+    if let Some(diag) = global_diagnostics() {
+        diag.shutdown(Duration::from_millis(250));
+    }
+    std::process::ExitCode::from(code)
 }
 
 #[cfg(test)]
@@ -1223,5 +1593,210 @@ mod tests {
                 .unwrap()
                 .contains("orchestrator boom")
         );
+    }
+
+    #[test]
+    fn verbose_flag_and_log_level_controls_are_enforced_with_stderr_diagnostics() {
+        // `-v` is no longer a silent no-op: it enables DEBUG diagnostics on stderr while keeping
+        // stdout strictly machine-readable.
+        let mut spy = SpyBackends::default();
+        let verbose = run_cli(&["-v", "--sim", "qm"], &mut spy);
+        assert_eq!(verbose.code, 0);
+        assert!(verbose.stdout.starts_with("Current Thermal Mode: Balanced"));
+        assert!(!verbose.stdout.contains("[DEBUG]"));
+        assert!(
+            verbose
+                .stderr
+                .contains("[DEBUG] awcc::cli [log_config]: level=DEBUG (source=cli_verbose)"),
+            "stderr: {}",
+            verbose.stderr
+        );
+
+        // Explicit `--log-level trace` overrides `-v`.
+        let mut spy = SpyBackends::default();
+        let trace = run_cli(&["-v", "--log-level", "trace", "--sim", "qm"], &mut spy);
+        assert_eq!(trace.code, 0);
+        assert!(
+            trace.stderr.contains("level=TRACE (source=cli_log_level)"),
+            "stderr: {}",
+            trace.stderr
+        );
+
+        // Invalid `--log-level` fails explicitly with exit 1 and zero backend touches.
+        let mut spy = SpyBackends::default();
+        let bad = run_cli(&["--log-level", "not-a-level", "--sim", "qm"], &mut spy);
+        assert_eq!(bad.code, 1);
+        assert!(bad.stdout.is_empty());
+        assert!(
+            bad.stderr.contains("invalid log level 'not-a-level'"),
+            "stderr: {}",
+            bad.stderr
+        );
+        assert_eq!(spy.profile_calls, 0);
+        assert_eq!(spy.orchestrator_calls, 0);
+    }
+
+    #[test]
+    fn diagnostics_export_and_summary_are_strictly_passive_and_produce_valid_redacted_zip() {
+        let tmp = std::env::temp_dir().join(format!(
+            "awcc-cli-diag-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 1. When no prior session evidence exists, `diagnostics export` still succeeds passively
+        //    with `origin=unavailable` and zero backend calls.
+        let empty_log_dir = tmp.join("empty-logs");
+        let zip_unavail = tmp.join("support-unavail.zip");
+        let mut spy = SpyBackends::default();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_with_log_dir(
+            &to_args(&[
+                "diagnostics",
+                "export",
+                "--output",
+                zip_unavail.to_str().unwrap(),
+            ]),
+            &mut spy,
+            Some(&empty_log_dir),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        assert_eq!(
+            spy.profile_calls, 0,
+            "passive export must not resolve live profile"
+        );
+        assert_eq!(
+            spy.orchestrator_calls, 0,
+            "passive export must not open transports"
+        );
+        let stdout_str = String::from_utf8(out).unwrap();
+        assert!(stdout_str.contains("origin=unavailable"), "{stdout_str}");
+
+        let archive_bytes = std::fs::read(&zip_unavail).unwrap();
+        let files = awcc_diagnostics::zip::read_stored_zip(&archive_bytes).unwrap();
+        for expected in [
+            "summary.txt",
+            "report.json",
+            "events.jsonl",
+            "hardware-audit.jsonl",
+            "build-info.json",
+            "settings.json",
+        ] {
+            assert!(
+                files.iter().any(|e| e.name == expected),
+                "missing {expected} in zip"
+            );
+        }
+
+        // 2. Persist simulated session evidence containing sensitive paths/serials into `populated-logs`
+        //    and verify `diagnostics export` ingests it passively with observation age and redacts PII.
+        let pop_log_dir = tmp.join("populated-logs");
+        let sink =
+            awcc_diagnostics::sink::FileSink::start(awcc_diagnostics::sink::SinkConfig::new(
+                pop_log_dir.clone(),
+                "a1b2c3d4e5f60718".to_string(),
+                std::process::id(),
+            ))
+            .unwrap();
+        let mut orch = ThermalOrchestrator::new_simulated_m15_r6().unwrap();
+        let snap = orch.set_thermal_mode(ThermalMode::Performance);
+        let mut evidence = snap.to_session_evidence(
+            "a1b2c3d4e5f60718",
+            awcc_diagnostics::export::BuildIdentityReport::current("awcc-gui"),
+            true,
+        );
+        evidence.subsystem_health.last_error = Some(
+            "failed reading /home/alice/.config/awcc with Service Tag: ABC1234 and MAC aa:bb:cc:dd:ee:ff"
+                .to_string(),
+        );
+        sink.publish_evidence(serde_json::to_string_pretty(&evidence).unwrap());
+        sink.shutdown(Duration::from_secs(1));
+
+        let zip_pop = tmp.join("awcc-support.zip");
+        let mut spy2 = SpyBackends::default();
+        let (mut out2, mut err2) = (Vec::new(), Vec::new());
+        let code2 = run_with_log_dir(
+            &to_args(&[
+                "diagnostics",
+                "export",
+                "--output",
+                zip_pop.to_str().unwrap(),
+            ]),
+            &mut spy2,
+            Some(&pop_log_dir),
+            &mut out2,
+            &mut err2,
+        );
+        assert_eq!(code2, 0, "stderr: {}", String::from_utf8_lossy(&err2));
+        assert_eq!(spy2.profile_calls, 0);
+        assert_eq!(spy2.orchestrator_calls, 0);
+        let stdout2 = String::from_utf8(out2).unwrap();
+        assert!(
+            stdout2.contains("origin=persisted_session_file"),
+            "{stdout2}"
+        );
+
+        let pop_files =
+            awcc_diagnostics::zip::read_stored_zip(&std::fs::read(&zip_pop).unwrap()).unwrap();
+        let find_entry = |name: &str| -> String {
+            String::from_utf8(
+                pop_files
+                    .iter()
+                    .find(|e| e.name == name)
+                    .unwrap_or_else(|| panic!("missing {name}"))
+                    .data
+                    .clone(),
+            )
+            .unwrap()
+        };
+        let report_json = find_entry("report.json");
+        let summary_txt = find_entry("summary.txt");
+        let audit_jsonl = find_entry("hardware-audit.jsonl");
+
+        assert!(report_json.contains("\"schema_version\": 1"));
+        assert!(report_json.contains("\"origin\": \"persisted_session_file\""));
+        assert!(report_json.contains("\"observation_age_ms\":"));
+        assert!(report_json.contains("Alienware m15 R6"));
+        assert!(
+            !report_json.contains("/home/alice"),
+            "home path must be redacted: {report_json}"
+        );
+        assert!(
+            !report_json.contains("ABC1234"),
+            "service tag must be redacted: {report_json}"
+        );
+        assert!(
+            !report_json.contains("aa:bb:cc:dd:ee:ff"),
+            "MAC must be redacted: {report_json}"
+        );
+        assert!(
+            !summary_txt.contains("/home/alice") && !summary_txt.contains("ABC1234"),
+            "summary.txt must be redacted: {summary_txt}"
+        );
+        assert!(
+            audit_jsonl.contains("WMAX 0 0x15"),
+            "hardware-audit.jsonl must include recorded ACPI writes: {audit_jsonl}"
+        );
+
+        // 3. `diagnostics summary` prints human summary by default and valid JSON with `--json`.
+        let (mut sum_out, mut sum_err) = (Vec::new(), Vec::new());
+        let sum_code = run_with_log_dir(
+            &to_args(&["diagnostics", "summary", "--json"]),
+            &mut spy2,
+            Some(&pop_log_dir),
+            &mut sum_out,
+            &mut sum_err,
+        );
+        assert_eq!(sum_code, 0);
+        assert_eq!((spy2.profile_calls, spy2.orchestrator_calls), (0, 0));
+        let parsed_json: serde_json::Value = serde_json::from_slice(&sum_out).unwrap();
+        assert_eq!(parsed_json["schema_version"], 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

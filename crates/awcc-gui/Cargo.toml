@@ -12,11 +12,14 @@ description.workspace = true
 anyhow.workspace = true
 awcc-build-info.workspace = true
 awcc-core.workspace = true
+awcc-diagnostics.workspace = true
 awcc-platform.workspace = true
 awcc-service.workspace = true
 i-slint-backend-testing.workspace = true
 png.workspace = true
+serde_json.workspace = true
 slint.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true

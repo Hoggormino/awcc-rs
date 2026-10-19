@@ -377,6 +377,7 @@ pub struct SimUsbElcTransport {
     pending_color_recorded: bool,
     sent_reports: Vec<HidReport33>,
     write_log: Vec<WriteAuditEntry>,
+    next_write_seq: usize,
     zone_colors: BTreeMap<u8, u32>,
     power_slot_colors: BTreeMap<u16, u32>,
     dim_value: u8,
@@ -422,6 +423,7 @@ impl SimUsbElcTransport {
             pending_color_recorded: false,
             sent_reports: Vec::new(),
             write_log: Vec::new(),
+            next_write_seq: 0,
             zone_colors,
             power_slot_colors,
             dim_value: 0,
@@ -486,15 +488,31 @@ impl SimUsbElcTransport {
         outcome: impl Into<String>,
         succeeded: bool,
         ack: AckStatus,
+        raw_usb_response_hex: Option<String>,
     ) {
-        let sequence = self.write_log.len() + 1;
+        self.next_write_seq += 1;
+        let sequence = self.next_write_seq;
         self.write_log.push(WriteAuditEntry {
             sequence,
             command,
             outcome: outcome.into(),
             succeeded,
             ack,
+            op_id: None,
+            raw_usb_response_hex,
         });
+        if self.write_log.len() > crate::MAX_TRANSPORT_AUDIT_ENTRIES {
+            let excess = self.write_log.len() - crate::MAX_TRANSPORT_AUDIT_ENTRIES;
+            self.write_log.drain(..excess);
+        }
+    }
+
+    fn push_sent_report(&mut self, report: HidReport33) {
+        self.sent_reports.push(report);
+        if self.sent_reports.len() > crate::MAX_TRANSPORT_AUDIT_ENTRIES {
+            let excess = self.sent_reports.len() - crate::MAX_TRANSPORT_AUDIT_ENTRIES;
+            self.sent_reports.drain(..excess);
+        }
     }
 }
 
@@ -534,7 +552,7 @@ impl UsbHidTransport for SimUsbElcTransport {
     fn send_report(&mut self, report: &HidReport33) -> Result<SendReceipt, TransportError> {
         // Track query vs mutating commands
         if report[0] == PREAMBLE && report[1] == CMD_REQUEST {
-            self.sent_reports.push(*report);
+            self.push_sent_report(*report);
             self.last_query_subcmd = Some(report[2]);
             return Ok(SendReceipt::without_ack());
         }
@@ -549,12 +567,13 @@ impl UsbHidTransport for SimUsbElcTransport {
                 "simulated libusb transfer error",
                 false,
                 AckStatus::NotApplicable,
+                None,
             );
             return Err(TransportError::TransportUnavailable(
                 "simulated libusb control transfer write failed".to_string(),
             ));
         }
-        self.sent_reports.push(*report);
+        self.push_sent_report(*report);
 
         // Update simulated state when mutating commands arrive
         track_elc_report_state(
@@ -568,11 +587,19 @@ impl UsbHidTransport for SimUsbElcTransport {
         );
 
         let ack = self.ack_fault.clone().unwrap_or(AckStatus::Received);
+        let raw_resp = matches!(ack, AckStatus::Received).then(|| {
+            let mut ack_buf = [0_u8; 33];
+            ack_buf[0] = PREAMBLE;
+            ack_buf[1] = report[1];
+            ack_buf[2] = report[2];
+            format_report_hex(&ack_buf)
+        });
         self.record_write(
             format!("USB HID 187c:{:04x} OUT [{hex}]", self.product_id),
             "33 bytes transferred",
             true,
             ack.clone(),
+            raw_resp,
         );
         Ok(SendReceipt { ack })
     }
@@ -645,6 +672,7 @@ pub struct LinuxUsbElcTransport {
     pending_color_recorded: bool,
     sent_reports: Vec<HidReport33>,
     write_log: Vec<WriteAuditEntry>,
+    next_write_seq: usize,
     zone_colors: BTreeMap<u8, u32>,
     power_slot_colors: BTreeMap<u16, u32>,
 }
@@ -684,6 +712,7 @@ impl LinuxUsbElcTransport {
             pending_color_recorded: false,
             sent_reports: Vec::new(),
             write_log: Vec::new(),
+            next_write_seq: 0,
             zone_colors,
             power_slot_colors,
         }
@@ -695,15 +724,23 @@ impl LinuxUsbElcTransport {
         outcome: impl Into<String>,
         succeeded: bool,
         ack: AckStatus,
+        raw_usb_response_hex: Option<String>,
     ) {
-        let sequence = self.write_log.len() + 1;
+        self.next_write_seq += 1;
+        let sequence = self.next_write_seq;
         self.write_log.push(WriteAuditEntry {
             sequence,
             command,
             outcome: outcome.into(),
             succeeded,
             ack,
+            op_id: None,
+            raw_usb_response_hex,
         });
+        if self.write_log.len() > crate::MAX_TRANSPORT_AUDIT_ENTRIES {
+            let excess = self.write_log.len() - crate::MAX_TRANSPORT_AUDIT_ENTRIES;
+            self.write_log.drain(..excess);
+        }
     }
 }
 
@@ -823,6 +860,10 @@ impl UsbHidTransport for LinuxUsbElcTransport {
         match handle.write_control(0x21, 0x09, 0x0202, 0, report, Duration::from_millis(1000)) {
             Ok(written) if written == report.len() => {
                 self.sent_reports.push(*report);
+                if self.sent_reports.len() > crate::MAX_TRANSPORT_AUDIT_ENTRIES {
+                    let excess = self.sent_reports.len() - crate::MAX_TRANSPORT_AUDIT_ENTRIES;
+                    self.sent_reports.drain(..excess);
+                }
                 if is_query {
                     return Ok(SendReceipt::without_ack());
                 }
@@ -860,7 +901,7 @@ impl UsbHidTransport for LinuxUsbElcTransport {
                 // recorded separately from the (already completed) outgoing transfer and never
                 // turns that transfer into an error.
                 let mut ack_buf = [0_u8; 33];
-                let ack = match handle.read_control(
+                let (ack, raw_resp) = match handle.read_control(
                     0xA1,
                     0x01,
                     0x0101,
@@ -868,11 +909,16 @@ impl UsbHidTransport for LinuxUsbElcTransport {
                     &mut ack_buf,
                     Duration::from_millis(500),
                 ) {
-                    Ok(n) if n == ack_buf.len() => AckStatus::Received,
-                    Ok(bytes) => AckStatus::Incomplete { bytes },
-                    Err(e) => AckStatus::Failed {
-                        reason: e.to_string(),
-                    },
+                    Ok(n) if n == ack_buf.len() => {
+                        (AckStatus::Received, Some(format_report_hex(&ack_buf)))
+                    }
+                    Ok(bytes) => (AckStatus::Incomplete { bytes }, None),
+                    Err(e) => (
+                        AckStatus::Failed {
+                            reason: e.to_string(),
+                        },
+                        None,
+                    ),
                 };
 
                 track_elc_report_state(
@@ -889,6 +935,7 @@ impl UsbHidTransport for LinuxUsbElcTransport {
                     "33 bytes transferred",
                     true,
                     ack.clone(),
+                    raw_resp,
                 );
                 Ok(SendReceipt { ack })
             }
@@ -899,6 +946,7 @@ impl UsbHidTransport for LinuxUsbElcTransport {
                         format!("partial write ({written}/33 bytes)"),
                         false,
                         AckStatus::NotApplicable,
+                        None,
                     );
                 }
                 Err(TransportError::TransportUnavailable(format!(
@@ -912,6 +960,7 @@ impl UsbHidTransport for LinuxUsbElcTransport {
                         format!("libusb error: {e}"),
                         false,
                         AckStatus::NotApplicable,
+                        None,
                     );
                 }
                 Err(TransportError::TransportUnavailable(format!(

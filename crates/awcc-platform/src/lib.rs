@@ -24,6 +24,9 @@ pub enum TransportError {
     TransportUnavailable(String),
 }
 
+/// Hard cap on per-transport write audit buffers so long-running sessions stay bounded in memory.
+pub const MAX_TRANSPORT_AUDIT_ENTRIES: usize = 256;
+
 /// Audit log entry for every hardware/simulated write command issued.
 ///
 /// Passive operations (`query_raw_thermal_mode`, `query_telemetry`, `device-info`) never append
@@ -41,6 +44,13 @@ pub struct WriteAuditEntry {
     /// recorded separately from the outgoing transfer. `NotApplicable` for ACPI/sysfs writes.
     #[serde(default)]
     pub ack: AckStatus,
+    /// Correlated operation ID assigned by `ThermalOrchestrator::run_op`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<u64>,
+    /// Optional 33-byte USB input report hex from the acknowledgement phase (included in support
+    /// exports only when `--trace-raw-usb` / `AWCC_TRACE_RAW_USB=1` is opted into).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_usb_response_hex: Option<String>,
 }
 
 impl WriteAuditEntry {
@@ -58,6 +68,8 @@ impl WriteAuditEntry {
             outcome: outcome.into(),
             succeeded,
             ack: AckStatus::NotApplicable,
+            op_id: None,
+            raw_usb_response_hex: None,
         }
     }
 }
@@ -622,6 +634,7 @@ pub struct LinuxAcpiTransport {
     hwmon: HwmonProvider,
     executor: CommandExecutor,
     write_log: Vec<WriteAuditEntry>,
+    next_write_seq: usize,
 }
 
 impl LinuxAcpiTransport {
@@ -638,6 +651,7 @@ impl LinuxAcpiTransport {
             hwmon,
             executor,
             write_log: Vec::new(),
+            next_write_seq: 0,
         }
     }
 
@@ -689,9 +703,14 @@ impl LinuxAcpiTransport {
     }
 
     fn record_write(&mut self, command: String, outcome: impl Into<String>, succeeded: bool) {
-        let sequence = self.write_log.len() + 1;
+        self.next_write_seq += 1;
+        let sequence = self.next_write_seq;
         self.write_log
             .push(WriteAuditEntry::new(sequence, command, outcome, succeeded));
+        if self.write_log.len() > MAX_TRANSPORT_AUDIT_ENTRIES {
+            let excess = self.write_log.len() - MAX_TRANSPORT_AUDIT_ENTRIES;
+            self.write_log.drain(..excess);
+        }
     }
 }
 
@@ -969,6 +988,7 @@ pub struct SimBackend {
     tcc_offset_c: u8,
     faults: SimFaults,
     write_log: Vec<WriteAuditEntry>,
+    next_write_seq: usize,
 }
 
 impl SimBackend {
@@ -989,13 +1009,19 @@ impl SimBackend {
             tcc_offset_c: 0,
             faults: SimFaults::default(),
             write_log: Vec::new(),
+            next_write_seq: 0,
         }
     }
 
     fn record_write(&mut self, command: String, outcome: impl Into<String>, succeeded: bool) {
-        let sequence = self.write_log.len() + 1;
+        self.next_write_seq += 1;
+        let sequence = self.next_write_seq;
         self.write_log
             .push(WriteAuditEntry::new(sequence, command, outcome, succeeded));
+        if self.write_log.len() > MAX_TRANSPORT_AUDIT_ENTRIES {
+            let excess = self.write_log.len() - MAX_TRANSPORT_AUDIT_ENTRIES;
+            self.write_log.drain(..excess);
+        }
     }
 
     fn apply_telemetry_preset_for_code(&mut self, mode_code: u16) {

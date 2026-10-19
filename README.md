@@ -9,15 +9,16 @@ Unofficial Alienware Command Center for Linux rewritten in **Rust** with a compa
 | Crate / Directory | Description |
 | :--- | :--- |
 | [`crates/awcc-core`](crates/awcc-core) | Pure domain model: 4-tier `database.json` resolution, DMI/ACPI prefix rules, `ThermalMode`, `ThermalModeState` (`Unknown != Manual`), `SensorReading<T>` (`Unavailable != 0`), `OperationLifecycle`, custom 4-point monotonic fan curves, TCC offset, and USB HID ELC (`0x187c:0x0550`/`0x0551`) packet builders. |
+| [`crates/awcc-diagnostics`](crates/awcc-diagnostics) | Bounded sequence-aware event & audit rings (`SeqRing`), `tracing` subscriber layer, non-blocking rotating session file sink (`$XDG_STATE_HOME/awcc-rs/logs`, 50 MiB budget), PII redactor, panic hook crash capture, and passive `.zip` support-report bundler. |
 | [`crates/awcc-platform`](crates/awcc-platform) | Hardware transport traits (`ThermalTransport`, `StateStorage`, `ElcUsbTransport`) with both live Linux backends (`/proc/acpi/call` WMAX, `hwmon`, `rusb` USB HID) and deterministic `SimBackend` / `MockElcDevice`. |
 | [`crates/awcc-service`](crates/awcc-service) | Non-blocking background worker (`ThermalServiceHandle`), privileged Unix-socket daemon (`/tmp/awcc.sock` allowlist executor), and `evdev` hotkey keybinder (`G-Mode` / brightness cycle). |
-| [`crates/awcc-gui`](crates/awcc-gui) | Slint (`@material` 1.1.0) desktop GUI (`awcc-gui`) with live hardware auto-detection, interactive simulation scenario controls (`--sim`), and headless PNG screenshot export (`--screenshot`). |
-| [`crates/awcc-cli`](crates/awcc-cli) | Command-line interface (`awcc-cli`) supporting thermal modes, G-Mode, manual fan boost, TCC offset, custom fan curves, RGB lighting effects, and `raw-status` diagnostics. |
+| [`crates/awcc-gui`](crates/awcc-gui) | Slint (`@material` 1.1.0) desktop GUI (`awcc-gui`) with live hardware auto-detection, interactive simulation scenario controls (`--sim`), passive support-report export, and headless PNG screenshot export (`--screenshot`). |
+| [`crates/awcc-cli`](crates/awcc-cli) | Command-line interface (`awcc-cli`) supporting thermal modes, G-Mode, manual fan boost, TCC offset, custom fan curves, RGB lighting effects, `raw-status` diagnostics, and passive `diagnostics export` / `diagnostics summary`. |
 | [`conformance/`](conformance) | C++ baseline conformance vectors (`cpp_baseline_vectors.json`) verified by `crates/awcc-platform/tests/conformance_suite.rs`. |
 | [`packaging/linux/`](packaging/linux) | Linux desktop integration (`awcc-gui.desktop`, icons, AppStream metainfo, `AppRun`) and RPM/Arch package templates (`awcc-rs.spec.in`, `PKGBUILD.in`). |
 | [`scripts/`](scripts) | Reusable payload staging, multi-distro package builders (`.tar.gz`, `AppImage`, `.deb`, `.rpm`, `.pkg.tar.zst`), isolated smoke tests, and release publication scripts. |
 | [`ui-libraries/material-1.1.0`](ui-libraries/material-1.1.0) | Vendored official Slint Material 3 component library (`@material` `1.1.0`, MIT license). |
-| [`docs/`](docs) | Engineering specifications: architecture & migration strategy, C++ compatibility map, Figma/Material 3 mapping, and [`ci_packaging_and_release.md`](docs/ci_packaging_and_release.md). |
+| [`docs/`](docs) | Engineering specifications: architecture & migration strategy, C++ compatibility map, Figma/Material 3 mapping, [`operation_outcomes_and_build_identity.md`](docs/operation_outcomes_and_build_identity.md), [`structured_logging_and_support_export.md`](docs/structured_logging_and_support_export.md), and [`ci_packaging_and_release.md`](docs/ci_packaging_and_release.md). |
 
 ---
 
@@ -52,13 +53,15 @@ cargo run -p awcc-gui
 cargo run -p awcc-gui -- --sim
 ```
 
-### 2. Run CLI Commands (`awcc-cli`)
+### 2. Run CLI Commands & Passive Diagnostics (`awcc-cli`)
 ```bash
 cargo run -p awcc-cli -- --help
 cargo run -p awcc-cli -- --version
 cargo run -p awcc-cli -- device-info
 cargo run -p awcc-cli -- --sim device-info
-cargo run -p awcc-cli -- --sim query-mode
+cargo run -p awcc-cli -- -v --sim query-mode
+cargo run -p awcc-cli -- diagnostics summary
+cargo run -p awcc-cli -- diagnostics export --output awcc-support.zip
 ```
 
 ### 3. Render Deterministic Screenshots (`1120×720` Normal, `880×620` Compact, Rollback, Lighting, Diagnostics)
@@ -82,6 +85,6 @@ Every push to `main`, pull request, manual `workflow_dispatch` run, and `vX.Y.Z`
 4. **Fedora 41+**: `awcc-rs-<version>-1.x86_64.rpm`
 5. **Arch Linux / CachyOS**: `awcc-rs-<version>-1-x86_64.pkg.tar.zst` + `PKGBUILD` + `.SRCINFO`
 
-`awcc-cli --version` / `awcc-gui --version` report the version, source commit (or `unknown`), dirty state, target, toolchain, and installation format; see [`docs/operation_outcomes_and_build_identity.md`](docs/operation_outcomes_and_build_identity.md) for that metadata and for how command outcomes (`Accepted` vs. `Confirmed` vs. `Failed`) and unavailable/stale state are reported.
+`awcc-cli --version` / `awcc-gui --version` report the version, source commit (or `unknown`), dirty state, target, toolchain, and installation format; see [`docs/operation_outcomes_and_build_identity.md`](docs/operation_outcomes_and_build_identity.md) for that metadata and for how command outcomes (`Accepted` vs. `Confirmed` vs. `Failed`) and unavailable/stale state are reported. See [`docs/structured_logging_and_support_export.md`](docs/structured_logging_and_support_export.md) for log-level controls (`--log-level`, `-v`, `AWCC_LOG`), bounded session logs under `$XDG_STATE_HOME/awcc-rs/logs`, and passive redacted support bundles (`awcc-cli diagnostics export`).
 
 See [`docs/ci_packaging_and_release.md`](docs/ci_packaging_and_release.md) for local packaging instructions, checksum verification (`SHA256SUMS`), hardware prerequisites, and maintainer release procedures.

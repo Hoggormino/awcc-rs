@@ -200,6 +200,44 @@ grep -q "^Matched in DB   :" <<<"${PASSIVE_DEV_OUT}"
 QM_OUT="$(run_isolated "${CLI_BIN}" --sim query-mode)"
 grep -q "Current Thermal Mode: Balanced (GameShift: false" <<<"${QM_OUT}"
 
+# Verify -v emits DEBUG console diagnostics on stderr while keeping stdout clean:
+VERBOSE_STDERR_FILE="${WORK_TMP}/verbose.stderr"
+VERBOSE_STDOUT="$(run_isolated "${CLI_BIN}" -v --sim query-mode 2>"${VERBOSE_STDERR_FILE}")"
+grep -q "Current Thermal Mode: Balanced" <<<"${VERBOSE_STDOUT}"
+grep -q "\[DEBUG\]" "${VERBOSE_STDERR_FILE}"
+
+# Verify passive diagnostics summary & zip export without hardware probes:
+SUMMARY_OUT="$(run_isolated "${CLI_BIN}" diagnostics summary)"
+grep -q "^AWCC Diagnostic Summary$" <<<"${SUMMARY_OUT}"
+grep -q "^Export Mode      : passive (zero hardware probes)$" <<<"${SUMMARY_OUT}"
+
+SUPPORT_ZIP="${WORK_TMP}/awcc-support-smoke.zip"
+EXPORT_OUT="$(run_isolated "${CLI_BIN}" diagnostics export --output "${SUPPORT_ZIP}")"
+grep -F "${SUPPORT_ZIP}" <<<"${EXPORT_OUT}" >/dev/null
+python3 - "${SUPPORT_ZIP}" <<'PY'
+import json, sys, zipfile
+
+zip_path = sys.argv[1]
+required = {
+    "summary.txt",
+    "report.json",
+    "events.jsonl",
+    "hardware-audit.jsonl",
+    "build-info.json",
+    "settings.json",
+}
+with zipfile.ZipFile(zip_path, "r") as zf:
+    names = set(zf.namelist())
+    missing = required - names
+    if missing:
+        raise SystemExit(f"ERROR: Support archive missing entries: {sorted(missing)}")
+    report = json.loads(zf.read("report.json").decode("utf-8"))
+    if report.get("schema_version") != 1:
+        raise SystemExit(f"ERROR: Unexpected schema_version in report.json: {report.get('schema_version')}")
+    if report.get("export_mode") != "passive":
+        raise SystemExit(f"ERROR: Expected passive export_mode, got {report.get('export_mode')}")
+PY
+
 # Fail-closed check: pointing AWCC_DATABASE_PATH at a missing file must fail with non-zero exit code
 if (
     cd "${ISOLATED_CWD}"

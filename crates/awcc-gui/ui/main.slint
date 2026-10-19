@@ -26,9 +26,11 @@ import {
 import { FanCurveEditor } from "fan-curve.slint";
 
 export struct AuditRow {
+    seq_num: int,
     seq_text: string,
     command: string,
     outcome: string,
+    detail: string,
     succeeded: bool,
 }
 
@@ -119,8 +121,21 @@ export component MainWindow inherits MaterialWindow {
     in property <string> telemetry-notice: "";
     in property <string> build-summary: "";
 
-    // Hardware Command Log (virtualized via ListView)
+    // Hardware Command Log & Diagnostics (sequence-aware, bounded retention)
     in property <[AuditRow]> audit-rows: [];
+    in property <int> audit-latest-seq: 0;
+    in property <int> audit-retained-count: 0;
+    in property <int> audit-evicted-count: 0;
+    in property <int> audit-cleared-count: 0;
+    in property <string> audit-counter-summary: "Zero unsolicited writes since startup";
+    in property <string> audit-eviction-notice: "";
+    in-out property <int> selected-audit-seq: 0;
+    in-out property <string> selected-audit-detail: "";
+    in-out property <bool> diagnostic-recording-active: false;
+    in-out property <string> diagnostic-recording-label: "Start DEBUG Recording";
+    in-out property <string> diagnostics-status-text: "";
+    in-out property <string> last-copied-text: "";
+    in-out property <string> last-export-path: "";
 
     // Callbacks to Rust service controller
     callback request-refresh();
@@ -143,6 +158,12 @@ export component MainWindow inherits MaterialWindow {
     callback select-sim-scenario(int);
     callback toggle-auto-refresh(bool);
     callback select-refresh-interval(int);
+    callback copy-diagnostic-summary();
+    callback export-support-report();
+    callback toggle-diagnostic-recording();
+    callback clear-audit-history();
+    callback select-audit-row(int);
+    callback copy-selected-audit-row();
 
     init => {
         Palette.color-scheme = ColorScheme.dark;
@@ -1491,18 +1512,90 @@ export component MainWindow inherits MaterialWindow {
 
                             MaterialText {
                                 vertical-alignment: center;
-                                text: root.write-count == 0
-                                    ? "Zero unsolicited writes since startup"
-                                    : "\{root.write-count} explicit commands recorded";
+                                text: root.audit-counter-summary;
                                 style: MaterialTypography.label_medium_prominent;
                                 color: MaterialPalette.primary;
                             }
                         }
 
+                        // Diagnostics & Support Export Toolbar (100% passive — zero hardware writes)
+                        HorizontalLayout {
+                            height: 32px;
+                            alignment: space-between;
+                            spacing: 8px;
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+
+                                TonalButton {
+                                    height: 32px;
+                                    text: root.diagnostic-recording-label;
+                                    clicked => {
+                                        root.toggle-diagnostic-recording();
+                                    }
+                                }
+
+                                OutlineButton {
+                                    height: 32px;
+                                    text: "Copy Summary";
+                                    clicked => {
+                                        root.copy-diagnostic-summary();
+                                    }
+                                }
+
+                                FilledButton {
+                                    height: 32px;
+                                    text: "Export Support Report";
+                                    clicked => {
+                                        root.export-support-report();
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: end;
+
+                                OutlineButton {
+                                    height: 32px;
+                                    enabled: root.selected-audit-detail != "";
+                                    text: "Copy Row";
+                                    clicked => {
+                                        root.copy-selected-audit-row();
+                                    }
+                                }
+
+                                OutlineButton {
+                                    height: 32px;
+                                    enabled: root.audit-rows.length > 0;
+                                    text: "Clear Visible";
+                                    clicked => {
+                                        root.clear-audit-history();
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.audit-eviction-notice != "" : MaterialText {
+                            text: root.audit-eviction-notice;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.tertiary;
+                        }
+
+                        if root.diagnostics-status-text != "" : MaterialText {
+                            text: root.diagnostics-status-text;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.primary;
+                            overflow: elide;
+                        }
+
                         HorizontalDivider {}
 
                         if root.audit-rows.length == 0 : MaterialText {
-                            text: "No hardware write commands have been issued in this session.";
+                            text: root.write-count == 0
+                                ? "No hardware write commands have been issued in this session."
+                                : "Visible command log cleared (\{root.write-count} lifetime commands recorded).";
                             style: MaterialTypography.body_medium;
                             color: MaterialPalette.on_surface_variant;
                         }
@@ -1519,7 +1612,15 @@ export component MainWindow inherits MaterialWindow {
                                     width: parent.width;
                                     height: 34px;
                                     border-radius: 6px;
+                                    border-width: root.selected-audit-seq == row.seq_num ? 2px : 0px;
+                                    border-color: MaterialPalette.primary;
                                     background: row.succeeded ? MaterialPalette.surface_container : MaterialPalette.error_container;
+
+                                    TouchArea {
+                                        clicked => {
+                                            root.select-audit-row(row.seq_num);
+                                        }
+                                    }
 
                                     HorizontalLayout {
                                         padding-left: 10px;
@@ -1553,6 +1654,24 @@ export component MainWindow inherits MaterialWindow {
                                             overflow: elide;
                                         }
                                     }
+                                }
+                            }
+                        }
+
+                        if root.selected-audit-detail != "" : Rectangle {
+                            height: 44px;
+                            border-radius: 6px;
+                            background: MaterialPalette.surface_container_high;
+
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                MaterialText {
+                                    vertical-alignment: center;
+                                    text: root.selected-audit-detail;
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface;
+                                    wrap: word-wrap;
                                 }
                             }
                         }

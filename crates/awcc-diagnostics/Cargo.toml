@@ -1,0 +1,20 @@
+[package]
+name = "awcc-diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Bounded structured logging, session evidence, and passive support-report export for AWCC"
+
+[dependencies]
+awcc-build-info.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
