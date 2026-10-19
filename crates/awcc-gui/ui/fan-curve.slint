@@ -1,0 +1,398 @@
+// Four fixed-temperature points, independently editable from 0 to 100%.
+// Import FanCurveEditor into your app. FanCurveDemo is a standalone preview.
+// Endpoint policy: hold the first/last value outside 45..85 degrees C.
+// Keyboard: Tab between points; Up/Down 1%; Shift+Up/Down 5%; Home/End 0/100.
+// Escape cancels a drag. edit-finished does not fire for cancelled drags.
+// Demo Apply/Stop expose callbacks; connect them to your existing controller.
+// Preview: slint-viewer fan-curve.slint
+// Checked with Slint 1.18.1 Python bindings and the winit software renderer.
+
+component FanHandle inherits FocusScope {
+    in-out property <int> value;
+    in property <int> min-value: 0;
+    in property <int> max-value: 100;
+    in property <int> temperature;
+    in property <length> plot-height;
+    in property <color> accent: #adc6ff;
+    in property <color> surface: #1a1b20;
+    callback edited();
+    callback edit-finished();
+
+    width: 40px;
+    height: root.plot-height + 40px;
+    private property <bool> dragging: false;
+    private property <int> start-value;
+    private property <length> start-y;
+    private property <length> center-y:
+        20px + (1 - root.value / 100) * root.plot-height;
+
+    accessible-role: slider;
+    accessible-orientation: vertical;
+    accessible-label: "Fan output at " + root.temperature + " degrees Celsius, percent";
+    accessible-enabled: root.enabled;
+    accessible-value: root.value;
+    accessible-value-minimum: root.min-value;
+    accessible-value-maximum: root.max-value;
+    accessible-value-step: 1;
+    accessible-action-increment => { root.accessible-edit(root.value + 1); }
+    accessible-action-decrement => { root.accessible-edit(root.value - 1); }
+    accessible-action-set-value(text) => {
+        if (text.is-float()) { root.accessible-edit(round(text.to-float())); }
+    }
+
+    function accessible-edit(v: int) {
+        if (root.enabled && !root.dragging) {
+            let previous = root.value;
+            root.set-value(v);
+            if (root.value != previous) { root.edit-finished(); }
+        }
+    }
+
+    function set-value(v: int) {
+        let lo = max(0, min(100, root.min-value));
+        let hi = max(lo, min(100, root.max-value));
+        let bounded = max(lo, min(hi, v));
+        if (bounded != root.value) {
+            root.value = bounded;
+            root.edited();
+        }
+    }
+
+    function update-drag() {
+        root.set-value(round(root.start-value
+            - 100 * (touch.mouse-y - root.start-y)
+                  / max(1px, root.plot-height)));
+    }
+
+    function cancel-drag() {
+        if (root.dragging) {
+            root.dragging = false;
+            root.set-value(root.start-value);
+        }
+    }
+
+    key-pressed(event) => {
+        if (!root.enabled) { return reject; }
+        if (event.text == Key.Escape && root.dragging) {
+            root.cancel-drag();
+            return accept;
+        }
+        if (root.dragging) { return reject; }
+        let previous = root.value;
+        let step = event.modifiers.shift ? 5 : 1;
+        if (event.text == Key.UpArrow) {
+            root.set-value(root.value + step);
+        } else if (event.text == Key.DownArrow) {
+            root.set-value(root.value - step);
+        } else if (event.text == Key.Home) {
+            root.set-value(root.min-value);
+        } else if (event.text == Key.End) {
+            root.set-value(root.max-value);
+        } else {
+            return reject;
+        }
+        if (root.value != previous) { root.edit-finished(); }
+        return accept;
+    }
+
+    // A focus ring around the moving visual, not around the whole lane.
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: root.center-y - self.height / 2;
+        width: 26px;
+        height: 26px;
+        border-radius: 13px;
+        background: transparent;
+        border-width: root.has-focus ? 2px : 0px;
+        border-color: root.accent;
+    }
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: root.center-y - self.height / 2;
+        width: 14px;
+        height: 14px;
+        border-radius: 7px;
+        background: root.dragging ? root.accent : root.surface;
+        border-width: 3px;
+        border-color: root.accent;
+    }
+    Text {
+        x: root.temperature == 45 ? -2px : (root.temperature == 85 ? -18px : -10px);
+        y: root.center-y + (root.value > 78 ? 10px : -24px);
+        width: 60px;
+        height: 16px;
+        text: root.value + "%";
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: root.accent;
+        font-size: 11px;
+        font-weight: 600;
+    }
+
+    // This area stays still. Only the circles and label above move.
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.dragging
+            || abs(self.mouse-y - root.center-y) <= 20px
+            ? ns-resize : default;
+        pointer-event(event) => {
+            // Cancellation can have button == other, so handle it first.
+            if (event.kind == PointerEventKind.cancel) {
+                root.cancel-drag();
+            } else if (event.button == PointerEventButton.left) {
+                if (event.kind == PointerEventKind.down
+                    && abs(self.mouse-y - root.center-y) <= 20px) {
+                    root.focus();
+                    root.start-value = root.value;
+                    root.start-y = self.mouse-y;
+                    root.dragging = true;
+                } else if (event.kind == PointerEventKind.up && root.dragging) {
+                    root.update-drag();
+                    root.dragging = false;
+                    if (root.value != root.start-value) {
+                        root.edit-finished();
+                    }
+                }
+            }
+        }
+        moved => {
+            if (root.dragging && self.pressed) { root.update-drag(); }
+        }
+    }
+}
+
+export component FanCurveEditor inherits Rectangle {
+    // Whole percentages; monotonically non-decreasing (0 <= p45 <= p60 <= p75 <= p85 <= 100).
+    in-out property <int> p45: 0;
+    in-out property <int> p60: 35;
+    in-out property <int> p75: 70;
+    in-out property <int> p85: 100;
+    in property <bool> enabled: true;
+    in property <color> accent: #adc6ff;
+    in property <color> surface: #1a1b20;
+    in property <color> secondary-text: #c4c6d0;
+    in property <color> grid-color: #33353a;
+    callback edited();       // Preview changed, including rollback on cancel.
+    callback edit-finished(); // Changed drag released, or keyboard/accessibility edit.
+
+    min-width: 260px;
+    min-height: 112px;
+    preferred-width: 260px;
+    preferred-height: 145px;
+    background: root.surface;
+
+    plot := Rectangle {
+        x: 42px;
+        y: 16px;
+        width: max(1px, root.width - 64px);
+        height: max(1px, root.height - 36px);
+        background: root.surface;
+
+        for level in [0, 25, 50, 75, 100]: Rectangle {
+            y: (1 - level / 100) * plot.height;
+            width: plot.width;
+            height: 1px;
+            background: root.grid-color;
+            Text {
+                x: -42px; y: -8px;
+                width: 30px; height: 16px;
+                text: level + "%";
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                color: root.secondary-text;
+                font-size: 10px;
+            }
+        }
+        for temperature in [45, 60, 75, 85]: Rectangle {
+            x: (temperature - 45) / 40 * plot.width;
+            width: 1px;
+            height: plot.height;
+            background: root.grid-color;
+            Text {
+                x: -22px; y: plot.height + 4px;
+                width: 44px; height: 16px;
+                text: temperature + "°C";
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                color: root.secondary-text;
+                font-size: 10px;
+            }
+        }
+
+        Path {
+            width: plot.width;
+            height: plot.height;
+            // X is temperature minus 45 (span 40°C: 45..85°C); Y is 100 minus fan percentage.
+            viewbox-width: 40;
+            viewbox-height: 100;
+            fit: fill;
+            fill: transparent;
+            stroke: root.accent;
+            stroke-width: 2px;
+            MoveTo { x: 0;  y: 100 - root.p45; }
+            LineTo { x: 15; y: 100 - root.p60; }
+            LineTo { x: 30; y: 100 - root.p75; }
+            LineTo { x: 40; y: 100 - root.p85; }
+        }
+
+        FanHandle {
+            x: (45 - 45) / 40 * plot.width - self.width / 2;
+            y: -20px;
+            plot-height: plot.height; temperature: 45;
+            min-value: 0; max-value: root.p60;
+            value <=> root.p45;
+            enabled: root.enabled; accent: root.accent; surface: root.surface;
+            edited => { root.edited(); }
+            edit-finished => { root.edit-finished(); }
+        }
+        FanHandle {
+            x: (60 - 45) / 40 * plot.width - self.width / 2;
+            y: -20px;
+            plot-height: plot.height; temperature: 60;
+            min-value: root.p45; max-value: root.p75;
+            value <=> root.p60;
+            enabled: root.enabled; accent: root.accent; surface: root.surface;
+            edited => { root.edited(); }
+            edit-finished => { root.edit-finished(); }
+        }
+        FanHandle {
+            x: (75 - 45) / 40 * plot.width - self.width / 2;
+            y: -20px;
+            plot-height: plot.height; temperature: 75;
+            min-value: root.p60; max-value: root.p85;
+            value <=> root.p75;
+            enabled: root.enabled; accent: root.accent; surface: root.surface;
+            edited => { root.edited(); }
+            edit-finished => { root.edit-finished(); }
+        }
+        FanHandle {
+            x: (85 - 45) / 40 * plot.width - self.width / 2;
+            y: -20px;
+            plot-height: plot.height; temperature: 85;
+            min-value: root.p75; max-value: 100;
+            value <=> root.p85;
+            enabled: root.enabled; accent: root.accent; surface: root.surface;
+            edited => { root.edited(); }
+            edit-finished => { root.edit-finished(); }
+        }
+    }
+}
+
+// Only the preview shell uses this small pill button. Use your app's buttons
+// when embedding FanCurveEditor into its existing Custom Fan Curve panel.
+component DemoButton inherits FocusScope {
+    in property <string> text;
+    in property <bool> primary: false;
+    callback clicked();
+    height: 36px;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    Rectangle {
+        background: root.primary ? #adc6ff : #1a1b20;
+        border-radius: 18px;
+        border-width: root.primary ? 0px : 1px;
+        border-color: root.enabled ? #8e9099 : #282a2f;
+        Text {
+            text: root.text;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            font-size: 14px;
+            font-weight: 600;
+            color: !root.enabled ? #66666d : root.primary ? #112f60 : #e2e2e9;
+        }
+    }
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    key-pressed(event) => {
+        if (root.enabled && (event.text == Key.Return || event.text == " ")) {
+            root.clicked();
+            return accept;
+        }
+        return reject;
+    }
+}
+
+export component FanCurveDemo inherits Window {
+    title: "Custom Fan Curve";
+    preferred-width: 520px;
+    preferred-height: 396px;
+    min-width: 470px;
+    min-height: 370px;
+    background: #111318;
+    in-out property <int> p45 <=> editor.p45;
+    in-out property <int> p60 <=> editor.p60;
+    in-out property <int> p75 <=> editor.p75;
+    in-out property <int> p85 <=> editor.p85;
+    callback curve-edited(int, int, int, int);
+    callback curve-committed(int, int, int, int);
+    in property <bool> curve-running: false;
+    callback apply-curve(int, int, int, int);
+    callback stop-curve();
+
+    Rectangle {
+        x: 10px; y: 10px;
+        width: parent.width - 20px;
+        height: parent.height - 20px;
+        background: #1a1b20;
+        border-width: 1px;
+        border-color: #8e9099;
+        border-radius: 12px;
+        Text {
+            x: 10px; y: 8px; height: 22px;
+            text: "Custom Fan Curve";
+            font-size: 14px;
+            font-weight: 600;
+            color: #e2e2e9;
+        }
+        Rectangle {
+            x: parent.width - 122px; y: 10px;
+            width: 112px; height: 20px;
+            background: #33353a;
+            border-radius: 3px;
+            Text {
+                text: root.curve-running ? "CURVE RUNNING" : "CURVE STOPPED";
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                font-size: 10px;
+                font-weight: 600;
+                color: #c4c6d0;
+            }
+        }
+        Text {
+            x: 10px; y: 32px; height: 18px;
+            text: "4-point linear · Drag points vertically to adjust";
+            color: #c4c6d0;
+            font-size: 12px;
+        }
+        editor := FanCurveEditor {
+            x: 10px; y: 54px;
+            width: parent.width - 20px;
+            height: parent.height - 111px;
+            edited => { root.curve-edited(root.p45, root.p60, root.p75, root.p85); }
+            edit-finished => {
+                root.curve-committed(root.p45, root.p60, root.p75, root.p85);
+            }
+        }
+        DemoButton {
+            x: parent.width - 275px;
+            y: parent.height - 46px;
+            width: 125px;
+            text: "Stop Curve";
+            enabled: root.curve-running;
+            clicked => { root.stop-curve(); }
+        }
+        DemoButton {
+            x: parent.width - 142px;
+            y: parent.height - 46px;
+            width: 132px;
+            text: "Apply Curve";
+            primary: true;
+            clicked => { root.apply-curve(root.p45, root.p60, root.p75, root.p85); }
+        }
+    }
+}

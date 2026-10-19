@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/awcc-core",
+    "crates/awcc-platform",
+    "crates/awcc-service",
+    "crates/awcc-gui",
+    "crates/awcc-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "BSD-2-Clause"
+authors = ["AWCC Linux Contributors"]
+
+[workspace.dependencies]
+awcc-core = { path = "crates/awcc-core" }
+awcc-platform = { path = "crates/awcc-platform" }
+awcc-service = { path = "crates/awcc-service" }
+anyhow = "1.0"
+png = "0.17"
+rusb = "0.9.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+slint = { version = "1.18.1", default-features = true, features = ["renderer-software"] }
+slint-build = "1.18.1"
+i-slint-backend-testing = "1.18.1"
+thiserror = "2.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"

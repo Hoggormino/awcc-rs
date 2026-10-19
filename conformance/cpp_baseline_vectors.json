@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "description": "Differential conformance vectors comparing C++ AWCC (AcpiUtils, Thermals, database.json) against Rust awcc-core and awcc-platform.",
+  "expected_database_entry_count": 54,
+  "acpi_prefix_vectors": [
+    { "device_name": "Alienware m15 R6", "cpu_vendor": "Intel", "expected_prefix": "AMWW" },
+    { "device_name": "Alienware m15 Ryzen Ed. R5", "cpu_vendor": "Amd", "expected_prefix": "AMW3" },
+    { "device_name": "Alienware m15 R2", "cpu_vendor": "Intel", "expected_prefix": "AMW1" },
+    { "device_name": "Alienware m15", "cpu_vendor": "Intel", "expected_prefix": "AMW1" },
+    { "device_name": "Alienware m16 R1 AMD", "cpu_vendor": "Amd", "expected_prefix": "AMWW" },
+    { "device_name": "Alienware m16 R1", "cpu_vendor": "Intel", "expected_prefix": "AMWW" },
+    { "device_name": "Dell G15 5525", "cpu_vendor": "Amd", "expected_prefix": "AMW3" },
+    { "device_name": "Dell G15 5520", "cpu_vendor": "Intel", "expected_prefix": "AMWW" },
+    { "device_name": "G5 5590", "cpu_vendor": "Intel", "expected_prefix": "AMW1" },
+    { "device_name": "G3 3590", "cpu_vendor": "Intel", "expected_prefix": "AMW1" },
+    { "device_name": "Alienware 17 R5", "cpu_vendor": "Intel", "expected_prefix": "AMW1" },
+    { "device_name": "Unknown Custom Laptop", "cpu_vendor": "Intel", "expected_prefix": "AMWW" },
+    { "device_name": "Unknown Custom Laptop", "cpu_vendor": "Amd", "expected_prefix": "AMW3" }
+  ],
+  "acpi_output_parser_vectors": [
+    { "raw": "0xa0\n\u0000", "expected": 160 },
+    { "raw": "0x000000ab\u0000", "expected": 171 },
+    { "raw": "0x0\n", "expected": 0 },
+    { "raw": "0xffffffff\u0000", "expected": -1 },
+    { "raw": "0xfffffffd", "expected": -3 },
+    { "raw": "", "expected": null },
+    { "raw": "Error: AE_NOT_FOUND", "expected": null }
+  ],
+  "patch_modes_vectors": [
+    {
+      "device_name": "Alienware m15 R6",
+      "set_codes": { "Manual": 0, "Balanced": 160, "Performance": 161, "Cool": 162, "Quiet": 163, "FullSpeed": 164, "BatterySaver": 165, "GMode": 171 },
+      "get_codes": { "0": "Manual", "150": "Quiet", "151": "Balanced", "152": "Performance", "153": "FullSpeed", "160": "Balanced", "161": "Performance", "162": "Cool", "163": "Quiet", "164": "FullSpeed", "165": "BatterySaver", "171": "GMode" }
+    },
+    {
+      "device_name": "Alienware 17 R5",
+      "set_codes": { "Quiet": 406, "Balanced": 407, "Performance": 408, "GMode": 171 },
+      "get_codes": { "150": "Quiet", "151": "Balanced", "152": "Performance", "171": "GMode" }
+    },
+    {
+      "device_name": "Alienware Aurora R9",
+      "set_codes": { "Balanced": 407, "Performance": 408 },
+      "get_codes": { "151": "Balanced", "152": "Performance" }
+    },
+    {
+      "device_name": "Dell G15 5515",
+      "set_codes": { "Balanced": 151 },
+      "get_codes": { "151": "Balanced" }
+    }
+  ],
+  "wmax_shell_traces": [
+    {
+      "name": "m15_r6_query_thermal_mode",
+      "prefix": "AMWW",
+      "subcmd": 20,
+      "arg1": 11,
+      "arg2": 0,
+      "arg3": 0,
+      "expected_cmd": "pkexec sh -c 'echo \"\\_SB.AMWW.WMAX 0 0x14 {0xb,0x0,0x0,0x00}\" > /proc/acpi/call && cat /proc/acpi/call'"
+    },
+    {
+      "name": "m15_r6_set_gmode_profile",
+      "prefix": "AMWW",
+      "subcmd": 21,
+      "arg1": 1,
+      "arg2": 171,
+      "arg3": 0,
+      "expected_cmd": "pkexec sh -c 'echo \"\\_SB.AMWW.WMAX 0 0x15 {0x1,0xab,0x0,0x00}\" > /proc/acpi/call && cat /proc/acpi/call'"
+    },
+    {
+      "name": "aurora_r9_set_legacy_balanced_0x197",
+      "prefix": "AMWW",
+      "subcmd": 21,
+      "arg1": 1,
+      "arg2": 407,
+      "arg3": 0,
+      "expected_cmd": "pkexec sh -c 'echo \"\\_SB.AMWW.WMAX 0 0x15 {0x1,0x197,0x0,0x00}\" > /proc/acpi/call && cat /proc/acpi/call'"
+    }
+  ]
+}
