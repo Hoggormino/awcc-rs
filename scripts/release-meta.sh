@@ -38,6 +38,22 @@ fi
 export AWCC_GIT_SHA AWCC_GIT_SHORT_SHA AWCC_SOURCE_DATE_EPOCH
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-${AWCC_SOURCE_DATE_EPOCH}}"
 
+# Dirty state of tracked files relative to AWCC_GIT_SHA (untracked files are ignored). Embedded
+# into the binaries by crates/awcc-build-info/build.rs, so both must use the same definition.
+# `unknown` is reported honestly when it cannot be established (no git, or HEAD != AWCC_GIT_SHA).
+if [[ -z "${AWCC_GIT_DIRTY:-}" ]]; then
+    AWCC_GIT_DIRTY="unknown"
+    if command -v git >/dev/null 2>&1 \
+        && [[ "$(git -C "${AWCC_REPO_ROOT}" rev-parse HEAD 2>/dev/null || true)" == "${AWCC_GIT_SHA}" ]]; then
+        if [[ -n "$(git -C "${AWCC_REPO_ROOT}" status --porcelain --untracked-files=no)" ]]; then
+            AWCC_GIT_DIRTY="1"
+        else
+            AWCC_GIT_DIRTY="0"
+        fi
+    fi
+fi
+export AWCC_GIT_DIRTY
+
 AWCC_RUSTC_VERSION="$(rustc --version 2>/dev/null || echo 'unknown')"
 export AWCC_RUSTC_VERSION
 
@@ -93,6 +109,68 @@ PY
     echo "Validated release tag ${tag} -> version ${AWCC_VERSION} at commit ${AWCC_GIT_SHA}"
 }
 
+# Run `<binary> --version` in a deliberately bare environment (no PATH, no state directory, no
+# usable device database) so the check also proves version output needs none of them.
+binary_version_output() {
+    env -i PATH="" HOME="/nonexistent-awcc-home" XDG_STATE_HOME="/nonexistent-awcc-state" \
+        AWCC_DATABASE_PATH="/nonexistent-awcc/database.json" "$1" --version
+}
+
+# Extract `key: value` from `--version` output (first match).
+version_field() {
+    local output="$1" key="$2"
+    printf '%s\n' "${output}" | sed -n "s/^${key}: //p" | head -n 1
+}
+
+# Verify that a built binary reports the identity this release metadata describes. Catches a
+# stale embedded commit/toolchain (for example a cached build) before anything is packaged.
+#   assert_binary_identity <binary> <label>
+assert_binary_identity() {
+    local bin="$1" label="$2" output
+    if ! output="$(binary_version_output "${bin}")"; then
+        echo "ERROR: ${label}: '${bin} --version' failed" >&2
+        return 1
+    fi
+    local failures=0
+    check_field() {
+        local key="$1" want="$2" got
+        got="$(version_field "${output}" "${key}")"
+        if [[ "${got}" != "${want}" ]]; then
+            echo "ERROR: ${label}: --version reports ${key} '${got}' but the release metadata says '${want}'" >&2
+            failures=1
+        fi
+    }
+    check_field "version" "${AWCC_VERSION}"
+    check_field "target" "${AWCC_TARGET}"
+    if [[ -n "${AWCC_GIT_SHA}" && "${AWCC_GIT_SHA}" != "unknown" ]]; then
+        check_field "commit" "${AWCC_GIT_SHA}"
+    fi
+    if [[ "${AWCC_RUSTC_VERSION}" != "unknown" ]]; then
+        check_field "rustc" "${AWCC_RUSTC_VERSION}"
+    fi
+    case "${AWCC_GIT_DIRTY}" in
+        0) check_field "dirty" "false" ;;
+        1) check_field "dirty" "true" ;;
+    esac
+    if [[ "${failures}" -ne 0 ]]; then
+        echo "ERROR: ${label} carries a stale or wrong build identity. Rebuild it (cargo clean -p awcc-build-info) from the commit being released." >&2
+        return 1
+    fi
+}
+
+# Print (one argument per line) the identity expectations to hand to smoke-test-installed.sh for a
+# package whose format marker is `<format>`; read with `mapfile -t ARGS < <(smoke_identity_args fmt)`.
+smoke_identity_args() {
+    printf '%s\n' --expect-package-format "$1" --expect-version "${AWCC_VERSION}" --expect-target "${AWCC_TARGET}"
+    if [[ -n "${AWCC_GIT_SHA}" && "${AWCC_GIT_SHA}" != "unknown" ]]; then
+        printf '%s\n' --expect-commit "${AWCC_GIT_SHA}"
+    fi
+    case "${AWCC_GIT_DIRTY}" in
+        0) printf '%s\n' --expect-dirty false ;;
+        1) printf '%s\n' --expect-dirty true ;;
+    esac
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-}" in
         --validate-tag)
@@ -110,6 +188,8 @@ AWCC_ARCH=${AWCC_ARCH}
 AWCC_DEB_ARCH=${AWCC_DEB_ARCH}
 AWCC_GIT_SHA=${AWCC_GIT_SHA}
 AWCC_GIT_SHORT_SHA=${AWCC_GIT_SHORT_SHA}
+AWCC_GIT_DIRTY=${AWCC_GIT_DIRTY}
+AWCC_RUSTC_VERSION=${AWCC_RUSTC_VERSION}
 AWCC_SOURCE_DATE_EPOCH=${AWCC_SOURCE_DATE_EPOCH}
 AWCC_TARBALL_NAME=${AWCC_TARBALL_NAME}
 AWCC_APPIMAGE_NAME=${AWCC_APPIMAGE_NAME}

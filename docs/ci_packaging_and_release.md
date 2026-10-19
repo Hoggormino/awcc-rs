@@ -28,6 +28,7 @@ Every run executes the following gates before any package is accepted:
 7. **Differential Conformance Suite**: `cargo test -p awcc-platform --test conformance_suite --locked` (validating 54 device entries, ACPI prefix precedence, hex parser edge cases, per-model mode overrides, and WMAX shell traces against committed baseline vectors).
 8. **Baseline Binary Build & Symbol Audit**: `cargo build --workspace --release --locked --target x86_64-unknown-linux-gnu` on Ubuntu 24.04 LTS, verifying no `target-cpu=native` flags are present and enforcing a maximum required glibc symbol version of `GLIBC_2.39`.
 9. **Isolated Unprivileged Smoke Tests (`scripts/smoke-test-installed.sh`)**: Executed outside the source checkout in an isolated temporary directory as an ordinary non-root user for every package format:
+   - `awcc-cli --version` and `awcc-gui --version` in a bare environment (empty `PATH`, no state directory, missing device database): both binaries must report identical `version`/`commit`/`commit-source`/`dirty`/`source-date-epoch`/`target`/`profile`/`rustc`/`package-format`, and match the expected release version, commit, target, `dirty: false`, and the package's own format (`tarball`, `appimage`, `deb`, `rpm`, `arch`). See [`operation_outcomes_and_build_identity.md`](operation_outcomes_and_build_identity.md).
    - `awcc-cli --help`
    - `awcc-cli --sim device-info` (verifying `Alienware m15 R6`, `AMWW`, `Matched in DB : true`, and packaged `database.json` provenance)
    - `awcc-cli --sim query-mode`
@@ -36,6 +37,8 @@ Every run executes the following gates before any package is accepted:
      - `1120×720` (`--scenario normal`)
      - `880×620` (`--scenario compact`)
      - `1120×720` (`--scenario rollback`, verifying error/rollback visual state)
+
+**Build identity gates.** `scripts/stage-release-payload.sh` runs both staged executables with `--version` and fails when the embedded version, target, commit, toolchain, or dirty state disagree with the release metadata (a stale cached build); `scripts/generate-release-manifest.sh` re-checks the binaries inside the final tarball, requires `awcc-cli` and `awcc-gui` to agree, records the binary-reported toolchain/`git_dirty`/`git_commit_source` in `build-manifest.json`, and refuses a dirty build for a `vX.Y.Z` tag. Each package ships `share/awcc/package-format` (written by that format's packager, not by the shared payload) so `--version` can report the installation format without compiling it into the common binaries.
 
 ### Development Artifact Locations
 
@@ -117,6 +120,8 @@ From the repository root:
 ./scripts/generate-release-manifest.sh
 ```
 
+Release metadata inputs (`AWCC_GIT_SHA`, `AWCC_GIT_DIRTY`, `AWCC_SOURCE_DATE_EPOCH`, `AWCC_TARGET`, `AWCC_RUSTC_VERSION`) come from `scripts/release-meta.sh` and are exactly what `crates/awcc-build-info/build.rs` embeds, so the binary and `build-manifest.json` cannot drift. A local build from a modified work tree reports `dirty: true`; a source archive without `.git` reports `commit-source: git-archive` (from `.git_archival.txt`) or `unknown`, and `dirty: unknown`.
+
 To run the isolated CLI + headless GUI screenshot smoke test directly against any pair of binaries:
 
 ```bash
@@ -124,7 +129,8 @@ To run the isolated CLI + headless GUI screenshot smoke test directly against an
   --cli ./dist/staging/awcc-rs-0.1.0-x86_64-unknown-linux-gnu/bin/awcc-cli \
   --gui ./dist/staging/awcc-rs-0.1.0-x86_64-unknown-linux-gnu/bin/awcc-gui \
   --database ./dist/staging/awcc-rs-0.1.0-x86_64-unknown-linux-gnu/share/awcc/database.json \
-  --label local
+  --label local \
+  --expect-package-format unknown   # optional identity expectations: --expect-version/-commit/-target/-dirty
 ```
 
 ---

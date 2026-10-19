@@ -127,6 +127,13 @@ if command -v objdump >/dev/null 2>&1; then
     fi
 fi
 
+# The embedded build identity must match the release metadata (guards against a stale cached
+# build whose commit/toolchain no longer describes the commit being packaged).
+for bin in awcc-cli awcc-gui; do
+    assert_binary_identity "${OUT_DIR}/bin/${bin}" "staged ${bin}"
+done
+echo "==> Staged binaries report the expected build identity (commit ${AWCC_GIT_SHA}, dirty=${AWCC_GIT_DIRTY})"
+
 # Normalize modification timestamps inside staging directory
 find "${OUT_DIR}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 

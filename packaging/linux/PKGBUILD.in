@@ -31,6 +31,8 @@ package() {
   install -Dm755 "${_root}/bin/awcc-gui" "${pkgdir}/usr/bin/awcc-gui"
   install -Dm644 "${_root}/share/awcc/database.json" "${pkgdir}/etc/awcc/database.json"
   install -Dm644 "${_root}/share/awcc/database.json" "${pkgdir}/usr/share/awcc/database.json"
+  # The release tarball declares itself `tarball`; this package declares its own format.
+  printf 'arch\n' | install -Dm644 /dev/stdin "${pkgdir}/usr/share/awcc/package-format"
   install -Dm644 "${_root}/share/applications/awcc-gui.desktop" "${pkgdir}/usr/share/applications/awcc-gui.desktop"
   install -Dm644 "${_root}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/awcc-gui.svg"
   install -Dm644 "${_root}/share/icons/hicolor/256x256/apps/awcc-gui.png" "${pkgdir}/usr/share/icons/hicolor/256x256/apps/awcc-gui.png"

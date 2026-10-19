@@ -55,6 +55,7 @@ cargo run -p awcc-gui -- --sim
 ### 2. Run CLI Commands (`awcc-cli`)
 ```bash
 cargo run -p awcc-cli -- --help
+cargo run -p awcc-cli -- --version
 cargo run -p awcc-cli -- device-info
 cargo run -p awcc-cli -- --sim device-info
 cargo run -p awcc-cli -- --sim query-mode
@@ -80,5 +81,7 @@ Every push to `main`, pull request, manual `workflow_dispatch` run, and `vX.Y.Z`
 3. **Debian / Ubuntu 24.04+**: `awcc-rs_<version>_amd64.deb`
 4. **Fedora 41+**: `awcc-rs-<version>-1.x86_64.rpm`
 5. **Arch Linux / CachyOS**: `awcc-rs-<version>-1-x86_64.pkg.tar.zst` + `PKGBUILD` + `.SRCINFO`
+
+`awcc-cli --version` / `awcc-gui --version` report the version, source commit (or `unknown`), dirty state, target, toolchain, and installation format; see [`docs/operation_outcomes_and_build_identity.md`](docs/operation_outcomes_and_build_identity.md) for that metadata and for how command outcomes (`Accepted` vs. `Confirmed` vs. `Failed`) and unavailable/stale state are reported.
 
 See [`docs/ci_packaging_and_release.md`](docs/ci_packaging_and_release.md) for local packaging instructions, checksum verification (`SHA256SUMS`), hardware prerequisites, and maintainer release procedures.

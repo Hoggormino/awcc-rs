@@ -128,6 +128,7 @@ done
 for req_file in \
     "etc/awcc/database.json" \
     "usr/share/awcc/database.json" \
+    "usr/share/awcc/package-format" \
     "usr/share/applications/awcc-gui.desktop" \
     "usr/share/icons/hicolor/scalable/apps/awcc-gui.svg" \
     "usr/share/icons/hicolor/256x256/apps/awcc-gui.png" \
@@ -141,7 +142,9 @@ for req_file in \
 done
 
 if [[ "${RUN_SMOKE}" -eq 1 ]]; then
+    mapfile -t IDENTITY_ARGS < <(smoke_identity_args arch)
     "${SCRIPT_DIR}/smoke-test-installed.sh" \
+        "${IDENTITY_ARGS[@]}" \
         --cli "${EXTRACT_PKG}/usr/bin/awcc-cli" \
         --gui "${EXTRACT_PKG}/usr/bin/awcc-gui" \
         --database "${EXTRACT_PKG}/etc/awcc/database.json" \

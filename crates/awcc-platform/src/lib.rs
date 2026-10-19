@@ -20,7 +20,7 @@ pub mod usb_elc;
 pub enum TransportError {
     #[error("ACPI call `{call}` returned 0xFFFFFFFF (hardware rejected operation)")]
     HardwareRejected { call: String },
-    #[error("ACPI transport unavailable: {0}")]
+    #[error("hardware transport unavailable: {0}")]
     TransportUnavailable(String),
 }
 
@@ -32,8 +32,73 @@ pub enum TransportError {
 pub struct WriteAuditEntry {
     pub sequence: usize,
     pub command: String,
+    /// Result of the *outgoing* write (ACPI return code, sysfs result, or USB OUT transfer).
     pub outcome: String,
+    /// Whether the outgoing write itself succeeded. For USB this says nothing about whether the
+    /// controller acknowledged it: see `ack`.
     pub succeeded: bool,
+    /// Result of the optional device acknowledgement read that follows a USB OUT report,
+    /// recorded separately from the outgoing transfer. `NotApplicable` for ACPI/sysfs writes.
+    #[serde(default)]
+    pub ack: AckStatus,
+}
+
+impl WriteAuditEntry {
+    /// An entry for a write that has no acknowledgement phase (ACPI, sysfs).
+    #[must_use]
+    pub fn new(
+        sequence: usize,
+        command: impl Into<String>,
+        outcome: impl Into<String>,
+        succeeded: bool,
+    ) -> Self {
+        Self {
+            sequence,
+            command: command.into(),
+            outcome: outcome.into(),
+            succeeded,
+            ack: AckStatus::NotApplicable,
+        }
+    }
+}
+
+/// Outcome of the device acknowledgement read that follows an outgoing USB HID report.
+///
+/// The legacy C++ `LightFX` never reads an acknowledgement after a set command, and no firmware
+/// success/failure codes are known for these reports, so the acknowledgement is *optional*
+/// evidence: a missing or failed read never fails the transfer, and a received report's content
+/// is not interpreted as a success code. It is recorded so that "the bytes were sent" and "the
+/// device answered" stay distinct.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AckStatus {
+    /// No acknowledgement phase applies (ACPI/sysfs writes, query reports).
+    #[default]
+    NotApplicable,
+    /// A full 33-byte input report was read after the transfer (content not interpreted).
+    Received,
+    /// A read completed but returned fewer bytes than a full report.
+    Incomplete { bytes: usize },
+    /// The acknowledgement read failed (timeout, I/O error, ...).
+    Failed { reason: String },
+}
+
+impl AckStatus {
+    /// `true` when an acknowledgement was expected but did not arrive intact.
+    #[must_use]
+    pub const fn is_problem(&self) -> bool {
+        matches!(self, Self::Incomplete { .. } | Self::Failed { .. })
+    }
+
+    /// Short human description, e.g. `ack received` or `ack read failed: timed out`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::NotApplicable => "no ack phase".to_string(),
+            Self::Received => "ack received".to_string(),
+            Self::Incomplete { bytes } => format!("ack incomplete ({bytes}/33 bytes)"),
+            Self::Failed { reason } => format!("ack read failed: {reason}"),
+        }
+    }
 }
 
 /// Persistence boundary for pre-G-Mode thermal state (`/etc/awcc/prev_mode`, `/run/awcc/prev_mode`,
@@ -482,6 +547,9 @@ pub trait ThermalTransport: Send {
     /// Switch the active simulation scenario (passive; does not count as a hardware write).
     fn set_scenario(&mut self, scenario: SimScenario);
 
+    /// Install fine-grained simulated faults. Real transports ignore this.
+    fn set_sim_faults(&mut self, _faults: SimFaults) {}
+
     /// Query raw thermal mode byte via `WMAX 0 0x14 {0x0b, 0x00, 0x00, 0x00}`.
     fn query_raw_thermal_mode(&mut self) -> Result<u32, TransportError>;
 
@@ -504,7 +572,10 @@ pub trait ThermalTransport: Send {
     fn set_fan_boost(&mut self, cpu_boost: u8, gpu_boost: u8) -> Result<(), TransportError>;
 
     /// Query CPU Turbo Boost state (`/sys/devices/system/cpu/intel_pstate/no_turbo` or `cpufreq/boost`).
-    fn query_cpu_turbo(&mut self) -> bool;
+    ///
+    /// Returns an error when no usable control file exists or its content cannot be parsed: a
+    /// failed query is never reported as "enabled" or "disabled".
+    fn query_cpu_turbo(&mut self) -> Result<bool, TransportError>;
 
     /// Toggle CPU Turbo Boost state.
     fn set_cpu_turbo(&mut self, enabled: bool) -> Result<(), TransportError>;
@@ -517,6 +588,31 @@ pub trait ThermalTransport: Send {
 
     /// Inspect all hardware write commands issued since initialization.
     fn write_audit_log(&self) -> &[WriteAuditEntry];
+}
+
+const NO_TURBO_PATH: &str = "/sys/devices/system/cpu/intel_pstate/no_turbo";
+const BOOST_PATH: &str = "/sys/devices/system/cpu/cpufreq/boost";
+
+/// Read the CPU turbo state from the `intel_pstate/no_turbo` (inverted) or `cpufreq/boost` file.
+///
+/// Returns an error when neither file is readable and numeric, so that a missing or malformed
+/// control file is never reported as "turbo enabled".
+pub fn read_cpu_turbo_state(no_turbo: &Path, boost: &Path) -> Result<bool, TransportError> {
+    if let Ok(s) = fs::read_to_string(no_turbo)
+        && let Ok(val) = s.trim().parse::<u8>()
+    {
+        return Ok(val == 0);
+    }
+    if let Ok(s) = fs::read_to_string(boost)
+        && let Ok(val) = s.trim().parse::<u8>()
+    {
+        return Ok(val != 0);
+    }
+    Err(TransportError::TransportUnavailable(format!(
+        "no readable CPU turbo control file ({} or {})",
+        no_turbo.display(),
+        boost.display()
+    )))
 }
 
 /// Real / mockable Linux ACPI WMAX transport matching C++ `AcpiUtils::executeAcpiCommand` + `Thermals`.
@@ -594,12 +690,8 @@ impl LinuxAcpiTransport {
 
     fn record_write(&mut self, command: String, outcome: impl Into<String>, succeeded: bool) {
         let sequence = self.write_log.len() + 1;
-        self.write_log.push(WriteAuditEntry {
-            sequence,
-            command,
-            outcome: outcome.into(),
-            succeeded,
-        });
+        self.write_log
+            .push(WriteAuditEntry::new(sequence, command, outcome, succeeded));
     }
 }
 
@@ -785,18 +877,8 @@ impl ThermalTransport for LinuxAcpiTransport {
         Ok(())
     }
 
-    fn query_cpu_turbo(&mut self) -> bool {
-        if let Ok(s) = fs::read_to_string("/sys/devices/system/cpu/intel_pstate/no_turbo")
-            && let Ok(val) = s.trim().parse::<u8>()
-        {
-            return val == 0;
-        }
-        if let Ok(s) = fs::read_to_string("/sys/devices/system/cpu/cpufreq/boost")
-            && let Ok(val) = s.trim().parse::<u8>()
-        {
-            return val != 0;
-        }
-        true
+    fn query_cpu_turbo(&mut self) -> Result<bool, TransportError> {
+        read_cpu_turbo_state(Path::new(NO_TURBO_PATH), Path::new(BOOST_PATH))
     }
 
     fn set_cpu_turbo(&mut self, enabled: bool) -> Result<(), TransportError> {
@@ -851,6 +933,28 @@ impl ThermalTransport for LinuxAcpiTransport {
     }
 }
 
+/// Fine-grained fault injection for [`SimBackend`], used to exercise failure reporting without
+/// hardware. Independent of (and combinable with) the coarse [`SimScenario`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SimFaults {
+    /// `set_cpu_turbo` is rejected (recorded as a failed write).
+    pub reject_turbo_write: bool,
+    /// `query_cpu_turbo` fails.
+    pub turbo_readback_unavailable: bool,
+    /// `query_cpu_turbo` keeps returning this value regardless of writes (device ignored them).
+    pub turbo_readback_stuck: Option<bool>,
+    /// `query_game_shift_status` fails.
+    pub game_shift_query_unavailable: bool,
+    /// `query_raw_thermal_mode` fails.
+    pub thermal_mode_query_unavailable: bool,
+    /// Clearing the GameShift latch (`set_game_shift_status(false)`) is rejected.
+    pub reject_game_shift_clear: bool,
+    /// The reported fan boost stays at the Balanced preset regardless of writes.
+    pub fan_boost_readback_stuck: bool,
+    /// The reported TCC offset stays at 0 regardless of writes.
+    pub tcc_readback_stuck: bool,
+}
+
 /// Deterministic simulation of an `Alienware m15 R6` (`\_SB.AMWW.WMAX`) hardware controller.
 #[derive(Debug, Clone)]
 pub struct SimBackend {
@@ -863,6 +967,7 @@ pub struct SimBackend {
     gpu_boost_pct: u8,
     cpu_turbo_enabled: bool,
     tcc_offset_c: u8,
+    faults: SimFaults,
     write_log: Vec<WriteAuditEntry>,
 }
 
@@ -882,18 +987,15 @@ impl SimBackend {
             gpu_boost_pct: 24,
             cpu_turbo_enabled: true,
             tcc_offset_c: 0,
+            faults: SimFaults::default(),
             write_log: Vec::new(),
         }
     }
 
     fn record_write(&mut self, command: String, outcome: impl Into<String>, succeeded: bool) {
         let sequence = self.write_log.len() + 1;
-        self.write_log.push(WriteAuditEntry {
-            sequence,
-            command,
-            outcome: outcome.into(),
-            succeeded,
-        });
+        self.write_log
+            .push(WriteAuditEntry::new(sequence, command, outcome, succeeded));
     }
 
     fn apply_telemetry_preset_for_code(&mut self, mode_code: u16) {
@@ -932,7 +1034,16 @@ impl ThermalTransport for SimBackend {
         self.scenario = scenario;
     }
 
+    fn set_sim_faults(&mut self, faults: SimFaults) {
+        self.faults = faults;
+    }
+
     fn query_raw_thermal_mode(&mut self) -> Result<u32, TransportError> {
+        if self.faults.thermal_mode_query_unavailable {
+            return Err(TransportError::TransportUnavailable(
+                "simulated thermal-mode query failure".to_string(),
+            ));
+        }
         match self.scenario {
             SimScenario::UnknownModeResponse => Ok(0x0000_00fe),
             SimScenario::Normal
@@ -942,6 +1053,11 @@ impl ThermalTransport for SimBackend {
     }
 
     fn query_game_shift_status(&mut self) -> Result<bool, TransportError> {
+        if self.faults.game_shift_query_unavailable {
+            return Err(TransportError::TransportUnavailable(
+                "simulated GameShift query failure".to_string(),
+            ));
+        }
         Ok(self.game_shift_enabled)
     }
 
@@ -969,6 +1085,10 @@ impl ThermalTransport for SimBackend {
             "{} 0 0x25 {{0x01, 0x{byte:02x}, 0x00, 0x00}}",
             self.prefix.wmax_path()
         );
+        if !enabled && self.faults.reject_game_shift_clear {
+            self.record_write(call.clone(), "0xFFFFFFFF (simulated ACPI rejection)", false);
+            return Err(TransportError::HardwareRejected { call });
+        }
         self.game_shift_enabled = enabled;
         self.record_write(call, "0x0 (OK)", true);
         Ok(())
@@ -1030,11 +1150,19 @@ impl ThermalTransport for SimBackend {
                 unit: " RPM",
             },
             cpu_boost_pct: SensorReading::Valid {
-                value: self.cpu_boost_pct,
+                value: if self.faults.fan_boost_readback_stuck {
+                    28
+                } else {
+                    self.cpu_boost_pct
+                },
                 unit: "%",
             },
             gpu_boost_pct: SensorReading::Valid {
-                value: self.gpu_boost_pct,
+                value: if self.faults.fan_boost_readback_stuck {
+                    24
+                } else {
+                    self.gpu_boost_pct
+                },
                 unit: "%",
             },
         }
@@ -1066,14 +1194,31 @@ impl ThermalTransport for SimBackend {
         Ok(())
     }
 
-    fn query_cpu_turbo(&mut self) -> bool {
-        self.cpu_turbo_enabled
+    fn query_cpu_turbo(&mut self) -> Result<bool, TransportError> {
+        if self.scenario == SimScenario::SensorUnavailable || self.faults.turbo_readback_unavailable
+        {
+            return Err(TransportError::TransportUnavailable(
+                "simulated CPU turbo control file unreadable".to_string(),
+            ));
+        }
+        Ok(self
+            .faults
+            .turbo_readback_stuck
+            .unwrap_or(self.cpu_turbo_enabled))
     }
 
     fn set_cpu_turbo(&mut self, enabled: bool) -> Result<(), TransportError> {
         let no_turbo_val = u8::from(!enabled);
         let call =
             format!("sysfs write /sys/devices/system/cpu/intel_pstate/no_turbo = {no_turbo_val}");
+        if self.faults.reject_turbo_write {
+            self.record_write(
+                call.clone(),
+                "Error: simulated sysfs write rejection",
+                false,
+            );
+            return Err(TransportError::HardwareRejected { call });
+        }
         self.cpu_turbo_enabled = enabled;
         self.record_write(call, "OK", true);
         Ok(())
@@ -1086,7 +1231,11 @@ impl ThermalTransport for SimBackend {
             }
         } else {
             SensorReading::Valid {
-                value: self.tcc_offset_c,
+                value: if self.faults.tcc_readback_stuck {
+                    0
+                } else {
+                    self.tcc_offset_c
+                },
                 unit: "°C",
             }
         }
@@ -1196,6 +1345,36 @@ mod tests {
         assert_eq!(provider.gpu_temp_c(), Some(59));
         assert_eq!(provider.cpu_fan_rpm(), Some(2850));
         assert_eq!(provider.gpu_fan_rpm(), Some(2710));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+    #[test]
+    fn cpu_turbo_query_reports_failure_instead_of_defaulting_to_enabled() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("awcc_rust_turbo_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let no_turbo = tmp_dir.join("no_turbo");
+        let boost = tmp_dir.join("boost");
+
+        // Neither control file exists: unknown, never "enabled".
+        let err = read_cpu_turbo_state(&no_turbo, &boost).expect_err("missing files");
+        assert!(matches!(err, TransportError::TransportUnavailable(_)));
+
+        // Garbage content is also an error.
+        fs::write(&no_turbo, "enabled?\n").unwrap();
+        assert!(read_cpu_turbo_state(&no_turbo, &boost).is_err());
+
+        // `no_turbo` is inverted; `boost` is not.
+        fs::write(&no_turbo, "0\n").unwrap();
+        assert!(read_cpu_turbo_state(&no_turbo, &boost).unwrap());
+        fs::write(&no_turbo, "1\n").unwrap();
+        assert!(!read_cpu_turbo_state(&no_turbo, &boost).unwrap());
+        fs::remove_file(&no_turbo).unwrap();
+        fs::write(&boost, "1\n").unwrap();
+        assert!(read_cpu_turbo_state(&no_turbo, &boost).unwrap());
+        fs::write(&boost, "0\n").unwrap();
+        assert!(!read_cpu_turbo_state(&no_turbo, &boost).unwrap());
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

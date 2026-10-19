@@ -24,7 +24,7 @@ use awcc_core::lighting::{
 use rusb::UsbContext;
 use serde::{Deserialize, Serialize};
 
-use crate::{TransportError, WriteAuditEntry};
+use crate::{AckStatus, TransportError, WriteAuditEntry};
 
 /// USB Vendor ID for Alienware LED controllers (`0x187c`).
 pub const ELC_VENDOR_ID: u16 = 0x187c;
@@ -56,6 +56,140 @@ pub struct ElcDiagnosticsSummary {
     pub elc_config: ElcConfig,
 }
 
+/// Result of one outgoing report: the transfer itself succeeded (otherwise `send_report`
+/// returns `Err`), and `ack` records the separate, optional acknowledgement read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendReceipt {
+    pub ack: AckStatus,
+}
+
+impl SendReceipt {
+    /// A receipt for a report that has no acknowledgement phase (query requests).
+    #[must_use]
+    pub const fn without_ack() -> Self {
+        Self {
+            ack: AckStatus::NotApplicable,
+        }
+    }
+}
+
+/// Aggregate result of a successful multi-report USB transaction.
+///
+/// `reports_sent` counts *outgoing transfers that completed in full*; the acknowledgement
+/// results are kept apart so a caller can never mistake "sent" for "device confirmed".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransactionReceipt {
+    pub reports_sent: usize,
+    pub acks_received: usize,
+    /// `(1-based report index, status)` for every acknowledgement that was missing/incomplete.
+    pub ack_problems: Vec<(usize, AckStatus)>,
+    /// Non-fatal problems after the transfers (releasing the interface, persisting brightness).
+    pub warnings: Vec<String>,
+}
+
+impl TransactionReceipt {
+    /// Receipt for an operation that resolved to zero reports.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// `true` when every sent report was followed by an intact acknowledgement read.
+    #[must_use]
+    pub fn fully_acknowledged(&self) -> bool {
+        self.reports_sent > 0
+            && self.ack_problems.is_empty()
+            && self.acks_received == self.reports_sent
+    }
+
+    /// One-sentence description of the acknowledgement evidence.
+    #[must_use]
+    pub fn ack_summary(&self) -> String {
+        if self.reports_sent == 0 {
+            return "no reports were sent".to_string();
+        }
+        if self.fully_acknowledged() {
+            return format!(
+                "{} of {} reports acknowledged by the controller (acknowledgement content is not interpreted)",
+                self.acks_received, self.reports_sent
+            );
+        }
+        let first = self
+            .ack_problems
+            .first()
+            .map(|(idx, status)| format!("report {idx}: {}", status.describe()))
+            .unwrap_or_else(|| "no acknowledgement phase".to_string());
+        format!(
+            "{} of {} reports acknowledged; {} acknowledgement(s) missing or incomplete ({first})",
+            self.acks_received,
+            self.reports_sent,
+            self.ack_problems.len()
+        )
+    }
+}
+
+/// A USB transaction that did not complete. Preserves how far it got so partial application is
+/// never confused with a clean failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbTransactionError {
+    pub reports_sent: usize,
+    pub reports_total: usize,
+    pub cause: TransportError,
+}
+
+impl UsbTransactionError {
+    /// `true` when at least one report reached the controller before the failure, so the
+    /// controller may be in a partially updated state.
+    #[must_use]
+    pub const fn is_partial(&self) -> bool {
+        self.reports_sent > 0
+    }
+}
+
+impl std::fmt::Display for UsbTransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_partial() {
+            write!(
+                f,
+                "{} (after {} of {} reports were already sent; the controller state may be partially updated)",
+                self.cause, self.reports_sent, self.reports_total
+            )
+        } else {
+            write!(f, "{}", self.cause)
+        }
+    }
+}
+
+impl std::error::Error for UsbTransactionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+impl From<TransportError> for UsbTransactionError {
+    fn from(cause: TransportError) -> Self {
+        Self {
+            reports_sent: 0,
+            reports_total: 0,
+            cause,
+        }
+    }
+}
+
+/// Where the lighting controller's remembered state (brightness, effect, stealth) comes from.
+///
+/// The ELC protocol exposes no readback of applied colours or brightness, so these values are
+/// only ever *remembered*, never observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LightingStateSource {
+    /// Built-in default assumed at startup; nothing has been commanded in this process.
+    AssumedDefault,
+    /// Brightness restored from the persisted brightness file; the device was not queried.
+    PersistedBrightness,
+    /// Set by a command in this process whose transfers completed.
+    Commanded,
+}
+
 /// Abstract USB HID 33-byte control transfer transport for Alienware ELC 2.0 controllers.
 pub trait UsbHidTransport: Send {
     /// Whether this transport is backed by simulation rather than physical USB hardware.
@@ -77,7 +211,11 @@ pub trait UsbHidTransport: Send {
     fn close(&mut self) -> Result<(), TransportError>;
 
     /// Send a 33-byte HID feature/output report (`0x21`, `0x09`, `0x0202`, `0`).
-    fn send_report(&mut self, report: &HidReport33) -> Result<(), TransportError>;
+    ///
+    /// `Ok` means the outgoing transfer completed in full. The optional acknowledgement read that
+    /// follows a mutating report is reported separately in [`SendReceipt::ack`] and never turns a
+    /// completed transfer into an error.
+    fn send_report(&mut self, report: &HidReport33) -> Result<SendReceipt, TransportError>;
 
     /// Receive a 33-byte HID feature/input report (`0xA1`, `0x01`, `0x0101`, `0`).
     fn receive_report(&mut self) -> Result<HidReport33, TransportError>;
@@ -120,7 +258,7 @@ impl UsbHidTransport for Box<dyn UsbHidTransport> {
         (**self).close()
     }
 
-    fn send_report(&mut self, report: &HidReport33) -> Result<(), TransportError> {
+    fn send_report(&mut self, report: &HidReport33) -> Result<SendReceipt, TransportError> {
         (**self).send_report(report)
     }
 
@@ -242,6 +380,13 @@ pub struct SimUsbElcTransport {
     zone_colors: BTreeMap<u8, u32>,
     power_slot_colors: BTreeMap<u16, u32>,
     dim_value: u8,
+    /// Fault injection: acknowledgement status returned for every mutating report.
+    ack_fault: Option<AckStatus>,
+    /// Fault injection: fail the Nth outgoing transfer (1-based) and every later one.
+    fail_sends_from: Option<usize>,
+    mutating_sends: usize,
+    /// Fault injection: every `receive_report` (diagnostic query response) fails with this text.
+    receive_failure: Option<String>,
 }
 
 impl Default for SimUsbElcTransport {
@@ -280,7 +425,28 @@ impl SimUsbElcTransport {
             zone_colors,
             power_slot_colors,
             dim_value: 0,
+            ack_fault: None,
+            fail_sends_from: None,
+            mutating_sends: 0,
+            receive_failure: None,
         }
+    }
+
+    /// Make every diagnostic response read fail with `reason` (`None` restores health).
+    pub fn inject_receive_failure(&mut self, reason: Option<String>) {
+        self.receive_failure = reason;
+    }
+
+    /// Make every later mutating report complete its transfer but report `fault` for the
+    /// acknowledgement read (`None` restores the healthy acknowledgement).
+    pub fn inject_ack_fault(&mut self, fault: Option<AckStatus>) {
+        self.ack_fault = fault;
+    }
+
+    /// Fail the `n`th mutating outgoing transfer (1-based, counted from now) and all later ones.
+    pub fn inject_send_failure_from(&mut self, n: Option<usize>) {
+        self.mutating_sends = 0;
+        self.fail_sends_from = n;
     }
 
     #[must_use]
@@ -314,13 +480,20 @@ impl SimUsbElcTransport {
         self.write_log.clear();
     }
 
-    fn record_write(&mut self, command: String, outcome: impl Into<String>, succeeded: bool) {
+    fn record_write(
+        &mut self,
+        command: String,
+        outcome: impl Into<String>,
+        succeeded: bool,
+        ack: AckStatus,
+    ) {
         let sequence = self.write_log.len() + 1;
         self.write_log.push(WriteAuditEntry {
             sequence,
             command,
             outcome: outcome.into(),
             succeeded,
+            ack,
         });
     }
 }
@@ -358,14 +531,30 @@ impl UsbHidTransport for SimUsbElcTransport {
         Ok(())
     }
 
-    fn send_report(&mut self, report: &HidReport33) -> Result<(), TransportError> {
-        self.sent_reports.push(*report);
-
+    fn send_report(&mut self, report: &HidReport33) -> Result<SendReceipt, TransportError> {
         // Track query vs mutating commands
         if report[0] == PREAMBLE && report[1] == CMD_REQUEST {
+            self.sent_reports.push(*report);
             self.last_query_subcmd = Some(report[2]);
-            return Ok(());
+            return Ok(SendReceipt::without_ack());
         }
+
+        self.mutating_sends += 1;
+        let hex = format_report_hex(report);
+        if let Some(from) = self.fail_sends_from
+            && self.mutating_sends >= from
+        {
+            self.record_write(
+                format!("USB HID 187c:{:04x} OUT [{hex}]", self.product_id),
+                "simulated libusb transfer error",
+                false,
+                AckStatus::NotApplicable,
+            );
+            return Err(TransportError::TransportUnavailable(
+                "simulated libusb control transfer write failed".to_string(),
+            ));
+        }
+        self.sent_reports.push(*report);
 
         // Update simulated state when mutating commands arrive
         track_elc_report_state(
@@ -378,16 +567,20 @@ impl UsbHidTransport for SimUsbElcTransport {
             &mut self.power_slot_colors,
         );
 
-        let hex = format_report_hex(report);
+        let ack = self.ack_fault.clone().unwrap_or(AckStatus::Received);
         self.record_write(
             format!("USB HID 187c:{:04x} OUT [{hex}]", self.product_id),
             "33 bytes transferred",
             true,
+            ack.clone(),
         );
-        Ok(())
+        Ok(SendReceipt { ack })
     }
 
     fn receive_report(&mut self) -> Result<HidReport33, TransportError> {
+        if let Some(reason) = &self.receive_failure {
+            return Err(TransportError::TransportUnavailable(reason.clone()));
+        }
         let mut resp = [0u8; 33];
         resp[0] = PREAMBLE;
         resp[1] = CMD_REQUEST;
@@ -496,13 +689,20 @@ impl LinuxUsbElcTransport {
         }
     }
 
-    fn record_write(&mut self, command: String, outcome: impl Into<String>, succeeded: bool) {
+    fn record_write(
+        &mut self,
+        command: String,
+        outcome: impl Into<String>,
+        succeeded: bool,
+        ack: AckStatus,
+    ) {
         let sequence = self.write_log.len() + 1;
         self.write_log.push(WriteAuditEntry {
             sequence,
             command,
             outcome: outcome.into(),
             succeeded,
+            ack,
         });
     }
 }
@@ -606,7 +806,7 @@ impl UsbHidTransport for LinuxUsbElcTransport {
         Ok(())
     }
 
-    fn send_report(&mut self, report: &HidReport33) -> Result<(), TransportError> {
+    fn send_report(&mut self, report: &HidReport33) -> Result<SendReceipt, TransportError> {
         if !self.is_acquired {
             return Err(TransportError::TransportUnavailable(
                 "ELC USB device not acquired before send_report".to_string(),
@@ -623,62 +823,74 @@ impl UsbHidTransport for LinuxUsbElcTransport {
         match handle.write_control(0x21, 0x09, 0x0202, 0, report, Duration::from_millis(1000)) {
             Ok(written) if written == report.len() => {
                 self.sent_reports.push(*report);
-                if !is_query {
-                    // Hardware timing: sleep *before* reading the
-                    // ELC input report ACK so SPI flash erase/save/default/color operations complete
-                    // in the STM32 main loop and enqueue their response into the USB TX queue before
-                    // USB control read / input report is issued.
-                    let pre_ack_sleep_ms = if report[0] == PREAMBLE
-                        && (report[1] == CMD_ANIMATION || report[1] == CMD_USER_ANIMATION)
-                    {
-                        let op = u16::from_be_bytes([report[2], report[3]]);
-                        if op == ANIM_CONFIG_SAVE {
-                            if report[1] == CMD_USER_ANIMATION {
-                                250
-                            } else {
-                                150
-                            }
-                        } else if op == ANIM_REMOVE {
-                            150
-                        } else if op == ANIM_SET_DEFAULT || op == ANIM_PLAY {
-                            50
+                if is_query {
+                    return Ok(SendReceipt::without_ack());
+                }
+                // Hardware timing: sleep *before* reading the ELC input report so SPI flash
+                // erase/save/default/color operations complete in the STM32 main loop and
+                // enqueue their response into the USB TX queue before the control read is issued.
+                let pre_ack_sleep_ms = if report[0] == PREAMBLE
+                    && (report[1] == CMD_ANIMATION || report[1] == CMD_USER_ANIMATION)
+                {
+                    let op = u16::from_be_bytes([report[2], report[3]]);
+                    if op == ANIM_CONFIG_SAVE {
+                        if report[1] == CMD_USER_ANIMATION {
+                            250
                         } else {
-                            15
+                            150
                         }
-                    } else if report[0] == PREAMBLE
-                        && (report[1] == CMD_SET_COLOR || report[1] == CMD_SET_DIM)
-                    {
+                    } else if op == ANIM_REMOVE {
+                        150
+                    } else if op == ANIM_SET_DEFAULT || op == ANIM_PLAY {
                         50
                     } else {
                         15
-                    };
-                    std::thread::sleep(Duration::from_millis(pre_ack_sleep_ms));
-                    let mut ack = [0_u8; 33];
-                    let _ = handle.read_control(
-                        0xA1,
-                        0x01,
-                        0x0101,
-                        0,
-                        &mut ack,
-                        Duration::from_millis(500),
-                    );
+                    }
+                } else if report[0] == PREAMBLE
+                    && (report[1] == CMD_SET_COLOR || report[1] == CMD_SET_DIM)
+                {
+                    50
+                } else {
+                    15
+                };
+                std::thread::sleep(Duration::from_millis(pre_ack_sleep_ms));
 
-                    track_elc_report_state(
-                        report,
-                        &mut self.dim_value,
-                        &mut self.pending_zones,
-                        &mut self.pending_power_slot,
-                        &mut self.pending_color_recorded,
-                        &mut self.zone_colors,
-                        &mut self.power_slot_colors,
-                    );
-                    self.record_write(
-                        format!("USB HID 187c:{:04x} OUT [{hex}]", self.product_id),
-                        "33 bytes transferred",
-                        true,
-                    );
-                }
-                Ok(())
+                // The acknowledgement read is best-effort evidence, not a protocol requirement:
+                // the legacy implementation never reads one after a set command. Its result is
+                // recorded separately from the (already completed) outgoing transfer and never
+                // turns that transfer into an error.
+                let mut ack_buf = [0_u8; 33];
+                let ack = match handle.read_control(
+                    0xA1,
+                    0x01,
+                    0x0101,
+                    0,
+                    &mut ack_buf,
+                    Duration::from_millis(500),
+                ) {
+                    Ok(n) if n == ack_buf.len() => AckStatus::Received,
+                    Ok(bytes) => AckStatus::Incomplete { bytes },
+                    Err(e) => AckStatus::Failed {
+                        reason: e.to_string(),
+                    },
+                };
+
+                track_elc_report_state(
+                    report,
+                    &mut self.dim_value,
+                    &mut self.pending_zones,
+                    &mut self.pending_power_slot,
+                    &mut self.pending_color_recorded,
+                    &mut self.zone_colors,
+                    &mut self.power_slot_colors,
+                );
+                self.record_write(
+                    format!("USB HID 187c:{:04x} OUT [{hex}]", self.product_id),
+                    "33 bytes transferred",
+                    true,
+                    ack.clone(),
+                );
+                Ok(SendReceipt { ack })
             }
             Ok(written) => {
                 if !is_query {
@@ -686,6 +898,7 @@ impl UsbHidTransport for LinuxUsbElcTransport {
                         format!("USB HID 187c:{:04x} OUT [{hex}]", self.product_id),
                         format!("partial write ({written}/33 bytes)"),
                         false,
+                        AckStatus::NotApplicable,
                     );
                 }
                 Err(TransportError::TransportUnavailable(format!(
@@ -698,6 +911,7 @@ impl UsbHidTransport for LinuxUsbElcTransport {
                         format!("USB HID 187c:{:04x} OUT [{hex}]", self.product_id),
                         format!("libusb error: {e}"),
                         false,
+                        AckStatus::NotApplicable,
                     );
                 }
                 Err(TransportError::TransportUnavailable(format!(
@@ -771,15 +985,21 @@ pub struct EffectController<T: UsbHidTransport> {
     pre_stealth_brightness: u8,
     stealth_enabled: bool,
     brightness_path_override: Option<PathBuf>,
+    state_source: LightingStateSource,
 }
 
 impl<T: UsbHidTransport> EffectController<T> {
     /// Construct a new `EffectController` with the given USB transport and active zone IDs.
     #[must_use]
     pub fn new(transport: T, zones: Vec<u8>) -> Self {
-        let initial_brightness = Self::read_brightness_from_path(Path::new("/etc/awcc/brightness"))
-            .filter(|&b| b > 0)
-            .unwrap_or(100);
+        let persisted =
+            Self::read_brightness_from_path(Path::new("/etc/awcc/brightness")).filter(|&b| b > 0);
+        let state_source = if persisted.is_some() {
+            LightingStateSource::PersistedBrightness
+        } else {
+            LightingStateSource::AssumedDefault
+        };
+        let initial_brightness = persisted.unwrap_or(100);
         let mut zone_effects = BTreeMap::new();
         for &z in &zones {
             zone_effects.insert(z, LightingEffect::Static { color: 0x00F0FF });
@@ -795,6 +1015,7 @@ impl<T: UsbHidTransport> EffectController<T> {
             pre_stealth_brightness: initial_brightness,
             stealth_enabled: false,
             brightness_path_override: None,
+            state_source,
         }
     }
 
@@ -807,6 +1028,7 @@ impl<T: UsbHidTransport> EffectController<T> {
             if b > 0 {
                 self.pre_stealth_brightness = b;
             }
+            self.state_source = LightingStateSource::PersistedBrightness;
         }
         self.brightness_path_override = Some(path);
         self
@@ -848,6 +1070,13 @@ impl<T: UsbHidTransport> EffectController<T> {
         self.stealth_enabled
     }
 
+    /// Provenance of the remembered brightness/stealth/effect state. The ELC protocol has no
+    /// readback for these, so they are assumed, restored, or commanded — never observed.
+    #[must_use]
+    pub const fn state_source(&self) -> LightingStateSource {
+        self.state_source
+    }
+
     fn brightness_file_path(&self) -> PathBuf {
         self.brightness_path_override
             .clone()
@@ -865,26 +1094,67 @@ impl<T: UsbHidTransport> EffectController<T> {
         }
     }
 
-    fn persist_brightness(&self, brightness: u8) {
+    /// Persist the brightness preference. A failure is not a device failure, so it is returned
+    /// as a warning for the caller to surface instead of being discarded.
+    fn persist_brightness(&self, brightness: u8) -> Option<String> {
         let path = self.brightness_file_path();
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            return Some(format!(
+                "brightness {brightness}% was sent but not saved to {}: {e}",
+                path.display()
+            ));
         }
-        let _ = fs::write(&path, format!("{brightness}\n"));
+        fs::write(&path, format!("{brightness}\n")).err().map(|e| {
+            format!(
+                "brightness {brightness}% was sent but not saved to {}: {e}",
+                path.display()
+            )
+        })
     }
 
-    fn run_transaction(&mut self, reports: &[HidReport33]) -> Result<usize, TransportError> {
-        self.transport.acquire()?;
-        let mut count = 0;
+    fn run_transaction(
+        &mut self,
+        reports: &[HidReport33],
+    ) -> Result<TransactionReceipt, UsbTransactionError> {
+        let total = reports.len();
+        self.transport
+            .acquire()
+            .map_err(|cause| UsbTransactionError {
+                reports_sent: 0,
+                reports_total: total,
+                cause,
+            })?;
+        let mut receipt = TransactionReceipt::empty();
         for report in reports {
-            if let Err(e) = self.transport.send_report(report) {
-                let _ = self.transport.release();
-                return Err(e);
+            match self.transport.send_report(report) {
+                Ok(sent) => {
+                    receipt.reports_sent += 1;
+                    match sent.ack {
+                        AckStatus::Received => receipt.acks_received += 1,
+                        AckStatus::NotApplicable => {}
+                        problem => receipt.ack_problems.push((receipt.reports_sent, problem)),
+                    }
+                }
+                Err(cause) => {
+                    let _ = self.transport.release();
+                    return Err(UsbTransactionError {
+                        reports_sent: receipt.reports_sent,
+                        reports_total: total,
+                        cause,
+                    });
+                }
             }
-            count += 1;
         }
-        self.transport.release()?;
-        Ok(count)
+        // Every transfer already completed; failing to release the interface afterwards is
+        // cleanup trouble, not evidence that the writes failed.
+        if let Err(e) = self.transport.release() {
+            receipt
+                .warnings
+                .push(format!("USB interface release failed after transfer: {e}"));
+        }
+        Ok(receipt)
     }
 
     fn all_dimmable_zones(&self) -> Vec<u8> {
@@ -897,31 +1167,36 @@ impl<T: UsbHidTransport> EffectController<T> {
 
     /// Set hardware brightness (`0..=100%`) across all configured zones (including Power LED `0x02`)
     /// and persist to `/etc/awcc/brightness`.
-    pub fn set_brightness(&mut self, brightness_pct: u8) -> Result<usize, TransportError> {
+    pub fn set_brightness(
+        &mut self,
+        brightness_pct: u8,
+    ) -> Result<TransactionReceipt, UsbTransactionError> {
         let clamped = brightness_pct.min(100);
         let dim = 100_u8.saturating_sub(clamped);
         let reports = build_set_dim_packets(dim, &self.all_dimmable_zones());
-        let sent = self.run_transaction(&reports)?;
+        let mut receipt = self.run_transaction(&reports)?;
         self.brightness = clamped;
+        self.state_source = LightingStateSource::Commanded;
         if clamped > 0 {
             self.pre_stealth_brightness = clamped;
             self.stealth_enabled = false;
         } else {
             self.stealth_enabled = true;
         }
-        self.persist_brightness(clamped);
-        Ok(sent)
+        receipt.warnings.extend(self.persist_brightness(clamped));
+        Ok(receipt)
     }
 
     /// Enable or disable Stealth (`Go Dark`) mode, preserving pre-stealth brightness on restore.
-    pub fn set_stealth(&mut self, enable: bool) -> Result<bool, TransportError> {
+    pub fn set_stealth(&mut self, enable: bool) -> Result<TransactionReceipt, UsbTransactionError> {
         let zones = self.all_dimmable_zones();
+        let mut receipt;
         if enable {
             if self.brightness > 0 {
                 self.pre_stealth_brightness = self.brightness;
             }
             let reports = build_set_dim_packets(100, &zones);
-            self.run_transaction(&reports)?;
+            receipt = self.run_transaction(&reports)?;
             self.brightness = 0;
             self.stealth_enabled = true;
         } else {
@@ -932,16 +1207,17 @@ impl<T: UsbHidTransport> EffectController<T> {
             };
             let dim = 100_u8.saturating_sub(restore);
             let reports = build_set_dim_packets(dim, &zones);
-            self.run_transaction(&reports)?;
+            receipt = self.run_transaction(&reports)?;
             self.brightness = restore;
             self.stealth_enabled = false;
-            self.persist_brightness(restore);
+            receipt.warnings.extend(self.persist_brightness(restore));
         }
-        Ok(self.stealth_enabled)
+        self.state_source = LightingStateSource::Commanded;
+        Ok(receipt)
     }
 
-    /// Toggle Stealth (`Go Dark`) mode and return the new Stealth state.
-    pub fn toggle_stealth(&mut self) -> Result<bool, TransportError> {
+    /// Toggle Stealth (`Go Dark`) mode.
+    pub fn toggle_stealth(&mut self) -> Result<TransactionReceipt, UsbTransactionError> {
         self.set_stealth(!self.stealth_enabled)
     }
 
@@ -984,11 +1260,15 @@ impl<T: UsbHidTransport> EffectController<T> {
         effect: LightingEffect,
         target: &ZoneTarget,
         persist_boot: bool,
-    ) -> Result<usize, TransportError> {
+    ) -> Result<TransactionReceipt, UsbTransactionError> {
         let resolved = target.resolve(&self.zones);
         if resolved.is_empty() {
-            return Ok(0);
+            return Ok(TransactionReceipt::empty());
         }
+        // Remember the previous per-zone effects: they must only change once the transfers
+        // actually completed, otherwise a failed request would silently become the baseline for
+        // every later composite effect.
+        let previous_effects = self.zone_effects.clone();
         for &z in &resolved {
             self.zone_effects.insert(z, effect);
         }
@@ -998,7 +1278,16 @@ impl<T: UsbHidTransport> EffectController<T> {
         if resolved.contains(&POWER_BUTTON_LED_ID) {
             reports.extend(compile_power_button_effect_packets(effect));
         }
-        self.run_transaction(&reports)
+        match self.run_transaction(&reports) {
+            Ok(receipt) => {
+                self.state_source = LightingStateSource::Commanded;
+                Ok(receipt)
+            }
+            Err(err) => {
+                self.zone_effects = previous_effects;
+                Err(err)
+            }
+        }
     }
 
     /// Apply direct volatile per-zone color (`0x27` `SendSetColor`) without touching flash animations.
@@ -1006,7 +1295,7 @@ impl<T: UsbHidTransport> EffectController<T> {
         &mut self,
         color: u32,
         target: &ZoneTarget,
-    ) -> Result<usize, TransportError> {
+    ) -> Result<TransactionReceipt, UsbTransactionError> {
         let resolved = target.resolve(&self.zones);
         let reports = build_set_color_packets(color, &resolved);
         self.run_transaction(&reports)
@@ -1018,7 +1307,7 @@ impl<T: UsbHidTransport> EffectController<T> {
         slot: PowerStateSlot,
         color: u32,
         pulse: bool,
-    ) -> Result<usize, TransportError> {
+    ) -> Result<TransactionReceipt, UsbTransactionError> {
         let mut reports = compile_power_button_slot_packets(slot, color, pulse);
         if matches!(
             slot,
@@ -1039,9 +1328,9 @@ impl<T: UsbHidTransport> EffectController<T> {
         dc_color: u32,
         charging_color: u32,
         critical_color: u32,
-    ) -> Result<usize, TransportError> {
+    ) -> Result<TransactionReceipt, UsbTransactionError> {
         let ac_effect = LightingEffect::Static { color: ac_color };
-        self.zone_effects.insert(POWER_BUTTON_LED_ID, ac_effect);
+        let previous_power_effect = self.zone_effects.insert(POWER_BUTTON_LED_ID, ac_effect);
         let groups = self.build_composite_groups(ac_effect, &[POWER_BUTTON_LED_ID]);
         let mut reports = compile_composite_effect_packets(&groups, true);
         reports.extend(compile_all_power_button_packets(
@@ -1050,7 +1339,23 @@ impl<T: UsbHidTransport> EffectController<T> {
             charging_color,
             critical_color,
         ));
-        self.run_transaction(&reports)
+        match self.run_transaction(&reports) {
+            Ok(receipt) => {
+                self.state_source = LightingStateSource::Commanded;
+                Ok(receipt)
+            }
+            Err(err) => {
+                match previous_power_effect {
+                    Some(prev) => {
+                        self.zone_effects.insert(POWER_BUTTON_LED_ID, prev);
+                    }
+                    None => {
+                        self.zone_effects.remove(&POWER_BUTTON_LED_ID);
+                    }
+                }
+                Err(err)
+            }
+        }
     }
 
     fn query_while_acquired(&mut self, subcmd: u8) -> Result<HidReport33, TransportError> {
@@ -1191,13 +1496,15 @@ mod tests {
         assert!(!ctrl.is_stealth());
 
         // Enable stealth -> dim_value becomes 100 (off), brightness 0, file still 80
-        assert!(ctrl.set_stealth(true).unwrap());
+        ctrl.set_stealth(true).unwrap();
+        assert!(ctrl.is_stealth());
         assert_eq!(ctrl.brightness(), 0);
         assert_eq!(ctrl.transport().dim_value(), 100);
         assert_eq!(fs::read_to_string(&b_file).unwrap().trim(), "80");
 
         // Toggle stealth off -> restores 80% brightness (dim_value = 20)
-        assert!(!ctrl.toggle_stealth().unwrap());
+        ctrl.toggle_stealth().unwrap();
+        assert!(!ctrl.is_stealth());
         assert_eq!(ctrl.brightness(), 80);
         assert_eq!(ctrl.transport().dim_value(), 20);
 
@@ -1218,7 +1525,8 @@ mod tests {
                 &ZoneTarget::Keyboard,
                 false,
             )
-            .unwrap();
+            .unwrap()
+            .reports_sent;
         assert_eq!(sent_volatile, 6);
         assert!(!ctrl.transport().is_acquired());
         assert_eq!(ctrl.transport().zone_colors()[&0x04], 0xFF0040);
@@ -1238,7 +1546,8 @@ mod tests {
                 &ZoneTarget::Logo,
                 true,
             )
-            .unwrap();
+            .unwrap()
+            .reports_sent;
         assert_eq!(sent_persist, 10);
         assert_eq!(ctrl.transport().zone_colors()[&0x03], 0x00FF80);
         assert_eq!(ctrl.transport().zone_colors()[&0x04], 0xFF0040);
@@ -1249,7 +1558,8 @@ mod tests {
         // Program all 6 power-button state slots (1 SetColor + 6 * 5 + 1 Play + 1 SetColor = 33 reports) + composite 0x21 (10 reports) = 43 reports
         let sent_pwr = ctrl
             .set_all_power_button_states(0x00F0FF, 0x0078FF, 0xFFB400, 0xFF0000)
-            .unwrap();
+            .unwrap()
+            .reports_sent;
         assert_eq!(sent_pwr, 43);
         assert_eq!(
             ctrl.transport().power_slot_colors()[&PowerStateSlot::AcOn.slot_id()],
@@ -1269,7 +1579,8 @@ mod tests {
                 &ZoneTarget::All,
                 true,
             )
-            .unwrap();
+            .unwrap()
+            .reports_sent;
         assert!(sent_all > 32);
         assert_eq!(ctrl.transport().zone_colors()[&0x02], 0xFFA000);
         assert_eq!(
@@ -1322,5 +1633,167 @@ mod tests {
             );
         }
         assert_eq!(ctrl.transport().zone_colors()[&0x03], 0xF59E0B);
+    }
+    fn healthy_controller() -> EffectController<SimUsbElcTransport> {
+        let zones = vec![0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x00];
+        EffectController::new(SimUsbElcTransport::new_alienware_m15_r6(), zones)
+    }
+
+    #[test]
+    fn completed_transfer_with_failed_ack_keeps_transfer_and_ack_outcomes_distinct() {
+        let mut ctrl = healthy_controller();
+        ctrl.transport_mut()
+            .inject_ack_fault(Some(AckStatus::Failed {
+                reason: "timed out".to_string(),
+            }));
+
+        let receipt = ctrl
+            .apply_effect(
+                LightingEffect::Static { color: 0xFF0040 },
+                &ZoneTarget::Keyboard,
+                false,
+            )
+            .expect("an unacknowledged transfer is not a transfer failure");
+
+        // All six outgoing transfers completed...
+        assert_eq!(receipt.reports_sent, 6);
+        // ...but not one acknowledgement arrived, and that is recorded rather than hidden.
+        assert_eq!(receipt.acks_received, 0);
+        assert_eq!(receipt.ack_problems.len(), 6);
+        assert!(!receipt.fully_acknowledged());
+        assert!(
+            receipt
+                .ack_summary()
+                .starts_with("0 of 6 reports acknowledged")
+        );
+        assert!(receipt.ack_summary().contains("timed out"));
+
+        // The audit trail records the transfer as successful and the ack separately.
+        let log = ctrl.transport().write_audit_log();
+        assert_eq!(log.len(), 6);
+        assert!(log.iter().all(|e| e.succeeded));
+        assert!(
+            log.iter()
+                .all(|e| matches!(e.ack, AckStatus::Failed { .. }))
+        );
+        // Remembered (commanded) state follows the completed transfers, not the ack.
+        assert_eq!(ctrl.state_source(), LightingStateSource::Commanded);
+    }
+
+    #[test]
+    fn short_ack_read_is_counted_as_a_problem_not_a_failure() {
+        let mut ctrl = healthy_controller();
+        ctrl.transport_mut()
+            .inject_ack_fault(Some(AckStatus::Incomplete { bytes: 8 }));
+        let receipt = ctrl.set_brightness(40).expect("transfer completes");
+        assert!(receipt.reports_sent > 0);
+        assert_eq!(receipt.acks_received, 0);
+        assert!(
+            receipt
+                .ack_problems
+                .iter()
+                .all(|(_, s)| *s == AckStatus::Incomplete { bytes: 8 })
+        );
+        assert_eq!(ctrl.brightness(), 40);
+    }
+
+    #[test]
+    fn healthy_transfers_report_every_ack_received() {
+        let mut ctrl = healthy_controller();
+        let receipt = ctrl
+            .apply_effect(
+                LightingEffect::Static { color: 0x112233 },
+                &ZoneTarget::Logo,
+                false,
+            )
+            .unwrap();
+        assert!(receipt.fully_acknowledged());
+        assert_eq!(receipt.acks_received, receipt.reports_sent);
+        assert!(
+            ctrl.transport()
+                .write_audit_log()
+                .iter()
+                .all(|e| e.ack == AckStatus::Received)
+        );
+    }
+
+    #[test]
+    fn partial_transfer_failure_reports_progress_and_restores_effect_baseline() {
+        let mut ctrl = healthy_controller();
+        ctrl.transport_mut().inject_send_failure_from(Some(3));
+        let err = ctrl
+            .apply_effect(
+                LightingEffect::Static { color: 0xFF0040 },
+                &ZoneTarget::Keyboard,
+                false,
+            )
+            .expect_err("third transfer fails");
+        assert_eq!(err.reports_sent, 2);
+        assert_eq!(err.reports_total, 6);
+        assert!(err.is_partial());
+        assert!(err.to_string().contains("partially updated"), "{err}");
+        assert!(
+            matches!(
+                ctrl.state_source(),
+                LightingStateSource::AssumedDefault | LightingStateSource::PersistedBrightness
+            ),
+            "a failed command must not become the remembered state"
+        );
+
+        // A later healthy command must start from the pre-failure baseline: the failed
+        // keyboard effect must not leak into the composite sent for the Logo.
+        ctrl.transport_mut().inject_send_failure_from(None);
+        let recovered = ctrl
+            .apply_effect(
+                LightingEffect::Static { color: 0x00FF80 },
+                &ZoneTarget::Logo,
+                true,
+            )
+            .unwrap();
+        let mut fresh = healthy_controller();
+        let reference = fresh
+            .apply_effect(
+                LightingEffect::Static { color: 0x00FF80 },
+                &ZoneTarget::Logo,
+                true,
+            )
+            .unwrap();
+        assert_eq!(recovered.reports_sent, reference.reports_sent);
+    }
+
+    #[test]
+    fn failure_before_any_transfer_is_not_reported_as_partial() {
+        let mut ctrl = healthy_controller();
+        ctrl.transport_mut().inject_send_failure_from(Some(1));
+        let err = ctrl.set_brightness(10).expect_err("first transfer fails");
+        assert_eq!(err.reports_sent, 0);
+        assert!(!err.is_partial());
+        assert!(!err.to_string().contains("partially"));
+        assert_ne!(
+            ctrl.brightness(),
+            10,
+            "brightness must not advance on failure"
+        );
+    }
+
+    #[test]
+    fn brightness_persistence_failure_is_a_warning_not_a_transfer_failure() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("awcc_rust_bright_warn_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let blocker = tmp_dir.join("file");
+        fs::write(&blocker, "x").unwrap();
+        // The parent of the brightness path is a regular file, so it can never be created.
+        let mut ctrl = healthy_controller().with_brightness_path(blocker.join("brightness"));
+
+        let receipt = ctrl.set_brightness(55).expect("device transfer succeeds");
+        assert_eq!(ctrl.brightness(), 55);
+        assert!(
+            receipt.warnings.iter().any(|w| w.contains("not saved")),
+            "{:?}",
+            receipt.warnings
+        );
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

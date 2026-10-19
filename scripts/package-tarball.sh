@@ -50,6 +50,10 @@ trap cleanup EXIT
 
 TREE_ROOT="${WORK_TMP}/${AWCC_TARBALL_BASENAME}"
 cp -a "${STAGED_DIR}" "${TREE_ROOT}"
+# The compiled payload is shared by every format, so each package declares its own format here
+# (read at run time by `--version`; never compiled into the common binaries).
+printf 'tarball\n' > "${TREE_ROOT}/share/awcc/package-format"
+chmod 0644 "${TREE_ROOT}/share/awcc/package-format"
 find "${TREE_ROOT}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 tar \
@@ -80,6 +84,7 @@ done
 
 for req_file in \
     "share/awcc/database.json" \
+    "share/awcc/package-format" \
     "share/applications/awcc-gui.desktop" \
     "share/icons/hicolor/scalable/apps/awcc-gui.svg" \
     "share/icons/hicolor/256x256/apps/awcc-gui.png" \
@@ -99,7 +104,9 @@ for req_file in \
 done
 
 if [[ "${RUN_SMOKE}" -eq 1 ]]; then
+    mapfile -t IDENTITY_ARGS < <(smoke_identity_args tarball)
     "${SCRIPT_DIR}/smoke-test-installed.sh" \
+        "${IDENTITY_ARGS[@]}" \
         --cli "${EXTRACTED_ROOT}/bin/awcc-cli" \
         --gui "${EXTRACTED_ROOT}/bin/awcc-gui" \
         --database "${EXTRACTED_ROOT}/share/awcc/database.json" \

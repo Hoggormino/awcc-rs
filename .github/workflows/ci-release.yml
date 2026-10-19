@@ -167,7 +167,10 @@ jobs:
       - name: Install .deb and run unprivileged CLI + GUI screenshot smoke tests in clean ubuntu:24.04 container
         run: |
           mkdir -p dist/deb-smoke-screenshots
+          VERSION="$(./scripts/release-meta.sh --print-env | sed -n 's/^AWCC_VERSION=//p')"
           docker run --rm \
+            -e AWCC_GIT_SHA="${GITHUB_SHA}" \
+            -e AWCC_VERSION="${VERSION}" \
             -v "${PWD}:/work:ro" \
             -v "${PWD}/dist/deb-smoke-screenshots:/screenshots:rw" \
             ubuntu:24.04 \
@@ -191,6 +194,11 @@ jobs:
                 --gui /usr/bin/awcc-gui \
                 --database /etc/awcc/database.json \
                 --label deb-ubuntu2404 \
+                --expect-package-format deb \
+                --expect-version ${AWCC_VERSION} \
+                --expect-commit ${AWCC_GIT_SHA} \
+                --expect-target x86_64-unknown-linux-gnu \
+                --expect-dirty false \
                 --screenshot-dir /screenshots"
             '
 
@@ -223,8 +231,10 @@ jobs:
           mkdir -p dist/staging/payload dist/fedora dist/fedora/smoke-screenshots
           tar -xzf dist/staged-payload.tar.gz -C dist/staging/payload
           HOST_SDE="$(git log -1 --format=%ct HEAD)"
+          VERSION="$(./scripts/release-meta.sh --print-env | sed -n 's/^AWCC_VERSION=//p')"
           docker run --rm \
             -e AWCC_GIT_SHA="${GITHUB_SHA}" \
+            -e AWCC_VERSION="${VERSION}" \
             -e SOURCE_DATE_EPOCH="${HOST_SDE}" \
             -v "${PWD}:/work:rw" \
             fedora:41 \
@@ -249,6 +259,11 @@ jobs:
                 --gui /usr/bin/awcc-gui \
                 --database /etc/awcc/database.json \
                 --label rpm-fedora41 \
+                --expect-package-format rpm \
+                --expect-version ${AWCC_VERSION} \
+                --expect-commit ${AWCC_GIT_SHA} \
+                --expect-target x86_64-unknown-linux-gnu \
+                --expect-dirty false \
                 --screenshot-dir /work/dist/fedora/smoke-screenshots"
             '
           sudo chown -R "$(id -u):$(id -g)" dist/fedora
@@ -294,8 +309,10 @@ jobs:
             exit 1
           fi
           HOST_SDE="$(git log -1 --format=%ct HEAD)"
+          VERSION="$(./scripts/release-meta.sh --print-env | sed -n 's/^AWCC_VERSION=//p')"
           docker run --rm \
             -e AWCC_GIT_SHA="${GITHUB_SHA}" \
+            -e AWCC_VERSION="${VERSION}" \
             -e SOURCE_DATE_EPOCH="${HOST_SDE}" \
             -v "${PWD}:/work:rw" \
             archlinux:base-devel \
@@ -319,6 +336,11 @@ jobs:
                 --gui /usr/bin/awcc-gui \
                 --database /etc/awcc/database.json \
                 --label archlinux \
+                --expect-package-format arch \
+                --expect-version ${VERSION} \
+                --expect-commit ${GITHUB_SHA} \
+                --expect-target x86_64-unknown-linux-gnu \
+                --expect-dirty false \
                 --screenshot-dir /work/dist/arch/smoke-screenshots'
             "
           sudo chown -R "$(id -u):$(id -g)" dist/arch

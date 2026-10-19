@@ -73,10 +73,49 @@ done < <(find "${DIST_DIR}" -maxdepth 1 -type f -print0)
 # Ensure AppImage has executable permission
 chmod 0755 "${DIST_DIR}/${AWCC_APPIMAGE_NAME}"
 
+# The shipped binaries must carry the identity this manifest is about. Extract the release tarball
+# and ask both executables (in a bare environment) what they were built from; a stale cached
+# build, or a dirty tree in a tagged release, fails here instead of being published.
+VERIFY_TMP="$(mktemp -d "${TMPDIR:-/tmp}/awcc-rs-manifest-verify-XXXXXX")"
+trap 'rm -rf "${VERIFY_TMP}"' EXIT
+tar -xzf "${DIST_DIR}/${AWCC_TARBALL_NAME}" -C "${VERIFY_TMP}"
+PAYLOAD_ROOT="${VERIFY_TMP}/${AWCC_TARBALL_BASENAME}"
+CLI_VERSION_OUT="$(binary_version_output "${PAYLOAD_ROOT}/bin/awcc-cli")"
+GUI_VERSION_OUT="$(binary_version_output "${PAYLOAD_ROOT}/bin/awcc-gui")"
+for key in version commit commit-source dirty source-date-epoch target profile rustc; do
+    if [[ "$(version_field "${CLI_VERSION_OUT}" "${key}")" != "$(version_field "${GUI_VERSION_OUT}" "${key}")" ]]; then
+        echo "ERROR: awcc-cli and awcc-gui in ${AWCC_TARBALL_NAME} disagree on ${key}" >&2
+        exit 1
+    fi
+done
+# The compiler that actually built the binaries is authoritative for the manifest; this job may
+# resolve a different `rustc` than the build job did.
+BINARY_RUSTC="$(version_field "${CLI_VERSION_OUT}" rustc)"
+if [[ -n "${BINARY_RUSTC}" && "${BINARY_RUSTC}" != "unknown" ]]; then
+    AWCC_RUSTC_VERSION="${BINARY_RUSTC}"
+fi
+# The dirty state describes the build, not this job's checkout.
+AWCC_GIT_DIRTY="unknown"
+case "$(version_field "${CLI_VERSION_OUT}" dirty)" in
+    false) AWCC_GIT_DIRTY="0" ;;
+    true) AWCC_GIT_DIRTY="1" ;;
+esac
+for bin in awcc-cli awcc-gui; do
+    assert_binary_identity "${PAYLOAD_ROOT}/bin/${bin}" "${AWCC_TARBALL_NAME}:${bin}"
+done
+BINARY_DIRTY="$(version_field "${CLI_VERSION_OUT}" dirty)"
+BINARY_COMMIT_SOURCE="$(version_field "${CLI_VERSION_OUT}" commit-source)"
+if [[ -n "${RELEASE_TAG}" && "${BINARY_DIRTY}" != "false" ]]; then
+    echo "ERROR: release ${RELEASE_TAG} binaries report dirty='${BINARY_DIRTY}'; releases must be built from a clean checkout of the tagged commit." >&2
+    exit 1
+fi
+echo "==> Binary identity verified: commit ${AWCC_GIT_SHA} (source: ${BINARY_COMMIT_SOURCE}), dirty=${BINARY_DIRTY}, ${AWCC_RUSTC_VERSION}"
+
 # Generate build-manifest.json
 MANIFEST_PATH="${DIST_DIR}/build-manifest.json"
 python3 - "${DIST_DIR}" "${MANIFEST_PATH}" "${AWCC_VERSION}" "${RELEASE_TAG:-v${AWCC_VERSION}}" \
     "${AWCC_GIT_SHA}" "${AWCC_SOURCE_DATE_EPOCH}" "${AWCC_TARGET}" "${AWCC_RUSTC_VERSION}" \
+    "${BINARY_DIRTY}" "${BINARY_COMMIT_SOURCE}" \
     "${EXPECTED_DISTRIBUTABLES[@]}" <<'PY'
 import hashlib, json, os, sys
 
@@ -88,7 +127,9 @@ git_sha = sys.argv[5]
 source_date_epoch = int(sys.argv[6])
 target = sys.argv[7]
 rustc_ver = sys.argv[8]
-assets = sys.argv[9:]
+git_dirty = sys.argv[9]
+commit_source = sys.argv[10]
+assets = sys.argv[11:]
 
 asset_entries = []
 for name in assets:
@@ -107,6 +148,8 @@ manifest = {
     "version": version,
     "tag": tag,
     "git_commit": git_sha,
+    "git_commit_source": commit_source,
+    "git_dirty": git_dirty,
     "source_date_epoch": source_date_epoch,
     "target_triple": target,
     "rustc_version": rustc_ver,

@@ -11,6 +11,11 @@ EXPECT_DB_SUBSTRING=""
 LABEL="local"
 SCREENSHOT_DIR=""
 APPRUN_BIN=""
+EXPECT_PACKAGE_FORMAT=""
+EXPECT_VERSION=""
+EXPECT_COMMIT=""
+EXPECT_TARGET=""
+EXPECT_DIRTY=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -42,9 +47,29 @@ while [[ $# -gt 0 ]]; do
             APPRUN_BIN="$2"
             shift 2
             ;;
+        --expect-package-format)
+            EXPECT_PACKAGE_FORMAT="$2"
+            shift 2
+            ;;
+        --expect-version)
+            EXPECT_VERSION="$2"
+            shift 2
+            ;;
+        --expect-commit)
+            EXPECT_COMMIT="$2"
+            shift 2
+            ;;
+        --expect-target)
+            EXPECT_TARGET="$2"
+            shift 2
+            ;;
+        --expect-dirty)
+            EXPECT_DIRTY="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 --cli <path> --gui <path> [--database <path>] [--expect-db-source <str>] [--label <name>] [--screenshot-dir <dir>] [--apprun <path>]" >&2
+            echo "Usage: $0 --cli <path> --gui <path> [--database <path>] [--expect-db-source <str>] [--label <name>] [--screenshot-dir <dir>] [--apprun <path>] [--expect-package-format <fmt>] [--expect-version <v>] [--expect-commit <sha>] [--expect-target <triple>] [--expect-dirty <true|false>]" >&2
             exit 1
             ;;
     esac
@@ -104,6 +129,54 @@ run_isolated() {
         fi
     )
 }
+
+# --version must work without hardware, a display, a state directory, or a usable database, and
+# both binaries must report the same shared build identity (and the package's declared format).
+# `env -i` with an empty PATH and a missing database file is the tripwire: any attempt to resolve
+# a profile, reach a transport, or open a window would fail here.
+bare_version() {
+    (
+        cd "${ISOLATED_CWD}"
+        env -i PATH="" HOME="/nonexistent-awcc-home" XDG_STATE_HOME="/nonexistent-awcc-state" \
+            AWCC_DATABASE_PATH="${WORK_TMP}/definitely-missing-database.json" "$@" --version
+    )
+}
+version_field() {
+    printf '%s\n' "$1" | sed -n "s/^$2: //p" | head -n 1
+}
+
+echo "==> [${LABEL}] Verifying --version of both binaries (shared identity, no hardware needed)..."
+CLI_VERSION_OUT="$(bare_version "${CLI_BIN}")"
+GUI_VERSION_OUT="$(bare_version "${GUI_BIN}")"
+grep -q "^awcc-cli " <<<"${CLI_VERSION_OUT}"
+grep -q "^awcc-gui " <<<"${GUI_VERSION_OUT}"
+for key in version commit commit-source dirty source-date-epoch target profile rustc package-format; do
+    cli_val="$(version_field "${CLI_VERSION_OUT}" "${key}")"
+    gui_val="$(version_field "${GUI_VERSION_OUT}" "${key}")"
+    if [[ -z "${cli_val}" || -z "${gui_val}" ]]; then
+        echo "ERROR: [${LABEL}] --version output is missing '${key}'" >&2
+        exit 1
+    fi
+    if [[ "${cli_val}" != "${gui_val}" ]]; then
+        echo "ERROR: [${LABEL}] awcc-cli and awcc-gui disagree on ${key}: '${cli_val}' vs '${gui_val}'" >&2
+        exit 1
+    fi
+done
+expect_field() {
+    local key="$1" want="$2" got
+    [[ -z "${want}" ]] && return 0
+    got="$(version_field "${CLI_VERSION_OUT}" "${key}")"
+    if [[ "${got}" != "${want}" ]]; then
+        echo "ERROR: [${LABEL}] --version reports ${key} '${got}', expected '${want}'" >&2
+        exit 1
+    fi
+}
+expect_field version "${EXPECT_VERSION}"
+expect_field commit "${EXPECT_COMMIT}"
+expect_field target "${EXPECT_TARGET}"
+expect_field dirty "${EXPECT_DIRTY}"
+expect_field package-format "${EXPECT_PACKAGE_FORMAT}"
+echo "    $(head -n 1 <<<"${CLI_VERSION_OUT}") [package-format: $(version_field "${CLI_VERSION_OUT}" package-format)]"
 
 echo "==> [${LABEL}] Running isolated CLI smoke tests in ${ISOLATED_CWD}..."
 HELP_OUT="$(run_isolated "${CLI_BIN}" --help)"
@@ -216,6 +289,24 @@ if [[ -n "${APPRUN_BIN}" ]]; then
     set -e
     if [[ "${APPRUN_ERR_RC}" -eq 0 ]]; then
         echo "ERROR: AppRun failed to forward non-zero exit code from awcc-cli" >&2
+        exit 1
+    fi
+
+    # AppRun is a shell script and needs `dirname`/`basename`, so it gets a minimal PATH.
+    APPRUN_CLI_VERSION="$(
+        cd "${ISOLATED_CWD}"
+        env -i PATH="/usr/bin:/bin" HOME="${ISOLATED_HOME}" AWCC_DATABASE_PATH="${WORK_TMP}/definitely-missing-database.json" \
+            "${APPRUN_BIN}" --cli --version
+    )"
+    grep -q "^awcc-cli " <<<"${APPRUN_CLI_VERSION}"
+    APPRUN_GUI_VERSION="$(
+        cd "${ISOLATED_CWD}"
+        env -i PATH="/usr/bin:/bin" HOME="${ISOLATED_HOME}" AWCC_DATABASE_PATH="${WORK_TMP}/definitely-missing-database.json" \
+            "${APPRUN_BIN}" --version
+    )"
+    grep -q "^awcc-gui " <<<"${APPRUN_GUI_VERSION}"
+    if [[ "$(version_field "${APPRUN_CLI_VERSION}" commit)" != "$(version_field "${APPRUN_GUI_VERSION}" commit)" ]]; then
+        echo "ERROR: [${LABEL}] AppRun CLI and GUI report different commits" >&2
         exit 1
     fi
 

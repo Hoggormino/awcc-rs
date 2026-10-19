@@ -52,6 +52,8 @@ install -m 0755 "%{staged_root}/bin/awcc-cli" "%{buildroot}%{_bindir}/awcc-cli"
 install -m 0755 "%{staged_root}/bin/awcc-gui" "%{buildroot}%{_bindir}/awcc-gui"
 install -m 0644 "%{staged_root}/share/awcc/database.json" "%{buildroot}%{_sysconfdir}/awcc/database.json"
 install -m 0644 "%{staged_root}/share/awcc/database.json" "%{buildroot}%{_datadir}/awcc/database.json"
+printf 'rpm\n' > "%{buildroot}%{_datadir}/awcc/package-format"
+chmod 0644 "%{buildroot}%{_datadir}/awcc/package-format"
 install -m 0644 "%{staged_root}/share/applications/awcc-gui.desktop" "%{buildroot}%{_datadir}/applications/awcc-gui.desktop"
 install -m 0644 "%{staged_root}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "%{buildroot}%{_datadir}/icons/hicolor/scalable/apps/awcc-gui.svg"
 install -m 0644 "%{staged_root}/share/icons/hicolor/256x256/apps/awcc-gui.png" "%{buildroot}%{_datadir}/icons/hicolor/256x256/apps/awcc-gui.png"
@@ -68,6 +70,7 @@ install -m 0644 "%{staged_root}/share/doc/awcc-rs/INSTALL.txt" "%{buildroot}%{_d
 %config(noreplace) %{_sysconfdir}/awcc/database.json
 %dir %{_datadir}/awcc
 %{_datadir}/awcc/database.json
+%{_datadir}/awcc/package-format
 %{_datadir}/applications/awcc-gui.desktop
 %{_datadir}/icons/hicolor/scalable/apps/awcc-gui.svg
 %{_datadir}/icons/hicolor/256x256/apps/awcc-gui.png

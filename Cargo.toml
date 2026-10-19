@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/awcc-build-info",
     "crates/awcc-core",
     "crates/awcc-platform",
     "crates/awcc-service",
@@ -18,6 +19,7 @@ repository = "https://github.com/Hoggormino/awcc-rs"
 description = "Unofficial Alienware Command Center for Linux (Rust + Slint Material 3)"
 
 [workspace.dependencies]
+awcc-build-info = { path = "crates/awcc-build-info" }
 awcc-core = { path = "crates/awcc-core" }
 awcc-platform = { path = "crates/awcc-platform" }
 awcc-service = { path = "crates/awcc-service" }

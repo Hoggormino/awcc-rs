@@ -68,19 +68,22 @@ export component MainWindow inherits MaterialWindow {
     in property <string> pre-gmode-restore-label: "Balanced";
 
     // Telemetry properties
-    in property <string> cpu-temp-text: "58°C";
-    in property <string> gpu-temp-text: "53°C";
-    in property <string> cpu-rpm-text: "2552 RPM";
-    in property <string> gpu-rpm-text: "2292 RPM";
-    in property <string> cpu-boost-text: "28%";
-    in property <string> gpu-boost-text: "24%";
-    in property <float> cpu-boost-progress: 0.28;
-    in property <float> gpu-boost-progress: 0.24;
-    in property <bool> sensors-available: true;
-    in-out property <bool> cpu-turbo-enabled: true;
+    in property <string> cpu-temp-text: "--";
+    in property <string> gpu-temp-text: "--";
+    in property <string> cpu-rpm-text: "--";
+    in property <string> gpu-rpm-text: "--";
+    in property <string> cpu-boost-text: "--";
+    in property <string> gpu-boost-text: "--";
+    in property <float> cpu-boost-progress: 0;
+    in property <float> gpu-boost-progress: 0;
+    in property <bool> sensors-available: false;
+    in-out property <bool> cpu-turbo-enabled: false;
+    // `false` until a turbo query succeeded: the switch is disabled and `cpu-turbo-note` says why.
+    in property <bool> cpu-turbo-known: false;
+    in property <string> cpu-turbo-note: "state not yet observed";
 
     // CPU TCC Offset (0..15°C reduction from TjMax)
-    in property <string> tcc-offset-text: "0°C";
+    in property <string> tcc-offset-text: "--";
     in-out property <float> staged-tcc-offset: 0;
     in-out property <bool> tcc-dirty: false;
 
@@ -106,12 +109,15 @@ export component MainWindow inherits MaterialWindow {
     in-out property <float> staged-lighting-brightness: 100;
     in-out property <bool> staged-lighting-persist-boot: true;
     in-out property <bool> lighting-stealth-enabled: false;
-    in property <string> active-lighting-summary: "All Zones · Static · Brightness 100% · Saved as Boot Default";
+    in property <string> active-lighting-summary: "Lighting state not yet reported";
     in property <color> zone-logo-color: #00f0ff;
     in property <color> zone-tron-color: #00f0ff;
     in property <color> zone-kbd-color: #00f0ff;
     in property <color> zone-power-color: #00f0ff;
-    in property <string> elc-firmware-summary: "ELC 187c:0550 · FW 2.0.5 · Platform 0x0F01 (8 Active Zones, 7 Stored Animations)";
+    in property <string> elc-firmware-summary: "ELC controller diagnostics: not yet observed";
+    // Why any telemetry value is unavailable or stale (empty when every reading is current).
+    in property <string> telemetry-notice: "";
+    in property <string> build-summary: "";
 
     // Hardware Command Log (virtualized via ListView)
     in property <[AuditRow]> audit-rows: [];
@@ -225,7 +231,7 @@ export component MainWindow inherits MaterialWindow {
                                 height: 100%;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
-                                text: root.is-simulated ? "SIMULATED HW" : "HARDWARE LIVE";
+                                text: root.is-simulated ? "SIMULATED HW" : "LIVE BACKEND";
                                 style: MaterialTypography.label_medium_prominent;
                                 color: root.is-simulated ? MaterialPalette.on_tertiary_container : MaterialPalette.on_primary_container;
                             }
@@ -583,16 +589,19 @@ export component MainWindow inherits MaterialWindow {
                                 alignment: space-between;
 
                                 MaterialText {
+                                    horizontal-stretch: 1;
                                     vertical-alignment: center;
-                                    text: "CPU Turbo Boost";
+                                    text: root.cpu-turbo-note == "" ? "CPU Turbo Boost" : "CPU Turbo Boost — \{root.cpu-turbo-note}";
                                     style: MaterialTypography.body_small;
-                                    color: MaterialPalette.on_surface_variant;
+                                    color: root.cpu-turbo-known ? MaterialPalette.on_surface_variant : MaterialPalette.error;
+                                    overflow: elide;
                                 }
 
                                 Switch {
                                     width: 52px;
                                     height: 32px;
                                     y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                    enabled: root.cpu-turbo-known;
                                     checked <=> root.cpu-turbo-enabled;
                                     checked_state_changed(enabled) => {
                                         root.toggle-cpu-turbo(enabled);
@@ -1706,6 +1715,18 @@ export component MainWindow inherits MaterialWindow {
                             text: root.elc-firmware-summary;
                             style: MaterialTypography.body_small;
                             color: MaterialPalette.primary;
+                        }
+
+                        if root.telemetry-notice != "" : MaterialText {
+                            text: root.telemetry-notice;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.error;
+                        }
+
+                        if root.build-summary != "" : MaterialText {
+                            text: root.build-summary;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.on_surface_variant;
                         }
                     }
                 }

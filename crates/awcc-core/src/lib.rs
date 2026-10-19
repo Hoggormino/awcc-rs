@@ -758,9 +758,12 @@ pub enum SensorReading<T> {
     Unavailable {
         reason: String,
     },
+    /// A previous valid reading kept because the latest query failed. `age_secs` is the age of
+    /// `last_value` when the snapshot was taken; `reason` is the error from the failed query.
     Stale {
         last_value: T,
         unit: &'static str,
+        age_secs: u64,
         reason: String,
     },
 }
@@ -772,8 +775,11 @@ impl<T: fmt::Display + Copy> SensorReading<T> {
             Self::Valid { value, unit } => format!("{value}{unit}"),
             Self::Unavailable { .. } => "--".to_string(),
             Self::Stale {
-                last_value, unit, ..
-            } => format!("{last_value}{unit} (stale)"),
+                last_value,
+                unit,
+                age_secs,
+                ..
+            } => format!("{last_value}{unit} (stale {age_secs}s)"),
         }
     }
 
@@ -790,6 +796,103 @@ impl<T: fmt::Display + Copy> SensorReading<T> {
             Self::Unavailable { .. } => fallback,
         }
     }
+
+    /// The value only when it was read successfully by the latest query (never a stale or
+    /// missing one). Use this for decisions and for confirming a write.
+    #[must_use]
+    pub const fn fresh_value(&self) -> Option<T> {
+        match self {
+            Self::Valid { value, .. } => Some(*value),
+            Self::Stale { .. } | Self::Unavailable { .. } => None,
+        }
+    }
+
+    /// The error context of a failed query (unavailable or stale), if any.
+    #[must_use]
+    pub fn problem(&self) -> Option<&str> {
+        match self {
+            Self::Valid { .. } => None,
+            Self::Unavailable { reason } | Self::Stale { reason, .. } => Some(reason),
+        }
+    }
+}
+
+/// State that is not a numeric sensor: a boolean latch, a firmware report, and so on.
+///
+/// Distinguishes a value that has never been observed, one whose latest query failed, and a
+/// last-known value that is explicitly stale. A failed query must never be rendered as a valid
+/// `false`/`off`, and a missing diagnostic must never be replaced by a plausible default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum Observation<T> {
+    /// No query has been attempted yet.
+    NotObserved,
+    /// The latest query succeeded.
+    Observed(T),
+    /// The latest query failed and no earlier value exists.
+    Unavailable { reason: String },
+    /// The latest query failed; `last_value` is from `age_secs` seconds earlier.
+    Stale {
+        last_value: T,
+        age_secs: u64,
+        reason: String,
+    },
+}
+
+impl<T> Observation<T> {
+    /// The value only when the latest query succeeded.
+    #[must_use]
+    pub const fn fresh(&self) -> Option<&T> {
+        match self {
+            Self::Observed(value) => Some(value),
+            Self::NotObserved | Self::Unavailable { .. } | Self::Stale { .. } => None,
+        }
+    }
+
+    /// The best-known value, including an explicitly stale one.
+    #[must_use]
+    pub const fn best_known(&self) -> Option<&T> {
+        match self {
+            Self::Observed(value) => Some(value),
+            Self::Stale { last_value, .. } => Some(last_value),
+            Self::NotObserved | Self::Unavailable { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_observed(&self) -> bool {
+        matches!(self, Self::Observed(_))
+    }
+
+    #[must_use]
+    pub const fn is_stale(&self) -> bool {
+        matches!(self, Self::Stale { .. })
+    }
+
+    /// The error context of a failed query (unavailable or stale), if any.
+    #[must_use]
+    pub fn problem(&self) -> Option<&str> {
+        match self {
+            Self::Unavailable { reason } | Self::Stale { reason, .. } => Some(reason),
+            Self::Observed(_) | Self::NotObserved => None,
+        }
+    }
+}
+
+impl<T: Copy> Observation<T> {
+    /// Label such as `on`, `unavailable (reason)`, or `off (stale 12s)` for a boolean-like value.
+    #[must_use]
+    pub fn describe_with(&self, render: impl Fn(T) -> String) -> String {
+        match self {
+            Self::Observed(value) => render(*value),
+            Self::NotObserved => "not yet observed".to_string(),
+            Self::Unavailable { reason } => format!("unavailable ({reason})"),
+            Self::Stale {
+                last_value,
+                age_secs,
+                reason,
+            } => format!("{} (stale {age_secs}s: {reason})", render(*last_value)),
+        }
+    }
 }
 
 /// Snapshot of CPU & GPU thermal/fan telemetry.
@@ -804,11 +907,25 @@ pub struct TelemetrySnapshot {
 }
 
 /// Lifecycle state of the most recent user-initiated control action.
+///
+/// The states are ordered by how much is actually known about the device:
+///
+/// * `Requested` — the request was queued by a client; nothing has executed yet.
+/// * `Pending` — the service started executing the request; no transport result yet.
+/// * `Accepted` — the transport reported that the write was delivered/accepted (ACPI return code
+///   success, or a USB OUT transfer that completed in full), but the applied device state is
+///   **not** confirmed. `caveat` says why (no readback exists, readback unavailable, device
+///   acknowledgement missing, ...).
+/// * `Confirmed` — accepted **and** an independent readback taken after the write matched the
+///   requested value.
+/// * `RolledBack` — a multi-step operation failed part-way and the earlier step was undone.
+/// * `Failed` — the operation did not take effect, or the readback contradicts it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationLifecycle {
     Idle,
     Requested { description: String },
     Pending { description: String },
+    Accepted { summary: String, caveat: String },
     Confirmed { summary: String },
     RolledBack { summary: String, reason: String },
     Failed { summary: String, error: String },
@@ -821,6 +938,7 @@ impl OperationLifecycle {
             Self::Idle => "READY",
             Self::Requested { .. } => "REQUESTED",
             Self::Pending { .. } => "APPLYING",
+            Self::Accepted { .. } => "ACCEPTED",
             Self::Confirmed { .. } => "CONFIRMED",
             Self::RolledBack { .. } => "ROLLED BACK",
             Self::Failed { .. } => "FAILED",
@@ -832,6 +950,7 @@ impl OperationLifecycle {
         match self {
             Self::Idle => "Passive observation active — 0 unsolicited hardware writes.".to_string(),
             Self::Requested { description } | Self::Pending { description } => description.clone(),
+            Self::Accepted { summary, caveat } => format!("{summary} — {caveat}"),
             Self::Confirmed { summary } => summary.clone(),
             Self::RolledBack { summary, reason } => format!("{summary} — {reason}"),
             Self::Failed { summary, error } => format!("{summary}: {error}"),
@@ -842,6 +961,72 @@ impl OperationLifecycle {
     pub const fn is_error_or_rollback(&self) -> bool {
         matches!(self, Self::RolledBack { .. } | Self::Failed { .. })
     }
+
+    /// Map a terminal lifecycle onto the shared result contract used by the CLI and GUI.
+    ///
+    /// `Accepted` and `Confirmed` are successes (with different strength); `Failed` and
+    /// `RolledBack` are errors. A lifecycle that is still `Idle`/`Requested`/`Pending` is *not* a
+    /// success: it means no outcome was recorded for the operation, so reporting success would be
+    /// an unsupported claim.
+    pub fn into_result(self) -> Result<OperationSuccess, OperationError> {
+        match self {
+            Self::Confirmed { summary } => Ok(OperationSuccess {
+                summary,
+                strength: SuccessStrength::Confirmed,
+            }),
+            Self::Accepted { summary, caveat } => Ok(OperationSuccess {
+                summary,
+                strength: SuccessStrength::Accepted { caveat },
+            }),
+            Self::Failed { summary, error } => Err(OperationError::Failed { summary, error }),
+            Self::RolledBack { summary, reason } => {
+                Err(OperationError::RolledBack { summary, reason })
+            }
+            other @ (Self::Idle | Self::Requested { .. } | Self::Pending { .. }) => {
+                Err(OperationError::NoOutcome {
+                    state: other.badge_label(),
+                })
+            }
+        }
+    }
+}
+
+/// How strongly a successful operation is established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuccessStrength {
+    /// Accepted and the post-write readback matched the request.
+    Confirmed,
+    /// Accepted by the transport; the applied state is not confirmed (see `caveat`).
+    Accepted { caveat: String },
+}
+
+/// A successful operation outcome (`Accepted` or `Confirmed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationSuccess {
+    pub summary: String,
+    pub strength: SuccessStrength,
+}
+
+impl OperationSuccess {
+    /// Caveat to show alongside the summary when the result is not device-confirmed.
+    #[must_use]
+    pub fn caveat(&self) -> Option<&str> {
+        match &self.strength {
+            SuccessStrength::Confirmed => None,
+            SuccessStrength::Accepted { caveat } => Some(caveat),
+        }
+    }
+}
+
+/// A failed operation outcome. Always maps to a non-zero CLI exit status.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OperationError {
+    #[error("{summary}: {error}")]
+    Failed { summary: String, error: String },
+    #[error("{summary}: {reason}")]
+    RolledBack { summary: String, reason: String },
+    #[error("no outcome was recorded for the requested operation (lifecycle state: {state})")]
+    NoOutcome { state: &'static str },
 }
 
 /// Deterministic simulation scenario selectable in the prototype UI and CLI.

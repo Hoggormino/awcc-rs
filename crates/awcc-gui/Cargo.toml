@@ -10,6 +10,7 @@ description.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+awcc-build-info.workspace = true
 awcc-core.workspace = true
 awcc-platform.workspace = true
 awcc-service.workspace = true

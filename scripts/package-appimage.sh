@@ -92,6 +92,8 @@ ln -sf "awcc-gui.png" "${APPDIR}/.DirIcon"
 install -m 0755 "${STAGED_DIR}/bin/awcc-cli" "${APPDIR}/usr/bin/awcc-cli"
 install -m 0755 "${STAGED_DIR}/bin/awcc-gui" "${APPDIR}/usr/bin/awcc-gui"
 install -m 0644 "${STAGED_DIR}/share/awcc/database.json" "${APPDIR}/usr/share/awcc/database.json"
+printf 'appimage\n' > "${APPDIR}/usr/share/awcc/package-format"
+chmod 0644 "${APPDIR}/usr/share/awcc/package-format"
 install -m 0644 "${STAGED_DIR}/share/applications/awcc-gui.desktop" "${APPDIR}/usr/share/applications/awcc-gui.desktop"
 install -m 0644 "${STAGED_DIR}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "${APPDIR}/usr/share/icons/hicolor/scalable/apps/awcc-gui.svg"
 install -m 0644 "${STAGED_DIR}/share/icons/hicolor/256x256/apps/awcc-gui.png" "${APPDIR}/usr/share/icons/hicolor/256x256/apps/awcc-gui.png"
@@ -199,6 +201,7 @@ for req_file in \
     ".DirIcon" \
     "usr/lib/libusb-1.0.so.0" \
     "usr/share/awcc/database.json" \
+    "usr/share/awcc/package-format" \
     "usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" \
     "usr/share/licenses/awcc-rs/LICENSE" \
     "usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md"; do
@@ -217,7 +220,9 @@ for forbidden in libc.so.6 libm.so.6 libgcc_s.so.1 libGL.so.1 libEGL.so.1 libway
 done
 
 if [[ "${RUN_SMOKE}" -eq 1 ]]; then
+    mapfile -t IDENTITY_ARGS < <(smoke_identity_args appimage)
     "${SCRIPT_DIR}/smoke-test-installed.sh" \
+        "${IDENTITY_ARGS[@]}" \
         --cli "${SQUASH_ROOT}/usr/bin/awcc-cli" \
         --gui "${SQUASH_ROOT}/usr/bin/awcc-gui" \
         --database "${SQUASH_ROOT}/usr/share/awcc/database.json" \
