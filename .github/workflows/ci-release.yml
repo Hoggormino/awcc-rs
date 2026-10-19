@@ -229,7 +229,7 @@ jobs:
             -v "${PWD}:/work:rw" \
             fedora:41 \
             bash -euxo pipefail -c '
-              dnf install -y --setopt=install_weak_deps=False rpm-build python3 findutils shadow-utils
+              dnf install -y --setopt=install_weak_deps=False rpm-build python3 findutils shadow-utils util-linux
               cd /work
               ./scripts/package-rpm.sh --staged-dir /work/dist/staging/payload --out-dir /work/dist/fedora
               dnf install -y --setopt=install_weak_deps=False /work/dist/fedora/awcc-rs-*.x86_64.rpm
