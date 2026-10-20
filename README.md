@@ -45,12 +45,27 @@ cargo test --workspace --all-features --locked
 ## Running the GUI (`awcc-gui`) & CLI (`awcc-cli`)
 
 ### 1. Launch the Desktop GUI (`awcc-gui`)
+
+For a first launch without accessing a device, run:
+
+```bash
+./scripts/run-sim.sh
+```
+
+The launcher builds with the pinned toolchain and lockfile, then opens the native
+Slint application against the in-memory simulator. It works from any current
+directory and forwards GUI options, for example:
+
+```bash
+/path/to/awcc-rs/scripts/run-sim.sh --screenshot /tmp/awcc-preview.png --scenario lighting
+```
+
 ```bash
 # Auto-detect live Alienware hardware (or pass --sim for simulation mode)
 cargo run -p awcc-gui
 
 # Explicitly run in Simulated Hardware Mode (Alienware m15 R6 · \_SB.AMWW.WMAX)
-cargo run -p awcc-gui -- --sim
+cargo run -p awcc-gui --locked -- --sim
 ```
 
 ### 2. Run CLI Commands & Passive Diagnostics (`awcc-cli`)
