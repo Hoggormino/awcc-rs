@@ -249,10 +249,13 @@ export function findMissingFields(formType, sections, rawBody) {
   return missing;
 }
 
+export const MAX_INTAKE_EVENT_PAGES = 5;
+export const MAX_INTAKE_COMMENT_LOOKUP_PAGES = 20;
+
 export function buildMissingInfoComment(missingFields) {
   const bullets = missingFields.map((item) => `- ${item}`).join("\n");
   return `${BOT_COMMENT_MARKER}
-Thanks for opening this issue. To help maintainers investigate without guesswork, please edit the issue description (or reply) with the following missing information:
+Thanks for opening this issue. To help maintainers investigate without guesswork, please **edit the issue description** to add the following missing information (editing the issue description triggers automatic re-evaluation to clear \`needs-info\`; comment replies are also read by maintainers during manual review):
 
 ${bullets}
 
@@ -308,6 +311,7 @@ export function evaluateIssueIntake({
   payload,
   existingComments = [],
   issueEvents = [],
+  commentsTruncated = false,
 }) {
   const action = payload?.action || "";
   const issue = payload?.issue;
@@ -318,6 +322,7 @@ export function evaluateIssueIntake({
       labelsToAdd: [],
       labelsToRemove: [],
       commentAction: null,
+      commentLookupIncomplete: false,
     };
   }
 
@@ -328,6 +333,7 @@ export function evaluateIssueIntake({
       labelsToAdd: [],
       labelsToRemove: [],
       commentAction: null,
+      commentLookupIncomplete: false,
     };
   }
 
@@ -338,6 +344,7 @@ export function evaluateIssueIntake({
       labelsToAdd: [],
       labelsToRemove: [],
       commentAction: null,
+      commentLookupIncomplete: false,
     };
   }
 
@@ -348,6 +355,7 @@ export function evaluateIssueIntake({
       labelsToAdd: [],
       labelsToRemove: [],
       commentAction: null,
+      commentLookupIncomplete: false,
     };
   }
 
@@ -415,6 +423,7 @@ export function evaluateIssueIntake({
   }
 
   let commentAction = null;
+  let commentLookupIncomplete = false;
 
   if (missingFields.length > 0) {
     // Only request missing info if the issue has not already been triaged by a maintainer.
@@ -429,6 +438,8 @@ export function evaluateIssueIntake({
             body: desiredBody,
           };
         }
+      } else if (commentsTruncated) {
+        commentLookupIncomplete = true;
       } else {
         commentAction = {
           type: "create",
@@ -438,16 +449,20 @@ export function evaluateIssueIntake({
     }
   } else {
     // Report has all required fields for its form!
-    if (
-      currentLabels.has("needs-info") &&
-      !humanAddedNeedsInfo &&
-      !maintainerTriaged
-    ) {
-      labelsToRemove.push("needs-info");
-    }
-    if (existingBotComment) {
+    // Only clear `needs-info` and update the bot comment to say `needs-info` was removed
+    // when neither a maintainer triage decision nor a human-applied `needs-info` label
+    // is active, and when `needs-info` was actually removed or already absent after a
+    // bot-owned missing-info request.
+    const canClearBotNeedsInfo = !humanAddedNeedsInfo && !maintainerTriaged;
+    if (canClearBotNeedsInfo) {
+      const hadNeedsInfo = currentLabels.has("needs-info");
+      if (hadNeedsInfo) {
+        labelsToRemove.push("needs-info");
+      }
       const resolvedBody = buildResolvedInfoComment();
-      if (existingBotComment.body !== resolvedBody) {
+      const hadBotMissingInfoPrompt =
+        existingBotComment && existingBotComment.body !== resolvedBody;
+      if (existingBotComment && (hadNeedsInfo || hadBotMissingInfoPrompt)) {
         commentAction = {
           type: "update",
           commentId: existingBotComment.id,
@@ -466,23 +481,39 @@ export function evaluateIssueIntake({
     labelsToAdd,
     labelsToRemove,
     commentAction,
+    commentLookupIncomplete,
   };
 }
 
-async function listBoundedPages(fetchPage, maxPages = 5) {
+async function listBoundedPages(
+  fetchPage,
+  maxPages = MAX_INTAKE_EVENT_PAGES,
+  stopPredicate = null
+) {
   const items = [];
+  let hasMorePages = false;
   for (let page = 1; page <= maxPages; page += 1) {
     const res = await fetchPage(page);
     const data = Array.isArray(res?.data) ? res.data : [];
     items.push(...data);
+    if (stopPredicate && data.some(stopPredicate)) {
+      break;
+    }
     if (data.length < 100) {
       break;
     }
+    if (page === maxPages) {
+      hasMorePages = true;
+    }
   }
-  return items;
+  return { items, hasMorePages };
 }
 
-export async function runIssueIntake({ github, context }) {
+export async function runIssueIntake({
+  github,
+  context,
+  maxCommentLookupPages = MAX_INTAKE_COMMENT_LOOKUP_PAGES,
+}) {
   const payload = context.payload;
   const issue = payload?.issue;
   if (!issue || issue.pull_request || issue.state !== "open") {
@@ -493,31 +524,37 @@ export async function runIssueIntake({ github, context }) {
   const repo = context.repo.repo;
   const issue_number = issue.number;
 
-  const [existingComments, issueEvents] = await Promise.all([
-    listBoundedPages((page) =>
-      github.rest.issues.listComments({
-        owner,
-        repo,
-        issue_number,
-        per_page: 100,
-        page,
-      })
+  const [commentLookup, eventLookup] = await Promise.all([
+    listBoundedPages(
+      (page) =>
+        github.rest.issues.listComments({
+          owner,
+          repo,
+          issue_number,
+          per_page: 100,
+          page,
+        }),
+      maxCommentLookupPages,
+      isVerifiedBotComment
     ),
-    listBoundedPages((page) =>
-      github.rest.issues.listEventsForIssue({
-        owner,
-        repo,
-        issue_number,
-        per_page: 100,
-        page,
-      })
+    listBoundedPages(
+      (page) =>
+        github.rest.issues.listEventsForIssue({
+          owner,
+          repo,
+          issue_number,
+          per_page: 100,
+          page,
+        }),
+      MAX_INTAKE_EVENT_PAGES
     ),
   ]);
 
   const decision = evaluateIssueIntake({
     payload,
-    existingComments,
-    issueEvents,
+    existingComments: commentLookup.items,
+    issueEvents: eventLookup.items,
+    commentsTruncated: commentLookup.hasMorePages,
   });
 
   if (decision.skip) {

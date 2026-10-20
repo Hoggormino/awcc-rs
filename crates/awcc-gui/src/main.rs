@@ -747,6 +747,8 @@ fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_slide
 
     if needs_audit_rebuild {
         let redactor = Redactor::from_environment();
+        let include_raw_usb =
+            ui.get_trace_raw_usb() || global_diagnostics().is_some_and(|d| d.trace_raw_usb());
         let selected_seq = ui.get_selected_audit_seq();
         let mut refreshed_selected_detail: Option<String> = None;
 
@@ -757,7 +759,13 @@ fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_slide
             .map(|entry| {
                 let (command_str, outcome_str) =
                     format_log_entry(entry, Some(&snap.profile.code_table));
-                let detail_str = format_audit_detail(entry, &command_str, &outcome_str, &redactor);
+                let detail_str = format_audit_detail(
+                    entry,
+                    &command_str,
+                    &outcome_str,
+                    &redactor,
+                    include_raw_usb,
+                );
                 let seq_num = i32::try_from(entry.sequence).unwrap_or(i32::MAX);
                 if selected_seq > 0 && seq_num == selected_seq {
                     refreshed_selected_detail = Some(detail_str.clone());
@@ -786,12 +794,16 @@ fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_slide
 }
 
 /// Format the full, copyable detail string for a single `WriteAuditEntry` (redacting PII).
+///
+/// Raw USB 33-byte response frames (`raw_usb_in=[...]`) are only included when `include_raw_usb`
+/// is explicitly opted in (`--trace-raw-usb` / `AWCC_TRACE_RAW_USB=1`).
 #[must_use]
 pub fn format_audit_detail(
     entry: &WriteAuditEntry,
     decoded_command: &str,
     decoded_outcome: &str,
     redactor: &Redactor,
+    include_raw_usb: bool,
 ) -> String {
     let op_str = entry
         .op_id
@@ -799,9 +811,9 @@ pub fn format_audit_detail(
     let raw_cmd = redactor.redact_text(&entry.command);
     let raw_outcome = redactor.redact_text(&entry.outcome);
     let ack_desc = redactor.redact_text(&entry.ack.describe());
-    let raw_usb_suffix = match &entry.raw_usb_response_hex {
-        Some(hex) => format!(" | raw_usb_in=[{hex}]"),
-        None => String::new(),
+    let raw_usb_suffix = match (&entry.raw_usb_response_hex, include_raw_usb) {
+        (Some(hex), true) => format!(" | raw_usb_in=[{hex}]"),
+        _ => String::new(),
     };
     format!(
         "#{:02} ({op_str}) {decoded_command} -> {decoded_outcome} | raw=\"{raw_cmd}\" | outcome=\"{raw_outcome}\" | ack={ack_desc}{raw_usb_suffix}",
@@ -914,6 +926,99 @@ fn build_summary() -> &'static str {
     })
 }
 
+/// Abstraction over desktop clipboard writes so GUI copy actions perform real clipboard
+/// operations in desktop sessions and can be deterministically verified (including failure
+/// modes) in headless tests.
+pub trait ClipboardBackend: Send {
+    fn set_text(&mut self, text: &str) -> Result<(), String>;
+}
+
+/// Real Linux desktop clipboard provider (`wl-copy` under Wayland, `xclip` / `xsel` under X11).
+struct SystemClipboard;
+
+impl SystemClipboard {
+    fn try_command_with_stdin(program: &str, args: &[&str], text: &str) -> Result<(), String> {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("{program}: {e}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("{program} stdin write failed: {e}"))?;
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        return Ok(());
+                    }
+                    return Err(format!("{program} exited with {status}"));
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(format!("{program} wait failed: {e}")),
+            }
+        }
+    }
+}
+
+impl ClipboardBackend for SystemClipboard {
+    fn set_text(&mut self, text: &str) -> Result<(), String> {
+        let has_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+        let has_x11 = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty());
+
+        if !has_wayland && !has_x11 {
+            return Err("no WAYLAND_DISPLAY or DISPLAY session available".to_string());
+        }
+
+        let mut errors = Vec::new();
+        if has_wayland {
+            match Self::try_command_with_stdin("wl-copy", &[], text) {
+                Ok(()) => return Ok(()),
+                Err(e) => errors.push(e),
+            }
+        }
+        if has_x11 {
+            for (prog, args) in [
+                ("xclip", &["-selection", "clipboard", "-i"][..]),
+                ("xsel", &["--clipboard", "--input"][..]),
+            ] {
+                match Self::try_command_with_stdin(prog, args, text) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => errors.push(e),
+                }
+            }
+        }
+
+        Err(if errors.is_empty() {
+            "no desktop clipboard utility available".to_string()
+        } else {
+            errors.join("; ")
+        })
+    }
+}
+
+enum DiagJobResult {
+    Summary(Result<(String, Result<(), String>), String>),
+    Export {
+        out_path: PathBuf,
+        result: Result<u64, String>,
+    },
+}
+
 /// A user request that was queued but that the worker has not reported on yet.
 #[derive(Debug, Clone)]
 struct PendingRequest {
@@ -927,6 +1032,11 @@ struct UiOps {
     worker_failure_shown: bool,
     diagnostics: Arc<DiagnosticsRuntime>,
     export_output_override: Option<PathBuf>,
+    clipboard: Arc<std::sync::Mutex<Box<dyn ClipboardBackend>>>,
+    diagnostics_busy: bool,
+    diag_job_tx: std::sync::mpsc::Sender<DiagJobResult>,
+    diag_job_rx: std::sync::mpsc::Receiver<DiagJobResult>,
+    diag_job_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for UiOps {
@@ -939,17 +1049,76 @@ impl Default for UiOps {
             cfg.enable_stderr_console = false;
             DiagnosticsRuntime::new(cfg)
         });
+        let (diag_job_tx, diag_job_rx) = std::sync::mpsc::channel();
         Self {
             pending: None,
             worker_failure_shown: false,
             diagnostics,
             export_output_override: None,
+            clipboard: Arc::new(std::sync::Mutex::new(Box::new(SystemClipboard))),
+            diagnostics_busy: false,
+            diag_job_tx,
+            diag_job_rx,
+            diag_job_hook: None,
         }
     }
 }
 
 type SharedOps = Rc<RefCell<UiOps>>;
 type SharedService = Rc<RefCell<ThermalServiceHandle>>;
+
+fn poll_diagnostics_jobs(ui: &MainWindow, ops: &SharedOps) -> bool {
+    let mut completed_any = false;
+    loop {
+        let received = ops.borrow().diag_job_rx.try_recv().ok();
+        let Some(job) = received else {
+            break;
+        };
+        completed_any = true;
+        ops.borrow_mut().diagnostics_busy = false;
+        ui.set_diagnostics_busy(false);
+        match job {
+            DiagJobResult::Summary(Ok((summary_txt, Ok(())))) => {
+                ui.set_clipboard_fallback_visible(false);
+                ui.set_last_copied_text(SharedString::from(summary_txt.as_str()));
+                ui.set_diagnostics_status_text(SharedString::from(
+                    "Copied redacted diagnostic summary to clipboard.",
+                ));
+            }
+            DiagJobResult::Summary(Ok((summary_txt, Err(clip_err)))) => {
+                ui.set_clipboard_fallback_visible(true);
+                ui.set_last_copied_text(SharedString::from(summary_txt.as_str()));
+                ui.set_diagnostics_status_text(SharedString::from(format!(
+                    "Clipboard unavailable ({clip_err}) — summary is ready in the read-only fallback below, or use Export Support Report."
+                )));
+            }
+            DiagJobResult::Summary(Err(err)) => {
+                ui.set_diagnostics_status_text(SharedString::from(format!(
+                    "Failed to assemble diagnostic summary: {err}"
+                )));
+            }
+            DiagJobResult::Export {
+                out_path,
+                result: Ok(bytes),
+            } => {
+                ui.set_last_export_path(SharedString::from(out_path.display().to_string()));
+                ui.set_diagnostics_status_text(SharedString::from(format!(
+                    "Exported passive support report -> {} ({bytes} B)",
+                    out_path.display()
+                )));
+            }
+            DiagJobResult::Export {
+                out_path: _,
+                result: Err(err),
+            } => {
+                ui.set_diagnostics_status_text(SharedString::from(format!(
+                    "Support report export failed: {err}"
+                )));
+            }
+        }
+    }
+    completed_any
+}
 
 fn sync_recording_state_to_ui(ui: &MainWindow, diag: &DiagnosticsRuntime) {
     let active = diag.is_recording_active();
@@ -1092,6 +1261,7 @@ fn apply_polled_snapshot(ui: &MainWindow, snap: &SystemSnapshot, ops: &SharedOps
     sync_snapshot_to_ui(ui, snap, false);
     let diag = Arc::clone(&ops.borrow().diagnostics);
     sync_recording_state_to_ui(ui, &diag);
+    poll_diagnostics_jobs(ui, ops);
     let pending = ops.borrow().pending.clone();
     if let Some(pending) = pending {
         if snap.command_seq >= pending.seq {
@@ -1134,6 +1304,13 @@ fn wire_ui_callbacks(
     ops: &SharedOps,
     refresh_timer: &Rc<Timer>,
 ) {
+    let trace_raw_usb = ops.borrow().diagnostics.trace_raw_usb();
+    if ui.get_trace_raw_usb() != trace_raw_usb {
+        ui.set_trace_raw_usb(trace_raw_usb);
+        let snap = service.borrow().current_snapshot().clone();
+        sync_snapshot_to_ui(ui, &snap, true);
+    }
+
     // Every user action goes through `submit`, which surfaces enqueue rejection.
     let submit_cmd: Rc<dyn Fn(ServiceCommand) -> bool> = {
         let ui_weak = ui.as_weak();
@@ -1472,6 +1649,9 @@ fn wire_ui_callbacks(
             let Some(w) = ui_weak.upgrade() else {
                 return;
             };
+            if ops.borrow().diagnostics_busy {
+                return;
+            }
             // Strictly passive: uses the cached snapshot already held in memory without
             // sending Refresh or touching hardware.
             let (snap, worker_alive) = {
@@ -1481,24 +1661,53 @@ fn wire_ui_callbacks(
                     handle.worker_failure().is_none(),
                 )
             };
-            let diag = Arc::clone(&ops.borrow().diagnostics);
-            let evidence = snap.to_session_evidence(
-                diag.session_id(),
-                BuildIdentityReport::current("awcc-gui"),
-                worker_alive,
-            );
-            match diag.assemble_support_bundle(Some(evidence), collect_gui_settings(&w)) {
-                Ok(bundle) => {
-                    w.set_last_copied_text(SharedString::from(bundle.summary_txt.as_str()));
-                    w.set_diagnostics_status_text(SharedString::from(
-                        "Copied redacted diagnostic summary.",
-                    ));
-                }
-                Err(err) => {
-                    w.set_diagnostics_status_text(SharedString::from(format!(
-                        "Failed to assemble diagnostic summary: {err}"
-                    )));
-                }
+            let gui_settings = collect_gui_settings(&w);
+            let (diag, clipboard, tx, hook) = {
+                let mut borrowed = ops.borrow_mut();
+                borrowed.diagnostics_busy = true;
+                (
+                    Arc::clone(&borrowed.diagnostics),
+                    Arc::clone(&borrowed.clipboard),
+                    borrowed.diag_job_tx.clone(),
+                    borrowed.diag_job_hook.clone(),
+                )
+            };
+            w.set_diagnostics_busy(true);
+            w.set_diagnostics_status_text(SharedString::from(
+                "Assembling redacted diagnostic summary in background...",
+            ));
+            let spawn_res = std::thread::Builder::new()
+                .name("awcc-diag-summary".into())
+                .spawn(move || {
+                    if let Some(h) = hook {
+                        h();
+                    }
+                    let evidence = snap.to_session_evidence(
+                        diag.session_id(),
+                        BuildIdentityReport::current("awcc-gui"),
+                        worker_alive,
+                    );
+                    let res = diag
+                        .assemble_support_bundle(Some(evidence), gui_settings)
+                        .map_err(|e| e.to_string())
+                        .map(|bundle| {
+                            let clip_res = match clipboard.lock() {
+                                Ok(mut guard) => guard.set_text(&bundle.summary_txt),
+                                Err(poisoned) => {
+                                    poisoned.into_inner().set_text(&bundle.summary_txt)
+                                }
+                            };
+                            (bundle.summary_txt, clip_res)
+                        });
+                    let _ = tx.send(DiagJobResult::Summary(res));
+                    let _ = slint::invoke_from_event_loop(|| {});
+                });
+            if let Err(err) = spawn_res {
+                ops.borrow_mut().diagnostics_busy = false;
+                w.set_diagnostics_busy(false);
+                w.set_diagnostics_status_text(SharedString::from(format!(
+                    "Failed to start background summary worker: {err}"
+                )));
             }
         });
     }
@@ -1511,6 +1720,9 @@ fn wire_ui_callbacks(
             let Some(w) = ui_weak.upgrade() else {
                 return;
             };
+            if ops.borrow().diagnostics_busy {
+                return;
+            }
             // Strictly passive: uses the cached snapshot already held in memory without
             // sending Refresh or touching hardware.
             let (snap, worker_alive) = {
@@ -1520,36 +1732,47 @@ fn wire_ui_callbacks(
                     handle.worker_failure().is_none(),
                 )
             };
-            let (diag, override_path) = {
-                let borrowed = ops.borrow();
+            let gui_settings = collect_gui_settings(&w);
+            let (diag, override_path, tx, hook) = {
+                let mut borrowed = ops.borrow_mut();
+                borrowed.diagnostics_busy = true;
                 (
                     Arc::clone(&borrowed.diagnostics),
                     borrowed.export_output_override.clone(),
+                    borrowed.diag_job_tx.clone(),
+                    borrowed.diag_job_hook.clone(),
                 )
             };
             let out_path =
                 override_path.unwrap_or_else(|| default_support_export_path(diag.session_id()));
-            let evidence = snap.to_session_evidence(
-                diag.session_id(),
-                BuildIdentityReport::current("awcc-gui"),
-                worker_alive,
-            );
-            match diag
-                .assemble_support_bundle(Some(evidence), collect_gui_settings(&w))
-                .and_then(|bundle| bundle.write_to_path(&out_path))
-            {
-                Ok(bytes) => {
-                    w.set_last_export_path(SharedString::from(out_path.display().to_string()));
-                    w.set_diagnostics_status_text(SharedString::from(format!(
-                        "Exported passive support report -> {} ({bytes} B)",
-                        out_path.display()
-                    )));
-                }
-                Err(err) => {
-                    w.set_diagnostics_status_text(SharedString::from(format!(
-                        "Support report export failed: {err}"
-                    )));
-                }
+            w.set_diagnostics_busy(true);
+            w.set_diagnostics_status_text(SharedString::from(
+                "Exporting passive support report in background...",
+            ));
+            let spawn_res = std::thread::Builder::new()
+                .name("awcc-diag-export".into())
+                .spawn(move || {
+                    if let Some(h) = hook {
+                        h();
+                    }
+                    let evidence = snap.to_session_evidence(
+                        diag.session_id(),
+                        BuildIdentityReport::current("awcc-gui"),
+                        worker_alive,
+                    );
+                    let result = diag
+                        .assemble_support_bundle(Some(evidence), gui_settings)
+                        .and_then(|bundle| bundle.write_to_path(&out_path))
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(DiagJobResult::Export { out_path, result });
+                    let _ = slint::invoke_from_event_loop(|| {});
+                });
+            if let Err(err) = spawn_res {
+                ops.borrow_mut().diagnostics_busy = false;
+                w.set_diagnostics_busy(false);
+                w.set_diagnostics_status_text(SharedString::from(format!(
+                    "Failed to start background export worker: {err}"
+                )));
             }
         });
     }
@@ -1597,6 +1820,7 @@ fn wire_ui_callbacks(
 
     {
         let ui_weak = ui.as_weak();
+        let ops = Rc::clone(ops);
         ui.on_copy_selected_audit_row(move || {
             let Some(w) = ui_weak.upgrade() else {
                 return;
@@ -1604,10 +1828,26 @@ fn wire_ui_callbacks(
             let detail = w.get_selected_audit_detail();
             if !detail.is_empty() {
                 let seq = w.get_selected_audit_seq();
+                let clipboard = Arc::clone(&ops.borrow().clipboard);
+                let clip_res = match clipboard.lock() {
+                    Ok(mut guard) => guard.set_text(detail.as_str()),
+                    Err(poisoned) => poisoned.into_inner().set_text(detail.as_str()),
+                };
                 w.set_last_copied_text(detail);
-                w.set_diagnostics_status_text(SharedString::from(format!(
-                    "Copied full audit detail for command #{seq:02}."
-                )));
+                match clip_res {
+                    Ok(()) => {
+                        w.set_clipboard_fallback_visible(false);
+                        w.set_diagnostics_status_text(SharedString::from(format!(
+                            "Copied full audit detail for command #{seq:02} to clipboard."
+                        )));
+                    }
+                    Err(err) => {
+                        w.set_clipboard_fallback_visible(true);
+                        w.set_diagnostics_status_text(SharedString::from(format!(
+                            "Clipboard unavailable ({err}) — detail for command #{seq:02} is ready in the read-only fallback below."
+                        )));
+                    }
+                }
             }
         });
     }
@@ -1875,6 +2115,7 @@ fn run_interactive(sim_mode: bool) -> Result<()> {
             } else {
                 let diag = Arc::clone(&ops.borrow().diagnostics);
                 sync_recording_state_to_ui(&w, &diag);
+                poll_diagnostics_jobs(&w, &ops);
             }
             report_worker_failure_once(&w, &svc, &ops, &refresh_timer);
         });
@@ -1921,6 +2162,56 @@ fn main() -> std::process::ExitCode {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FakeClipboardState {
+        history: Vec<String>,
+        fail_with: Option<String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeClipboard {
+        state: Arc<std::sync::Mutex<FakeClipboardState>>,
+    }
+
+    impl FakeClipboard {
+        fn last_copied(&self) -> Option<String> {
+            self.state.lock().unwrap().history.last().cloned()
+        }
+
+        fn copy_count(&self) -> usize {
+            self.state.lock().unwrap().history.len()
+        }
+
+        fn set_failure(&self, err: Option<&str>) {
+            self.state.lock().unwrap().fail_with = err.map(str::to_string);
+        }
+    }
+
+    impl ClipboardBackend for FakeClipboard {
+        fn set_text(&mut self, text: &str) -> Result<(), String> {
+            let mut guard = self.state.lock().unwrap();
+            if let Some(err) = &guard.fail_with {
+                return Err(err.clone());
+            }
+            guard.history.push(text.to_string());
+            Ok(())
+        }
+    }
+
+    fn wait_for_diagnostics_job(ui: &MainWindow, ops: &SharedOps) {
+        for _ in 0..400 {
+            if poll_diagnostics_jobs(ui, ops) && !ops.borrow().diagnostics_busy {
+                return;
+            }
+            if !ops.borrow().diagnostics_busy {
+                poll_diagnostics_jobs(ui, ops);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for background diagnostics job to complete");
+    }
 
     #[test]
     fn cli_parser_handles_passive_commands_and_screenshot_flags() {
@@ -2245,7 +2536,11 @@ mod tests {
     fn wired_ui(service: &SharedService) -> (MainWindow, SharedOps, Rc<Timer>) {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().expect("window");
-        let ops: SharedOps = Rc::new(RefCell::new(UiOps::default()));
+        let default_ops = UiOps {
+            clipboard: Arc::new(std::sync::Mutex::new(Box::new(FakeClipboard::default()))),
+            ..Default::default()
+        };
+        let ops: SharedOps = Rc::new(RefCell::new(default_ops));
         let timer = Rc::new(Timer::default());
         let snap = service.borrow().current_snapshot().clone();
         sync_snapshot_to_ui(&ui, &snap, true);
@@ -2554,6 +2849,7 @@ mod tests {
         //    command or change `write_count` / `command_seq`:
         let seq_before = service.borrow().current_snapshot().command_seq;
         ui.invoke_copy_diagnostic_summary();
+        wait_for_diagnostics_job(&ui, &ops);
         assert!(
             ui.get_last_copied_text()
                 .contains("AWCC Diagnostic Summary"),
@@ -2566,6 +2862,7 @@ mod tests {
             ui.get_last_copied_text()
         );
         ui.invoke_export_support_report();
+        wait_for_diagnostics_job(&ui, &ops);
         assert_eq!(
             ui.get_last_export_path().as_str(),
             zip_path.display().to_string()
@@ -2594,6 +2891,214 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn clipboard_copy_actions_write_to_backend_and_report_failures_honestly() {
+        let mut orch = ThermalOrchestrator::new_simulated_m15_r6().expect("sim");
+        let _ = orch.set_thermal_mode(ThermalMode::Quiet);
+        let service: SharedService = Rc::new(RefCell::new(
+            ThermalServiceHandle::spawn(orch).expect("worker"),
+        ));
+        let (ui, ops, _timer) = wired_ui(&service);
+
+        let fake_clip = FakeClipboard::default();
+        ops.borrow_mut().clipboard = Arc::new(std::sync::Mutex::new(Box::new(fake_clip.clone())));
+
+        // 1. Successful row copy writes exact detail to clipboard and reports "Copied...":
+        ui.invoke_select_audit_row(1);
+        ui.invoke_copy_selected_audit_row();
+        assert_eq!(fake_clip.copy_count(), 1);
+        assert_eq!(
+            fake_clip.last_copied().as_deref(),
+            Some(ui.get_selected_audit_detail().as_str())
+        );
+        assert!(!ui.get_clipboard_fallback_visible());
+        assert!(
+            ui.get_diagnostics_status_text().starts_with("Copied "),
+            "expected 'Copied...' status, got: {}",
+            ui.get_diagnostics_status_text()
+        );
+
+        // 2. Successful summary copy writes summary text to clipboard and reports "Copied...":
+        ui.invoke_copy_diagnostic_summary();
+        wait_for_diagnostics_job(&ui, &ops);
+        assert_eq!(fake_clip.copy_count(), 2);
+        assert!(
+            fake_clip
+                .last_copied()
+                .as_deref()
+                .unwrap_or_default()
+                .contains("AWCC Diagnostic Summary")
+        );
+        assert!(!ui.get_clipboard_fallback_visible());
+        assert!(
+            ui.get_diagnostics_status_text().starts_with("Copied "),
+            "expected 'Copied...' status, got: {}",
+            ui.get_diagnostics_status_text()
+        );
+
+        // 3. When clipboard backend fails, neither action may claim "Copied"; both surface a
+        //    clear failure/fallback status and expose the read-only fallback text:
+        fake_clip.set_failure(Some("headless session has no clipboard owner"));
+        ui.invoke_copy_selected_audit_row();
+        assert_eq!(fake_clip.copy_count(), 2);
+        assert!(ui.get_clipboard_fallback_visible());
+        assert_eq!(ui.get_last_copied_text(), ui.get_selected_audit_detail());
+        let row_fail_status = ui.get_diagnostics_status_text();
+        assert!(
+            row_fail_status.contains("Clipboard unavailable"),
+            "got: {row_fail_status}"
+        );
+        assert!(
+            !row_fail_status.contains("Copied"),
+            "failed clipboard copy must never claim 'Copied': {row_fail_status}"
+        );
+
+        ui.invoke_copy_diagnostic_summary();
+        wait_for_diagnostics_job(&ui, &ops);
+        assert_eq!(fake_clip.copy_count(), 2);
+        assert!(ui.get_clipboard_fallback_visible());
+        assert!(
+            ui.get_last_copied_text()
+                .contains("AWCC Diagnostic Summary")
+        );
+        let summary_fail_status = ui.get_diagnostics_status_text();
+        assert!(
+            summary_fail_status.contains("Clipboard unavailable"),
+            "got: {summary_fail_status}"
+        );
+        assert!(
+            !summary_fail_status.contains("Copied"),
+            "failed summary copy must never claim 'Copied': {summary_fail_status}"
+        );
+    }
+
+    #[test]
+    fn async_summary_and_export_run_off_ui_thread_prevent_duplicate_triggers_and_tolerate_window_drop()
+     {
+        let orch = ThermalOrchestrator::new_simulated_m15_r6().expect("sim");
+        let service: SharedService = Rc::new(RefCell::new(
+            ThermalServiceHandle::spawn(orch).expect("worker"),
+        ));
+        let (ui, ops, _timer) = wired_ui(&service);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "awcc-gui-async-diag-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let zip_path = tmp.join("async-support.zip");
+        ops.borrow_mut().export_output_override = Some(zip_path.clone());
+
+        let fake_clip = FakeClipboard::default();
+        ops.borrow_mut().clipboard = Arc::new(std::sync::Mutex::new(Box::new(fake_clip.clone())));
+
+        // Gate the background worker so we can observe the in-flight state on the UI thread:
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let hook_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let hook_runs = Arc::clone(&hook_runs);
+            let release_rx = Arc::clone(&release_rx);
+            ops.borrow_mut().diag_job_hook = Some(Arc::new(move || {
+                hook_runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }));
+        }
+
+        // 1. Trigger `copy_diagnostic_summary` — returns immediately on UI thread while worker waits:
+        ui.invoke_copy_diagnostic_summary();
+        assert!(ui.get_diagnostics_busy());
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("background summary thread should start");
+
+        // UI state updates remain responsive while background summary is in flight:
+        ui.invoke_stage_cpu_boost(77.0);
+        assert_eq!(ui.get_staged_cpu_boost(), 77.0);
+        assert!(ui.get_boost_dirty());
+
+        // Duplicate clicks on Copy Summary or Export Support Report while busy are ignored:
+        ui.invoke_copy_diagnostic_summary();
+        ui.invoke_export_support_report();
+        assert_eq!(hook_runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Release the background summary job and poll completion:
+        release_tx.send(()).unwrap();
+        wait_for_diagnostics_job(&ui, &ops);
+        assert!(!ui.get_diagnostics_busy());
+        assert_eq!(fake_clip.copy_count(), 1);
+
+        // 2. Trigger `export_support_report` with the same gate and verify async completion:
+        ui.invoke_export_support_report();
+        assert!(ui.get_diagnostics_busy());
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("background export thread should start");
+        release_tx.send(()).unwrap();
+        wait_for_diagnostics_job(&ui, &ops);
+        assert!(!ui.get_diagnostics_busy());
+        assert!(zip_path.exists());
+
+        // 3. Dropping the window/ops while a background job is in flight must not panic:
+        ui.invoke_copy_diagnostic_summary();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("third background thread should start");
+        drop(ui);
+        drop(ops);
+        release_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn audit_row_detail_and_copy_respect_trace_raw_usb_opt_in() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().expect("window");
+        let canary = "03 24 aa bb cc dd ee ff 11 22 33 44";
+
+        let mut snap = healthy_snapshot();
+        snap.write_audit_log.push(WriteAuditEntry {
+            sequence: 1,
+            op_id: Some(9),
+            command: "USB HID 187c:0550 OUT [03 24 02 07 d0 00 fa f5 9e 0b]".to_string(),
+            outcome: "33 bytes transferred".to_string(),
+            succeeded: true,
+            ack: awcc_platform::AckStatus::Received,
+            raw_usb_response_hex: Some(canary.to_string()),
+        });
+        snap.audit_stats.lifetime_total = 1;
+        snap.audit_stats.retained = 1;
+        snap.audit_stats.last_seq = 1;
+
+        // Default (`trace-raw-usb == false`): raw USB response hex must NOT appear in row detail:
+        ui.set_trace_raw_usb(false);
+        sync_snapshot_to_ui(&ui, &snap, true);
+        let row_default = ui.get_audit_rows().row_data(0).expect("row 0");
+        assert!(
+            !row_default.detail.contains(canary),
+            "default GUI audit row detail must omit raw_usb_response_hex: {}",
+            row_default.detail
+        );
+        assert!(!row_default.detail.contains("raw_usb_in="));
+
+        // Explicit opt-in (`trace-raw-usb == true`): raw USB response hex is included:
+        ui.set_trace_raw_usb(true);
+        sync_snapshot_to_ui(&ui, &snap, true);
+        let row_opt_in = ui.get_audit_rows().row_data(0).expect("row 0");
+        assert!(
+            row_opt_in.detail.contains(canary),
+            "opt-in GUI audit row detail must include raw_usb_response_hex: {}",
+            row_opt_in.detail
+        );
     }
 
     #[test]

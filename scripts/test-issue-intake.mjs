@@ -774,6 +774,140 @@ _No response_`;
     "Must update the existing bot comment on page 2"
   );
   assert.equal(state.calls.updateComment[0].comment_id, 9001);
+
+  // Also test when an existing bot comment sits beyond comment #500 (e.g., on page 6):
+  const moreThan500UserComments = Array.from({ length: 515 }, (_, i) => ({
+    id: i + 1,
+    body: `User discussion comment #${i + 1}`,
+    user: { login: `user-${i + 1}`, type: "User" },
+  }));
+  const botCommentOnPage6 = {
+    id: 9520,
+    body: `${BOT_COMMENT_MARKER}\nOutdated missing-info comment beyond 500`,
+    user: { login: "github-actions[bot]", type: "Bot" },
+  };
+  const trailingComments = Array.from({ length: 200 }, (_, i) => ({
+    id: 600 + i,
+    body: `Trailing comment #${i + 1}`,
+    user: { login: `user-t-${i + 1}`, type: "User" },
+  }));
+
+  const deepMock = createMockGitHub({
+    initialComments: [
+      ...moreThan500UserComments,
+      botCommentOnPage6,
+      ...trailingComments,
+    ],
+  });
+  const deepDecision = await runIssueIntake({
+    github: deepMock.github,
+    context: deepMock.makeContext("edited", { body: incompleteFeatureBody }),
+  });
+  assert.equal(
+    deepMock.state.calls.listComments,
+    6,
+    "Must scan past 500 comments and stop as soon as the bot comment is found on page 6"
+  );
+  assert.equal(deepMock.state.calls.createComment.length, 0);
+  assert.equal(deepMock.state.calls.updateComment.length, 1);
+  assert.equal(deepMock.state.calls.updateComment[0].comment_id, 9520);
+  assert.equal(deepDecision.commentLookupIncomplete, false);
+
+  // Test when comment lookup hits the page cap without finding an existing bot comment:
+  // it must NOT post a potentially duplicate bot comment.
+  const truncatedMock = createMockGitHub({
+    initialComments: moreThan500UserComments,
+  });
+  const truncatedDecision = await runIssueIntake({
+    github: truncatedMock.github,
+    context: truncatedMock.makeContext("edited", {
+      body: incompleteFeatureBody,
+    }),
+    maxCommentLookupPages: 5,
+  });
+  assert.equal(truncatedDecision.commentLookupIncomplete, true);
+  assert.equal(truncatedDecision.commentAction, null);
+  assert.equal(
+    truncatedMock.state.calls.createComment.length,
+    0,
+    "Must not create a duplicate bot comment when comment lookup was truncated at page cap"
+  );
+}
+
+async function testMaintainerOrHumanNeedsInfoNeverFalselyClaimedRemoved() {
+  const completedFeatureBody = `### Related area
+
+GUI (awcc-gui)
+
+### Problem or use case
+
+I want a keyboard shortcut in awcc-gui to copy the diagnostic summary.
+
+### Desired behavior
+
+Pressing Ctrl+Shift+C on the Log tab copies the diagnostic summary.`;
+
+  const existingBotPrompt = {
+    id: 7001,
+    body: `${BOT_COMMENT_MARKER}\nMissing fields prompt from initial open`,
+    user: { login: "github-actions[bot]", type: "Bot" },
+  };
+
+  // Case A: Human maintainer explicitly added `needs-info` (e.g., asking a follow-up question),
+  // and reporter edits the issue body so all form sections are filled.
+  const humanNeedsInfoMock = createMockGitHub({
+    initialLabels: ["enhancement", "needs-triage", "needs-info"],
+    initialComments: [existingBotPrompt],
+    initialEvents: [
+      {
+        event: "labeled",
+        label: { name: "needs-info" },
+        actor: { login: "Hoggormino", type: "User" },
+      },
+    ],
+  });
+
+  const dHuman = await runIssueIntake({
+    github: humanNeedsInfoMock.github,
+    context: humanNeedsInfoMock.makeContext("edited", {
+      body: completedFeatureBody,
+    }),
+  });
+  assert.deepEqual(dHuman.missingFields, []);
+  assert.deepEqual(
+    dHuman.labelsToRemove,
+    [],
+    "Bot must not remove human-applied needs-info"
+  );
+  assert.equal(
+    dHuman.commentAction,
+    null,
+    "Bot must not edit its comment to claim needs-info was removed when humanAddedNeedsInfo retains the label"
+  );
+  assert.ok(humanNeedsInfoMock.state.labels.has("needs-info"));
+  assert.equal(humanNeedsInfoMock.state.calls.updateComment.length, 0);
+
+  // Case B: Issue is maintainerTriaged (`confirmed` + `needs-info` present) and reporter edits the body.
+  const triagedNeedsInfoMock = createMockGitHub({
+    initialLabels: ["enhancement", "confirmed", "needs-info"],
+    initialComments: [existingBotPrompt],
+  });
+
+  const dTriaged = await runIssueIntake({
+    github: triagedNeedsInfoMock.github,
+    context: triagedNeedsInfoMock.makeContext("edited", {
+      body: completedFeatureBody,
+    }),
+  });
+  assert.equal(dTriaged.maintainerTriaged, true);
+  assert.deepEqual(dTriaged.labelsToRemove, []);
+  assert.equal(
+    dTriaged.commentAction,
+    null,
+    "Bot must not edit its comment to claim needs-info was removed when maintainerTriaged retains the label"
+  );
+  assert.ok(triagedNeedsInfoMock.state.labels.has("needs-info"));
+  assert.equal(triagedNeedsInfoMock.state.calls.updateComment.length, 0);
 }
 
 function testDocumentationAndInvestigationRunbook() {
@@ -835,6 +969,7 @@ async function main() {
   await testUserForgedBotMarkerIsNeverTrustedOrEdited();
   await testAdversarialShellSyntaxQuotesAndNewlinesAreTreatedAsData();
   await testPaginatedBotCommentDiscovery();
+  await testMaintainerOrHumanNeedsInfoNeverFalselyClaimedRemoved();
 
   // Also sanity-check evaluateIssueIntake directly on a pull_request payload:
   const prDecision = evaluateIssueIntake({

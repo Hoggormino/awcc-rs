@@ -543,10 +543,58 @@ function makeValidInvestigationReport(overrides = {}) {
   assert.equal(mockGh.createdComments.length, 0);
   assert.equal(mockGh.updatedComments.length, 0);
 
+  // Feed the actual artifact files (evidence-metadata.json + investigation-report.json)
+  // produced by runValidateStep into publishOrUpdateInvestigationComment, matching the
+  // publish-comment job in .github/workflows/issue-investigate.yml:
+  const artifactEvidenceMeta = JSON.parse(
+    fs.readFileSync(
+      path.join(tmpDir, ".codex-investigation/artifact/evidence-metadata.json"),
+      "utf8"
+    )
+  );
+  const artifactReportRaw = fs.readFileSync(
+    path.join(tmpDir, ".codex-investigation/artifact/investigation-report.json"),
+    "utf8"
+  );
+  assert.equal(
+    artifactEvidenceMeta.extracted_inline_diagnostics,
+    undefined,
+    "evidence-metadata.json stores extracted_inline_diagnostics_count, not the full array"
+  );
+  assert.ok(artifactEvidenceMeta.extracted_inline_diagnostics_count > 0);
+
+  const pubFromArtifact = await publishOrUpdateInvestigationComment({
+    github: mockGh,
+    owner: "Hoggormino",
+    repo: "awcc-rs",
+    issueNumber: 42,
+    report: artifactReportRaw,
+    evidenceMeta: artifactEvidenceMeta,
+  });
+  assert.equal(pubFromArtifact.action, "created");
+  assert.match(
+    pubFromArtifact.body,
+    new RegExp(
+      `\\b${artifactEvidenceMeta.extracted_inline_diagnostics_count} inline diagnostic block\\(s\\)`
+    ),
+    "Published comment from evidence-metadata.json must report the exact non-zero inline diagnostic block count"
+  );
+
+  // Also verify 0 inline diagnostic blocks when none are present in evidence-metadata.json:
+  const zeroDiagMd = renderInvestigationMarkdown({
+    report: JSON.parse(artifactReportRaw),
+    evidenceMeta: {
+      ...artifactEvidenceMeta,
+      extracted_inline_diagnostics_count: 0,
+    },
+    includeBotMarker: true,
+  });
+  assert.match(zeroDiagMd, /\b0 inline diagnostic block\(s\)/);
+
   fs.rmSync(tmpDir, { recursive: true, force: true });
 }
 
-// 5. Test optional comment publication, forged marker immunity, HTML escaping, and idempotent updates
+// 5. Test optional comment publication, forged marker immunity, HTML escaping, idempotent updates, and >500 comments
 {
   const report = makeValidInvestigationReport({
     summary:
@@ -635,9 +683,77 @@ function makeValidInvestigationReport(overrides = {}) {
   assert.equal(thirdPub.commentId, firstPub.commentId);
   assert.equal(mockGh.createdComments.length, 1);
   assert.equal(mockGh.updatedComments.length, 1);
+
+  // Case A (>500 comments with existing bot comment after comment #500):
+  const userComments520 = Array.from({ length: 520 }, (_, i) => ({
+    id: i + 1,
+    user: { login: `user_${i + 1}`, type: "User" },
+    body: `Discussion comment #${i + 1}`,
+  }));
+  const botCommentBeyond500 = {
+    id: 9521,
+    user: { login: "github-actions[bot]", type: "Bot" },
+    body: `${INVESTIGATION_COMMENT_MARKER}\nOlder investigation report beyond comment 500`,
+  };
+  const mockDeepBot = createMockGithub({
+    commentsByIssue: {
+      42: [...userComments520, botCommentBeyond500],
+    },
+  });
+  const deepUpdateRes = await publishOrUpdateInvestigationComment({
+    github: mockDeepBot,
+    owner: "Hoggormino",
+    repo: "awcc-rs",
+    issueNumber: 42,
+    report,
+    evidenceMeta,
+  });
+  assert.equal(deepUpdateRes.action, "updated");
+  assert.equal(deepUpdateRes.commentId, 9521);
+  assert.equal(mockDeepBot.createdComments.length, 0);
+  assert.equal(mockDeepBot.updatedComments.length, 1);
+
+  // Case B (>500 comments, e.g. 550 comments, and NO existing bot comment):
+  const mockDeepNoBot = createMockGithub({
+    commentsByIssue: {
+      42: userComments520,
+    },
+  });
+  const deepCreateRes = await publishOrUpdateInvestigationComment({
+    github: mockDeepNoBot,
+    owner: "Hoggormino",
+    repo: "awcc-rs",
+    issueNumber: 42,
+    report,
+    evidenceMeta,
+  });
+  assert.equal(deepCreateRes.action, "created");
+  assert.equal(mockDeepNoBot.createdComments.length, 1);
+
+  // Case C (comment lookup hits maxLookupPages bound without seeing end of comments):
+  const mockTruncatedLookup = createMockGithub({
+    commentsByIssue: {
+      42: userComments520,
+    },
+  });
+  const skippedRes = await publishOrUpdateInvestigationComment({
+    github: mockTruncatedLookup,
+    owner: "Hoggormino",
+    repo: "awcc-rs",
+    issueNumber: 42,
+    report,
+    evidenceMeta,
+    maxLookupPages: 5,
+  });
+  assert.equal(skippedRes.action, "skipped_comment_lookup_incomplete");
+  assert.equal(
+    mockTruncatedLookup.createdComments.length,
+    0,
+    "Must not create a duplicate bot comment when comment lookup was truncated at page cap"
+  );
 }
 
-// Render fixture preview check
+// 6. Render fixture preview check and workflow YAML contract check
 {
   const md = renderInvestigationMarkdown({
     report: makeValidInvestigationReport(),
@@ -654,7 +770,7 @@ function makeValidInvestigationReport(overrides = {}) {
           url: "https://github.com/user-attachments/files/12345/awcc-support.zip",
         },
       ],
-      extracted_inline_diagnostics: [{ kind: "awcc_diagnostic_summary" }],
+      extracted_inline_diagnostics_count: 1,
       truncation: {
         issue_body_truncated: false,
         issue_body_retained_chars: 412,
@@ -667,6 +783,17 @@ function makeValidInvestigationReport(overrides = {}) {
   assert.ok(md.includes("### Grounded Source & Issue Evidence"));
   assert.ok(md.includes("### Suggested Offline Regression Test"));
   assert.ok(md.includes("### What Was & Was Not Checked"));
+  assert.ok(md.includes("1 inline diagnostic block(s)"));
+
+  const workflowYml = fs.readFileSync(
+    path.resolve(process.cwd(), ".github/workflows/issue-investigate.yml"),
+    "utf8"
+  );
+  assert.match(workflowYml, /inputs\.publish_comment == true/);
+  assert.match(workflowYml, /uses:\s*actions\/checkout@v7\b/);
+  assert.match(workflowYml, /uses:\s*actions\/upload-artifact@v7\b/);
+  assert.match(workflowYml, /uses:\s*actions\/download-artifact@v8\b/);
+  assert.match(workflowYml, /uses:\s*actions\/github-script@v9\b/);
 }
 
-console.log("All hosted issue investigation tests passed (5/5 test groups).");
+console.log("All hosted issue investigation tests passed (6/6 test groups).");

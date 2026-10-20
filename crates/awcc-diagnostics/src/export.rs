@@ -7,9 +7,11 @@
 //! from the log directory and reports its observation age, or it marks live hardware state as
 //! `unavailable`.
 
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use awcc_build_info::{BuildInfo, detect_package_format};
 use serde::{Deserialize, Serialize};
@@ -19,7 +21,7 @@ use thiserror::Error;
 use crate::event::Event;
 use crate::redact::Redactor;
 use crate::ring::RingStats;
-use crate::sink::{SinkStatus, list_sessions};
+use crate::sink::{SinkStatus, list_sessions, parse_session_segment_file_name};
 use crate::time::{now_unix_millis, rfc3339_millis};
 use crate::zip::{ZipEntry, ZipError, write_zip};
 
@@ -29,6 +31,14 @@ pub const REPORT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_EXPORTED_EVENTS: usize = 1000;
 /// Maximum number of hardware write-audit entries written into `hardware-audit.jsonl`.
 pub const MAX_EXPORTED_AUDIT_ENTRIES: usize = 500;
+/// Maximum number of recent sessions scanned when loading persisted events/evidence.
+pub const MAX_EXPORT_SCAN_SESSIONS: usize = 8;
+/// Maximum number of persisted `.jsonl` segment files scanned during export.
+pub const MAX_EXPORT_SCAN_FILES: usize = 16;
+/// Maximum total bytes read from persisted `.jsonl` segment files during export (2 MiB).
+pub const MAX_EXPORT_SCAN_BYTES: u64 = 2 * 1024 * 1024;
+/// Maximum length in bytes of a single JSONL line accepted during export.
+pub const MAX_EXPORT_LINE_BYTES: usize = 64 * 1024;
 
 /// Serializable runtime build identity stored in `build-info.json` and `report.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +340,30 @@ impl RedactionPolicySummary {
     }
 }
 
+/// Statistics and truncation/collection limits from assembling `events.jsonl`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCollectionStats {
+    pub max_exported_events: usize,
+    pub max_scan_sessions: usize,
+    pub max_scan_files: usize,
+    pub max_scan_bytes: u64,
+    pub sessions_discovered: usize,
+    pub sessions_scanned: usize,
+    pub sessions_skipped_by_limit: usize,
+    pub files_scanned: usize,
+    pub files_skipped_by_limit: usize,
+    pub bytes_scanned: u64,
+    pub files_tail_truncated_by_byte_limit: usize,
+    pub malformed_lines_skipped: u64,
+    pub duplicate_events_deduplicated: u64,
+    pub events_dropped_records_included: u64,
+    pub events_truncated_by_cap: u64,
+    pub exported_events: usize,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// Top-level `report.json` structure inside a support bundle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupportReport {
@@ -341,6 +375,8 @@ pub struct SupportReport {
     pub host_environment: HostEnvironment,
     pub session_id: String,
     pub event_ring_stats: RingStats,
+    #[serde(default)]
+    pub event_collection: EventCollectionStats,
     pub sink_status: SinkStatus,
     pub redaction_policy: RedactionPolicySummary,
     pub evidence: EvidenceEnvelope,
@@ -374,56 +410,398 @@ pub struct SupportBundle {
 }
 
 /// Read the newest persisted `evidence-<session>.json` from `log_dir` without modifying any files.
+/// Evaluates up to `MAX_EXPORT_SCAN_SESSIONS` recent sessions and selects the valid evidence file
+/// with the newest `recorded_unix_ms` (breaking ties by session modification time and session ID).
 #[must_use]
 pub fn load_latest_persisted_evidence(log_dir: &Path) -> Option<SessionEvidence> {
     let mut sessions = list_sessions(log_dir);
-    sessions.sort_by_key(|b| std::cmp::Reverse(b.newest_mtime));
-    for s in sessions {
+    sessions.sort_by(|a, b| {
+        b.newest_mtime
+            .cmp(&a.newest_mtime)
+            .then_with(|| b.session_id.cmp(&a.session_id))
+    });
+    let mut best: Option<((u64, SystemTime, String), SessionEvidence)> = None;
+    for s in sessions.into_iter().take(MAX_EXPORT_SCAN_SESSIONS) {
         for p in &s.paths {
             let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
             if name.starts_with("evidence-")
                 && name.ends_with(".json")
+                && let Ok(meta) = fs::symlink_metadata(p)
+                && meta.len() <= MAX_EXPORT_SCAN_BYTES
                 && let Ok(raw) = fs::read_to_string(p)
                 && let Ok(ev) = serde_json::from_str::<SessionEvidence>(&raw)
             {
-                return Some(ev);
-            }
-        }
-    }
-    None
-}
-
-/// Read up to `max_events` recent `Event` records from persisted `session-*.jsonl` files in
-/// `log_dir`, ordered by `(unix_ms, seq)`. Malformed lines are skipped safely.
-#[must_use]
-pub fn load_persisted_events(log_dir: &Path, max_events: usize) -> Vec<Event> {
-    let mut sessions = list_sessions(log_dir);
-    sessions.sort_by_key(|s| s.newest_mtime);
-    let mut events = Vec::new();
-    for s in sessions {
-        let mut jsonl_paths: Vec<PathBuf> = s
-            .paths
-            .into_iter()
-            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-            .collect();
-        jsonl_paths.sort();
-        for p in jsonl_paths {
-            let Ok(text) = fs::read_to_string(&p) else {
-                continue;
-            };
-            for line in text.lines() {
-                if let Ok(ev) = serde_json::from_str::<Event>(line) {
-                    events.push(ev);
+                let key = (ev.recorded_unix_ms, s.newest_mtime, ev.session_id.clone());
+                if best.as_ref().is_none_or(|(best_key, _)| key > *best_key) {
+                    best = Some((key, ev));
                 }
             }
         }
     }
-    if events.len() > max_events {
-        events.drain(..events.len() - max_events);
+    best.map(|(_, ev)| ev)
+}
+
+#[derive(Debug, Clone)]
+struct CandidateSegment {
+    path: PathBuf,
+    session_id: String,
+    session_newest_mtime: SystemTime,
+    started_utc_compact: String,
+    segment: u32,
+    byte_len: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedSegmentEvent {
+    started_utc_compact: String,
+    segment: u32,
+    line_index: usize,
+    event: Event,
+}
+
+/// Read lines from `path`, seeking to the last `max_bytes` of the file (and skipping any partial
+/// first line after seeking) when `byte_len > max_bytes`.
+fn read_segment_events_bounded(
+    seg: &CandidateSegment,
+    max_bytes: u64,
+    stats: &mut EventCollectionStats,
+) -> Vec<ParsedSegmentEvent> {
+    let Ok(mut file) = File::open(&seg.path) else {
+        return Vec::new();
+    };
+    let actual_len = file.metadata().map(|m| m.len()).unwrap_or(seg.byte_len);
+    let bytes_to_read = if actual_len > max_bytes {
+        let start_offset = actual_len - max_bytes;
+        if file.seek(SeekFrom::Start(start_offset)).is_err() {
+            return Vec::new();
+        }
+        stats.files_tail_truncated_by_byte_limit += 1;
+        max_bytes
+    } else {
+        actual_len
+    };
+    stats.bytes_scanned += bytes_to_read;
+    stats.files_scanned += 1;
+
+    let mut reader = BufReader::new(file.take(bytes_to_read));
+    let mut buf = Vec::new();
+    if actual_len > max_bytes {
+        // Seeking into the middle of a file can land inside a line; discard up to the first '\n'.
+        let _ = reader.read_until(b'\n', &mut buf);
+        buf.clear();
     }
-    events
+
+    let mut out = Vec::new();
+    let mut line_index = 0usize;
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                if buf.is_empty() {
+                    continue;
+                }
+                if buf.len() > MAX_EXPORT_LINE_BYTES {
+                    stats.malformed_lines_skipped += 1;
+                    continue;
+                }
+                let Ok(line_str) = std::str::from_utf8(&buf) else {
+                    stats.malformed_lines_skipped += 1;
+                    continue;
+                };
+                let trimmed = line_str.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Event>(trimmed) {
+                    Ok(event) => {
+                        out.push(ParsedSegmentEvent {
+                            started_utc_compact: seg.started_utc_compact.clone(),
+                            segment: seg.segment,
+                            line_index,
+                            event,
+                        });
+                        line_index += 1;
+                    }
+                    Err(_) => {
+                        stats.malformed_lines_skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Collect and merge persisted `.jsonl` events and `in_memory_events` within explicit scan and
+/// output bounds while preserving per-session sequence order and `seq == 0` (`events_dropped`)
+/// loss markers.
+pub fn collect_and_merge_events_with_limits(
+    log_dir: Option<&Path>,
+    in_memory_events: &[Event],
+    max_events: usize,
+    max_scan_sessions: usize,
+    max_scan_files: usize,
+    max_scan_bytes: u64,
+) -> (Vec<Event>, EventCollectionStats) {
+    let mut stats = EventCollectionStats {
+        max_exported_events: max_events,
+        max_scan_sessions,
+        max_scan_files,
+        max_scan_bytes,
+        ..EventCollectionStats::default()
+    };
+
+    let mut persisted_by_session: BTreeMap<String, Vec<ParsedSegmentEvent>> = BTreeMap::new();
+
+    if let Some(dir) = log_dir {
+        let sessions = list_sessions(dir);
+        stats.sessions_discovered = sessions.len();
+
+        // Build per-session segment lists with numeric segment metadata.
+        let mut session_groups = Vec::new();
+
+        for s in sessions {
+            let mut segs = Vec::new();
+            let mut latest_utc = String::new();
+            let mut max_seg = 0u32;
+            for p in s.paths {
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let Some(parsed) = parse_session_segment_file_name(name) else {
+                    continue;
+                };
+                let Ok(meta) = fs::symlink_metadata(&p) else {
+                    continue;
+                };
+                if !meta.file_type().is_file() {
+                    continue;
+                }
+                if parsed.started_utc_compact > latest_utc {
+                    latest_utc.clone_from(&parsed.started_utc_compact);
+                }
+                if parsed.segment > max_seg {
+                    max_seg = parsed.segment;
+                }
+                segs.push(CandidateSegment {
+                    path: p,
+                    session_id: s.session_id.clone(),
+                    session_newest_mtime: s.newest_mtime,
+                    started_utc_compact: parsed.started_utc_compact,
+                    segment: parsed.segment,
+                    byte_len: meta.len(),
+                });
+            }
+            if !segs.is_empty() {
+                session_groups.push(((s.newest_mtime, latest_utc, max_seg, s.session_id), segs));
+            }
+        }
+
+        // Order sessions newest-first so old sessions are shed first when over max_scan_sessions.
+        session_groups.sort_by(|a, b| b.0.cmp(&a.0));
+        if session_groups.len() > max_scan_sessions {
+            for (_, skipped_segs) in session_groups.drain(max_scan_sessions..) {
+                stats.sessions_skipped_by_limit += 1;
+                stats.files_skipped_by_limit += skipped_segs.len();
+            }
+        }
+        stats.sessions_scanned = session_groups.len();
+
+        // Flatten candidate segments across the selected sessions and scan newest segments first
+        // within the file/byte budgets.
+        let mut candidates: Vec<CandidateSegment> = session_groups
+            .into_iter()
+            .flat_map(|(_, segs)| segs)
+            .collect();
+        candidates.sort_by(|a, b| {
+            b.session_newest_mtime
+                .cmp(&a.session_newest_mtime)
+                .then_with(|| b.started_utc_compact.cmp(&a.started_utc_compact))
+                .then_with(|| b.segment.cmp(&a.segment))
+                .then_with(|| b.session_id.cmp(&a.session_id))
+        });
+
+        for seg in candidates {
+            let remaining_bytes = max_scan_bytes.saturating_sub(stats.bytes_scanned);
+            if stats.files_scanned >= max_scan_files || remaining_bytes == 0 {
+                stats.files_skipped_by_limit += 1;
+                continue;
+            }
+            let parsed_events = read_segment_events_bounded(&seg, remaining_bytes, &mut stats);
+            if !parsed_events.is_empty() {
+                persisted_by_session
+                    .entry(seg.session_id)
+                    .or_default()
+                    .extend(parsed_events);
+            }
+        }
+    }
+
+    // Group in-memory events by session_id.
+    let mut memory_by_session: BTreeMap<String, Vec<Event>> = BTreeMap::new();
+    for ev in in_memory_events {
+        memory_by_session
+            .entry(ev.session_id.clone())
+            .or_default()
+            .push(ev.clone());
+    }
+
+    let mut all_session_ids: BTreeSet<String> = persisted_by_session.keys().cloned().collect();
+    all_session_ids.extend(memory_by_session.keys().cloned());
+
+    #[derive(Debug, Clone)]
+    struct OrderedSessionEvent {
+        effective_unix_ms: u64,
+        session_id: String,
+        session_order: u64,
+        event: Event,
+    }
+
+    let mut all_ordered: Vec<OrderedSessionEvent> = Vec::new();
+
+    for sid in all_session_ids {
+        let mut persisted = persisted_by_session.remove(&sid).unwrap_or_default();
+        // Sort persisted events in strict chronological segment & line order:
+        // numeric `segment` ensures `.9.jsonl` comes before `.10.jsonl`.
+        persisted.sort_by(|a, b| {
+            a.started_utc_compact
+                .cmp(&b.started_utc_compact)
+                .then_with(|| a.segment.cmp(&b.segment))
+                .then_with(|| a.line_index.cmp(&b.line_index))
+        });
+
+        let mut seen_nonzero_seqs: BTreeSet<u64> = BTreeSet::new();
+        let mut session_events: Vec<Event> = Vec::with_capacity(persisted.len());
+        for item in persisted {
+            if item.event.seq > 0 && !seen_nonzero_seqs.insert(item.event.seq) {
+                stats.duplicate_events_deduplicated += 1;
+                continue;
+            }
+            session_events.push(item.event);
+        }
+
+        if let Some(mut mem_events) = memory_by_session.remove(&sid) {
+            mem_events.sort_by_key(|e| (e.seq, e.unix_ms));
+            for mem_ev in mem_events {
+                if mem_ev.seq > 0 && !seen_nonzero_seqs.insert(mem_ev.seq) {
+                    stats.duplicate_events_deduplicated += 1;
+                    continue;
+                }
+                // Insert in-memory event before the first persisted event with a larger non-zero
+                // sequence number, or at the end if it is newer than all persisted events.
+                if mem_ev.seq > 0
+                    && let Some(pos) = session_events.iter().position(|e| e.seq > mem_ev.seq)
+                {
+                    session_events.insert(pos, mem_ev);
+                } else {
+                    session_events.push(mem_ev);
+                }
+            }
+        }
+
+        // Assign monotonic per-session order and non-decreasing effective timestamp so cross-session
+        // chronological sorting never reorders events within the same session.
+        let mut running_unix_ms = 0u64;
+        for (idx, ev) in session_events.into_iter().enumerate() {
+            running_unix_ms = running_unix_ms.max(ev.unix_ms);
+            all_ordered.push(OrderedSessionEvent {
+                effective_unix_ms: running_unix_ms,
+                session_id: sid.clone(),
+                session_order: idx as u64,
+                event: ev,
+            });
+        }
+    }
+
+    // Sort globally across sessions by (effective_unix_ms, session_id, session_order).
+    all_ordered.sort_by(|a, b| {
+        a.effective_unix_ms
+            .cmp(&b.effective_unix_ms)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+            .then_with(|| a.session_order.cmp(&b.session_order))
+    });
+
+    if all_ordered.len() > max_events {
+        let drop_count = all_ordered.len() - max_events;
+        stats.events_truncated_by_cap = drop_count as u64;
+        all_ordered.drain(..drop_count);
+    }
+
+    let events: Vec<Event> = all_ordered.into_iter().map(|o| o.event).collect();
+    stats.events_dropped_records_included = events
+        .iter()
+        .filter(|e| e.code.as_deref() == Some("events_dropped"))
+        .count() as u64;
+    stats.exported_events = events.len();
+    stats.truncated = stats.sessions_skipped_by_limit > 0
+        || stats.files_skipped_by_limit > 0
+        || stats.files_tail_truncated_by_byte_limit > 0
+        || stats.events_truncated_by_cap > 0;
+
+    let mut notes = Vec::new();
+    if stats.events_truncated_by_cap > 0 {
+        notes.push(format!(
+            "older events omitted to stay within max_exported_events={max_events} ({} dropped)",
+            stats.events_truncated_by_cap
+        ));
+    }
+    if stats.sessions_skipped_by_limit > 0 {
+        notes.push(format!(
+            "{} older session(s) skipped by max_scan_sessions={max_scan_sessions}",
+            stats.sessions_skipped_by_limit
+        ));
+    }
+    if stats.files_skipped_by_limit > 0 {
+        notes.push(format!(
+            "{} older segment file(s) skipped by scan limits",
+            stats.files_skipped_by_limit
+        ));
+    }
+    if stats.files_tail_truncated_by_byte_limit > 0 {
+        notes.push(format!(
+            "{} segment file(s) tail-read to stay within max_scan_bytes={max_scan_bytes}",
+            stats.files_tail_truncated_by_byte_limit
+        ));
+    }
+    if stats.malformed_lines_skipped > 0 {
+        notes.push(format!(
+            "{} malformed log line(s) skipped safely",
+            stats.malformed_lines_skipped
+        ));
+    }
+    if stats.events_dropped_records_included > 0 {
+        notes.push(format!(
+            "{} writer queue-drop warning record(s) (code=events_dropped) included",
+            stats.events_dropped_records_included
+        ));
+    }
+    if !notes.is_empty() {
+        stats.note = Some(notes.join("; "));
+    }
+
+    (events, stats)
+}
+
+/// Read up to `max_events` recent `Event` records from persisted `session-*.jsonl` files in
+/// `log_dir`, preserving numeric segment order and per-session sequence order while selecting the
+/// newest `max_events` events overall. Malformed lines are skipped safely.
+#[must_use]
+pub fn load_persisted_events(log_dir: &Path, max_events: usize) -> Vec<Event> {
+    collect_and_merge_events_with_limits(
+        Some(log_dir),
+        &[],
+        max_events,
+        MAX_EXPORT_SCAN_SESSIONS,
+        MAX_EXPORT_SCAN_FILES,
+        MAX_EXPORT_SCAN_BYTES,
+    )
+    .0
 }
 
 fn redact_via_json<T: Serialize + for<'de> Deserialize<'de>>(
@@ -443,7 +821,7 @@ impl SupportBundle {
         let now_utc = rfc3339_millis(now_ms);
 
         // 1. Resolve evidence envelope passively (live cache -> persisted session file -> unavailable).
-        let raw_envelope = if let Some(ev) = &input.live_evidence {
+        let mut raw_envelope = if let Some(ev) = &input.live_evidence {
             let age = now_ms.saturating_sub(ev.recorded_unix_ms);
             EvidenceEnvelope {
                 origin: EvidenceOrigin::InMemoryCache,
@@ -476,26 +854,37 @@ impl SupportBundle {
             }
         };
 
+        // Enforce raw-USB response opt-in and audit entry cap on the shared evidence BEFORE
+        // generating `report.json`, `hardware-audit.jsonl`, `summary.txt`, or any other member.
+        if let Some(ev_data) = raw_envelope.data.as_mut() {
+            if ev_data.audit_entries.len() > MAX_EXPORTED_AUDIT_ENTRIES {
+                let drop_count = ev_data.audit_entries.len() - MAX_EXPORTED_AUDIT_ENTRIES;
+                ev_data.audit_entries.drain(..drop_count);
+            }
+            if !input.settings.trace_raw_usb_opt_in {
+                for entry in &mut ev_data.audit_entries {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.remove("raw_usb_response_hex");
+                    }
+                }
+            }
+        }
+
         let envelope = redact_via_json(&raw_envelope, &input.redactor)?;
         let host_env = redact_via_json(&input.host_environment, &input.redactor)?;
         let sink_status = redact_via_json(&input.sink_status, &input.redactor)?;
 
-        // 2. Collect bounded events (persisted + in-memory, deduplicated by `(session_id, seq)`).
-        let mut merged_events: Vec<Event> = Vec::new();
-        if let Some(dir) = &input.log_dir {
-            merged_events.extend(load_persisted_events(dir, MAX_EXPORTED_EVENTS));
-        }
-        for ev in &input.in_memory_events {
-            if !merged_events
-                .iter()
-                .any(|e| e.session_id == ev.session_id && e.seq == ev.seq && ev.seq != 0)
-            {
-                merged_events.push(ev.clone());
-            }
-        }
-        if merged_events.len() > MAX_EXPORTED_EVENTS {
-            merged_events.drain(..merged_events.len() - MAX_EXPORTED_EVENTS);
-        }
+        // 2. Collect bounded events (persisted + in-memory, deduplicated for seq > 0 while
+        // preserving seq == 0 `events_dropped` markers).
+        let (merged_events, raw_collection_stats) = collect_and_merge_events_with_limits(
+            input.log_dir.as_deref(),
+            &input.in_memory_events,
+            MAX_EXPORTED_EVENTS,
+            MAX_EXPORT_SCAN_SESSIONS,
+            MAX_EXPORT_SCAN_FILES,
+            MAX_EXPORT_SCAN_BYTES,
+        );
+        let event_collection = redact_via_json(&raw_collection_stats, &input.redactor)?;
 
         let mut events_jsonl = String::new();
         for ev in &merged_events {
@@ -505,20 +894,11 @@ impl SupportBundle {
             events_jsonl.push('\n');
         }
 
-        // 3. Collect bounded hardware write-audit entries from the resolved evidence.
+        // 3. Collect bounded hardware write-audit entries from the already-filtered & redacted evidence.
         let mut hardware_audit_jsonl = String::new();
         if let Some(ev_data) = &envelope.data {
-            let entries = &ev_data.audit_entries;
-            let start = entries.len().saturating_sub(MAX_EXPORTED_AUDIT_ENTRIES);
-            for entry in &entries[start..] {
-                let mut val = entry.clone();
-                if !input.settings.trace_raw_usb_opt_in
-                    && let Some(obj) = val.as_object_mut()
-                {
-                    obj.remove("raw_usb_response_hex");
-                }
-                input.redactor.redact_json(&mut val);
-                hardware_audit_jsonl.push_str(&serde_json::to_string(&val)?);
+            for entry in &ev_data.audit_entries {
+                hardware_audit_jsonl.push_str(&serde_json::to_string(entry)?);
                 hardware_audit_jsonl.push('\n');
             }
         }
@@ -537,6 +917,7 @@ impl SupportBundle {
             host_environment: host_env,
             session_id: input.session_id.clone(),
             event_ring_stats: input.event_ring_stats,
+            event_collection,
             sink_status,
             redaction_policy: RedactionPolicySummary::new(input.settings.trace_raw_usb_opt_in),
             evidence: envelope,
@@ -660,6 +1041,9 @@ fn format_summary_text(
         report.event_ring_stats.cleared,
         exported_event_count,
     ));
+    if let Some(note) = &report.event_collection.note {
+        lines.push(format!("Event Collection : {note}"));
+    }
     lines.push(format!(
         "Log Sink         : enabled={} · bytes_written={} · rotations={} · dropped_queue={} · dropped_io={}",
         report.sink_status.enabled,
@@ -862,6 +1246,7 @@ mod tests {
 
     #[test]
     fn raw_usb_response_bytes_require_explicit_opt_in() {
+        let canary = "02 06 19 64 de ad be ef ca fe f0 0d";
         let ev = SessionEvidence {
             session_id: "deadbeef".to_string(),
             recorded_at_utc: "2026-10-19T12:00:00.000Z".to_string(),
@@ -896,33 +1281,344 @@ mod tests {
                 "subsystem": "usb_elc",
                 "operation": "dim_lighting",
                 "raw_command_or_packet_hex": "02 06 19 64 00 00 00 00 00 00 00 00",
-                "raw_usb_response_hex": "02 06 19 64 aa bb cc dd ee",
+                "raw_usb_response_hex": canary,
                 "outcome": "confirmed"
             })],
         };
 
-        let mut input = sample_input(Some(ev), None);
-        let default_bundle = SupportBundle::assemble(&input).expect("default bundle");
-        assert!(
-            default_bundle
-                .hardware_audit_jsonl
-                .contains("02 06 19 64 00 00 00 00 00 00 00 00")
+        // Also persist the session evidence to disk so both InMemoryCache and PersistedSessionFile
+        // paths are verified across the entire ZIP archive.
+        let dir = std::env::temp_dir().join(format!(
+            "awcc_export_raw_usb_{}_{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("evidence-deadbeef.json"),
+            serde_json::to_string_pretty(&ev).unwrap(),
+        )
+        .unwrap();
+
+        for live in [Some(ev.clone()), None] {
+            let mut input = sample_input(live, Some(dir.clone()));
+            let default_bundle = SupportBundle::assemble(&input).expect("default bundle");
+            assert!(
+                default_bundle
+                    .hardware_audit_jsonl
+                    .contains("02 06 19 64 00 00 00 00 00 00 00 00"),
+                "standard decoded/hex command audit must remain present"
+            );
+            let default_zip = default_bundle.to_zip_bytes().expect("default zip");
+            let default_entries = read_stored_zip(&default_zip).expect("read default zip");
+            for entry in &default_entries {
+                let text = std::str::from_utf8(&entry.data).expect("utf8");
+                assert!(
+                    !text.contains(canary),
+                    "raw USB response canary leaked into {} without opt-in: {text}",
+                    entry.name
+                );
+                assert!(
+                    !text.contains("raw_usb_response_hex"),
+                    "raw_usb_response_hex key leaked into {} without opt-in: {text}",
+                    entry.name
+                );
+            }
+
+            input.settings.trace_raw_usb_opt_in = true;
+            let opt_in_bundle = SupportBundle::assemble(&input).expect("opt-in bundle");
+            let opt_in_zip = opt_in_bundle.to_zip_bytes().expect("opt-in zip");
+            let opt_in_entries = read_stored_zip(&opt_in_zip).expect("read opt-in zip");
+            let audit_entry = opt_in_entries
+                .iter()
+                .find(|e| e.name == "hardware-audit.jsonl")
+                .unwrap();
+            let report_entry = opt_in_entries
+                .iter()
+                .find(|e| e.name == "report.json")
+                .unwrap();
+            assert!(
+                std::str::from_utf8(&audit_entry.data)
+                    .unwrap()
+                    .contains(canary),
+                "hardware-audit.jsonl must include canary when opted in"
+            );
+            assert!(
+                std::str::from_utf8(&report_entry.data)
+                    .unwrap()
+                    .contains(canary),
+                "report.json must include canary when opted in"
+            );
+            assert!(opt_in_bundle.summary_txt.contains("Alienware m15 R6"));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn make_test_event(session_id: &str, seq: u64, unix_ms: u64, msg: &str) -> Event {
+        Event {
+            session_id: session_id.to_string(),
+            seq,
+            ts_utc: rfc3339_millis(unix_ms),
+            unix_ms,
+            severity: Severity::Info,
+            component: "awcc::test".to_string(),
+            category: Category::App,
+            op_id: None,
+            action: None,
+            outcome: None,
+            code: None,
+            elapsed_ms: None,
+            repeat_count: None,
+            message: msg.to_string(),
+            fields: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn segment_rotation_past_9_into_10_preserves_numeric_segment_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "awcc_export_seg10_{}_{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Write segments 8, 9, 10, 11 for the same session with equal timestamps so only segment
+        // ordering determines the intra-session sequence.
+        let pid = std::process::id();
+        for (seg_idx, seq) in [(8u32, 80u64), (9, 90), (10, 100), (11, 110)] {
+            let file_name = format!("session-20261019T120000Z-{pid}-abcd0010.{seg_idx}.jsonl");
+            let ev = make_test_event(
+                "abcd0010",
+                seq,
+                1_792_411_200_000,
+                &format!("seg-{seg_idx}"),
+            );
+            let line = serde_json::to_string(&ev).unwrap() + "\n";
+            fs::write(dir.join(file_name), line).unwrap();
+        }
+
+        let loaded = load_persisted_events(&dir, 100);
+        let seqs: Vec<u64> = loaded.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![80, 90, 100, 110],
+            "segment 10 and 11 must follow segment 9 in numeric order"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multiple_overlapping_sessions_and_in_memory_events_keep_per_session_order_and_newest_events()
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "awcc_export_multi_sess_{}_{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let pid = std::process::id();
+        // Session A: seq 1 (t=1000), seq 2 (t=1020), seq 3 (t=1040)
+        let sess_a_lines: String = [
+            make_test_event("aaaa1111", 1, 1000, "a-1"),
+            make_test_event("aaaa1111", 2, 1020, "a-2"),
+            make_test_event("aaaa1111", 3, 1040, "a-3"),
+        ]
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap() + "\n")
+        .collect();
+        fs::write(
+            dir.join(format!("session-20261019T120000Z-{pid}-aaaa1111.0.jsonl")),
+            sess_a_lines,
+        )
+        .unwrap();
+
+        // Session B (overlapping timestamps with Session A): seq 1 (t=1010), seq 2 (t=1030)
+        let sess_b_lines: String = [
+            make_test_event("bbbb2222", 1, 1010, "b-1"),
+            make_test_event("bbbb2222", 2, 1030, "b-2"),
+        ]
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap() + "\n")
+        .collect();
+        fs::write(
+            dir.join(format!("session-20261019T120001Z-{pid}-bbbb2222.0.jsonl")),
+            sess_b_lines,
+        )
+        .unwrap();
+
+        // In-memory events for Session B include duplicate seq 2 (t=1030) and new seq 3 (t=1050).
+        let in_mem = vec![
+            make_test_event("bbbb2222", 2, 1030, "b-2"),
+            make_test_event("bbbb2222", 3, 1050, "b-3"),
+        ];
+
+        // Request all 6 unique events first:
+        let (all_events, stats) =
+            collect_and_merge_events_with_limits(Some(&dir), &in_mem, 10, 8, 16, 1024 * 1024);
+        assert_eq!(stats.duplicate_events_deduplicated, 1);
+        let labels: Vec<&str> = all_events.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(labels, vec!["a-1", "b-1", "a-2", "b-2", "a-3", "b-3"]);
+
+        // Now cap max_events to 4 and verify the newest 4 across both sessions are selected while
+        // preserving each session's internal sequence order.
+        let (newest_four, cap_stats) =
+            collect_and_merge_events_with_limits(Some(&dir), &in_mem, 4, 8, 16, 1024 * 1024);
+        let newest_labels: Vec<&str> = newest_four.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(newest_labels, vec!["a-2", "b-2", "a-3", "b-3"]);
+        assert_eq!(cap_stats.events_truncated_by_cap, 2);
+        assert!(cap_stats.truncated);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writer_queue_drops_and_malformed_lines_round_trip_into_support_bundle() {
+        use crate::sink::{FileSink, SinkConfig};
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!(
+            "awcc_export_drops_{}_{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut cfg = SinkConfig::new(dir.clone(), "cccc4444".to_string(), std::process::id());
+        cfg.queue_capacity = 4;
+        let sink = FileSink::start(cfg).expect("start sink");
+
+        // Pause writer and saturate queue twice so multiple seq==0 `events_dropped` records are
+        // written into the session `.jsonl` file alongside real Event records.
+        sink.set_paused(true);
+        let mut accepted = 0usize;
+        for seq in 1..=50_u64 {
+            let ev = make_test_event(
+                "cccc4444",
+                seq,
+                1_792_411_200_000 + seq,
+                &format!("ev-{seq}"),
+            );
+            if sink.try_send_line(serde_json::to_string(&ev).unwrap()) {
+                accepted += 1;
+            }
+        }
+        sink.set_paused(false);
+        assert!(sink.flush(Duration::from_secs(5)));
+
+        // Inject a malformed line and another saturation burst.
+        assert!(sink.try_send_line("{not-valid-json".to_string()));
+        assert!(sink.flush(Duration::from_secs(5)));
+
+        sink.set_paused(true);
+        for seq in 51..=80_u64 {
+            let ev = make_test_event(
+                "cccc4444",
+                seq,
+                1_792_411_200_000 + seq,
+                &format!("ev-{seq}"),
+            );
+            if sink.try_send_line(serde_json::to_string(&ev).unwrap()) {
+                accepted += 1;
+            }
+        }
+        sink.set_paused(false);
+        assert!(sink.flush(Duration::from_secs(5)));
+        let sink_status = sink.status();
+        sink.shutdown(Duration::from_secs(5));
+
+        let expected_dropped = (80 - accepted) as u64;
+        assert_eq!(sink_status.dropped_queue_full, expected_dropped);
+
+        let mut input = sample_input(None, Some(dir.clone()));
+        input.session_id = "cccc4444".to_string();
+        input.in_memory_events.clear();
+        input.sink_status = sink_status;
+
+        let bundle = SupportBundle::assemble(&input).expect("assemble bundle");
+        let exported_events: Vec<Event> = bundle
+            .events_jsonl
+            .lines()
+            .map(|l| serde_json::from_str::<Event>(l).expect("valid exported Event JSON"))
+            .collect();
+
+        let drop_records: Vec<&Event> = exported_events
+            .iter()
+            .filter(|e| e.code.as_deref() == Some("events_dropped"))
+            .collect();
+        assert_eq!(
+            drop_records.len(),
+            2,
+            "both seq==0 events_dropped records must survive deduplication and export: {exported_events:?}"
+        );
+        let exported_drop_sum: u64 = drop_records.iter().filter_map(|e| e.repeat_count).sum();
+        assert_eq!(exported_drop_sum, expected_dropped);
+        assert_eq!(
+            bundle
+                .report
+                .event_collection
+                .events_dropped_records_included,
+            2
+        );
+        assert_eq!(bundle.report.event_collection.malformed_lines_skipped, 1);
         assert!(
-            !default_bundle
-                .hardware_audit_jsonl
-                .contains("aa bb cc dd ee"),
-            "verbose raw USB response must be omitted without opt-in"
+            bundle
+                .summary_txt
+                .contains("writer queue-drop warning record(s) (code=events_dropped) included"),
+            "summary.txt must surface queue-drop evidence: {}",
+            bundle.summary_txt
         );
 
-        input.settings.trace_raw_usb_opt_in = true;
-        let opt_in_bundle = SupportBundle::assemble(&input).expect("opt-in bundle");
-        assert!(
-            opt_in_bundle
-                .hardware_audit_jsonl
-                .contains("aa bb cc dd ee"),
-            "verbose raw USB response is included when explicitly opted in"
-        );
-        assert!(opt_in_bundle.summary_txt.contains("Alienware m15 R6"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_log_directory_is_scanned_within_byte_and_file_limits_and_reports_truncation() {
+        let dir = std::env::temp_dir().join(format!(
+            "awcc_export_bounded_{}_{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let pid = std::process::id();
+        let mut payload = String::new();
+        for seq in 1..=200_u64 {
+            let ev = make_test_event(
+                "dddd5555",
+                seq,
+                1_792_411_200_000 + seq,
+                &format!("msg-{seq}-padding-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+            );
+            payload.push_str(&serde_json::to_string(&ev).unwrap());
+            payload.push('\n');
+        }
+        let seg_path = dir.join(format!("session-20261019T120000Z-{pid}-dddd5555.0.jsonl"));
+        fs::write(&seg_path, &payload).unwrap();
+        let full_len = payload.len() as u64;
+        assert!(full_len > 8_000);
+
+        // Scan with a tight 4 KiB byte budget: only the tail of the file may be read, and the
+        // newest events at the end of the file (including seq 200) must be preserved without
+        // malformed-line failure at the seek boundary.
+        let (events, stats) =
+            collect_and_merge_events_with_limits(Some(&dir), &[], 100, 4, 4, 4096);
+        assert_eq!(stats.bytes_scanned, 4096);
+        assert_eq!(stats.files_tail_truncated_by_byte_limit, 1);
+        assert!(stats.truncated);
+        assert!(!events.is_empty());
+        assert_eq!(events.last().unwrap().seq, 200);
+        // Verify strictly increasing sequence order in the tail slice.
+        for pair in events.windows(2) {
+            assert!(pair[0].seq < pair[1].seq);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

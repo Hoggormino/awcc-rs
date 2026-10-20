@@ -1704,11 +1704,20 @@ mod tests {
             ))
             .unwrap();
         let mut orch = ThermalOrchestrator::new_simulated_m15_r6().unwrap();
-        let snap = orch.set_thermal_mode(ThermalMode::Performance);
+        orch.set_trace_raw_usb(true);
+        let _ = orch.set_thermal_mode(ThermalMode::Performance);
+        let snap = orch.set_brightness(50);
         let mut evidence = snap.to_session_evidence(
             "a1b2c3d4e5f60718",
             awcc_diagnostics::export::BuildIdentityReport::current("awcc-gui"),
             true,
+        );
+        assert!(
+            evidence
+                .audit_entries
+                .iter()
+                .any(|e| e.get("raw_usb_response_hex").is_some()),
+            "persisted session evidence must contain raw_usb_response_hex before opt-out export"
         );
         evidence.subsystem_health.last_error = Some(
             "failed reading /home/alice/.config/awcc with Service Tag: ABC1234 and MAC aa:bb:cc:dd:ee:ff"
@@ -1754,6 +1763,14 @@ mod tests {
             )
             .unwrap()
         };
+        for entry in &pop_files {
+            let text = std::str::from_utf8(&entry.data).unwrap();
+            assert!(
+                !text.contains("raw_usb_response_hex"),
+                "raw_usb_response_hex must not appear in {} without --trace-raw-usb: {text}",
+                entry.name
+            );
+        }
         let report_json = find_entry("report.json");
         let summary_txt = find_entry("summary.txt");
         let audit_jsonl = find_entry("hardware-audit.jsonl");
@@ -1783,6 +1800,46 @@ mod tests {
             "hardware-audit.jsonl must include recorded ACPI writes: {audit_jsonl}"
         );
 
+        // Verify explicit `--trace-raw-usb` includes `raw_usb_response_hex` in the exported archive.
+        let zip_opt_in = tmp.join("awcc-support-raw-usb.zip");
+        let (mut opt_out, mut opt_err) = (Vec::new(), Vec::new());
+        let opt_code = run_with_log_dir(
+            &to_args(&[
+                "--trace-raw-usb",
+                "diagnostics",
+                "export",
+                "--output",
+                zip_opt_in.to_str().unwrap(),
+            ]),
+            &mut spy2,
+            Some(&pop_log_dir),
+            &mut opt_out,
+            &mut opt_err,
+        );
+        assert_eq!(opt_code, 0, "stderr: {}", String::from_utf8_lossy(&opt_err));
+        let opt_files =
+            awcc_diagnostics::zip::read_stored_zip(&std::fs::read(&zip_opt_in).unwrap()).unwrap();
+        let opt_audit = String::from_utf8(
+            opt_files
+                .iter()
+                .find(|e| e.name == "hardware-audit.jsonl")
+                .unwrap()
+                .data
+                .clone(),
+        )
+        .unwrap();
+        let opt_report = String::from_utf8(
+            opt_files
+                .iter()
+                .find(|e| e.name == "report.json")
+                .unwrap()
+                .data
+                .clone(),
+        )
+        .unwrap();
+        assert!(opt_audit.contains("raw_usb_response_hex"));
+        assert!(opt_report.contains("raw_usb_response_hex"));
+
         // 3. `diagnostics summary` prints human summary by default and valid JSON with `--json`.
         let (mut sum_out, mut sum_err) = (Vec::new(), Vec::new());
         let sum_code = run_with_log_dir(
@@ -1794,6 +1851,11 @@ mod tests {
         );
         assert_eq!(sum_code, 0);
         assert_eq!((spy2.profile_calls, spy2.orchestrator_calls), (0, 0));
+        let sum_str = String::from_utf8(sum_out.clone()).unwrap();
+        assert!(
+            !sum_str.contains("raw_usb_response_hex"),
+            "diagnostics summary --json must also omit raw_usb_response_hex without opt-in"
+        );
         let parsed_json: serde_json::Value = serde_json::from_slice(&sum_out).unwrap();
         assert_eq!(parsed_json["schema_version"], 1);
 

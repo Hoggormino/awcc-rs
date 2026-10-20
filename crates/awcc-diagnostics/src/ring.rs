@@ -61,7 +61,12 @@ impl<T: HasSeq + Clone> SeqRing<T> {
 
     /// Append an item. Sequences must be strictly increasing (they are assigned at emission).
     pub fn push(&mut self, item: T) {
-        debug_assert!(item.seq() > self.last_seq, "sequence must increase");
+        assert!(
+            item.seq() > self.last_seq,
+            "SeqRing::push requires strictly increasing sequence numbers (got {}, last_seq was {})",
+            item.seq(),
+            self.last_seq
+        );
         self.last_seq = item.seq();
         self.lifetime_total += 1;
         self.items.push(item);

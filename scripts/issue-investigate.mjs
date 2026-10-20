@@ -29,6 +29,7 @@ export const MAX_ISSUE_BODY_CHARS = 16000;
 export const MAX_COMMENTS_COLLECTED = 30;
 export const MAX_COMMENT_BODY_CHARS = 4000;
 export const MAX_COMMENT_PAGES = 5;
+export const MAX_BOT_COMMENT_LOOKUP_PAGES = 20;
 
 export const ALLOWED_REPRODUCTION_STATUSES = new Set([
   "not_attempted_static_analysis_only",
@@ -299,6 +300,7 @@ async function listBoundedIssueComments({
   repo,
   issueNumber,
   maxPages = MAX_COMMENT_PAGES,
+  stopPredicate = null,
 }) {
   const allComments = [];
   let hasMorePages = false;
@@ -312,6 +314,9 @@ async function listBoundedIssueComments({
     });
     const pageItems = Array.isArray(res?.data) ? res.data : [];
     allComments.push(...pageItems);
+    if (stopPredicate && pageItems.some(stopPredicate)) {
+      break;
+    }
     if (pageItems.length < 100) {
       break;
     }
@@ -836,6 +841,10 @@ export function renderInvestigationMarkdown({
   }
 
   const trunc = evidenceMeta?.truncation || {};
+  const inlineDiagCount =
+    typeof evidenceMeta?.extracted_inline_diagnostics_count === "number"
+      ? evidenceMeta.extracted_inline_diagnostics_count
+      : (evidenceMeta?.extracted_inline_diagnostics || []).length;
   lines.push(
     "",
     "### What Was & Was Not Checked",
@@ -845,9 +854,7 @@ export function renderInvestigationMarkdown({
         : `${trunc.issue_body_retained_chars ?? 0} chars`
     }), ${trunc.comments_retained ?? 0} comment(s) (omitted: ${
       trunc.comments_omitted_count ?? 0
-    }), ${
-      (evidenceMeta?.extracted_inline_diagnostics || []).length
-    } inline diagnostic block(s), and trusted repository checkout at \`${rev}\`.`,
+    }), ${inlineDiagCount} inline diagnostic block(s), and trusted repository checkout at \`${rev}\`.`,
     "- **Not Checked**: Uploaded file attachments (`awcc-support.zip`), external URLs, live ACPI/USB hardware, and runtime test execution (`cargo test` is run in the local-agent workflow and CI pipeline, not inside this read-only investigation job)."
   );
 
@@ -861,6 +868,7 @@ export async function publishOrUpdateInvestigationComment({
   issueNumber,
   report,
   evidenceMeta,
+  maxLookupPages = MAX_BOT_COMMENT_LOOKUP_PAGES,
 }) {
   const validated = validateInvestigationOutput(report, issueNumber);
   const body = renderInvestigationMarkdown({
@@ -869,11 +877,13 @@ export async function publishOrUpdateInvestigationComment({
     includeBotMarker: true,
   });
 
-  const { allComments } = await listBoundedIssueComments({
+  const { allComments, hasMorePages } = await listBoundedIssueComments({
     github,
     owner,
     repo,
     issueNumber,
+    maxPages: maxLookupPages,
+    stopPredicate: isVerifiedInvestigationBotComment,
   });
 
   const verifiedComments = allComments.filter(
@@ -898,6 +908,14 @@ export async function publishOrUpdateInvestigationComment({
     return {
       action: "updated",
       commentId: existing.id,
+      body,
+    };
+  }
+
+  if (hasMorePages) {
+    return {
+      action: "skipped_comment_lookup_incomplete",
+      commentId: null,
       body,
     };
   }

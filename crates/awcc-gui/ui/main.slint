@@ -136,6 +136,9 @@ export component MainWindow inherits MaterialWindow {
     in-out property <string> diagnostics-status-text: "";
     in-out property <string> last-copied-text: "";
     in-out property <string> last-export-path: "";
+    in-out property <bool> diagnostics-busy: false;
+    in-out property <bool> clipboard-fallback-visible: false;
+    in-out property <bool> trace-raw-usb: false;
 
     // Callbacks to Rust service controller
     callback request-refresh();
@@ -1538,6 +1541,7 @@ export component MainWindow inherits MaterialWindow {
 
                                 OutlineButton {
                                     height: 32px;
+                                    enabled: !root.diagnostics-busy;
                                     text: "Copy Summary";
                                     clicked => {
                                         root.copy-diagnostic-summary();
@@ -1546,6 +1550,7 @@ export component MainWindow inherits MaterialWindow {
 
                                 FilledButton {
                                     height: 32px;
+                                    enabled: !root.diagnostics-busy;
                                     text: "Export Support Report";
                                     clicked => {
                                         root.export-support-report();
@@ -1588,6 +1593,37 @@ export component MainWindow inherits MaterialWindow {
                             style: MaterialTypography.body_small;
                             color: MaterialPalette.primary;
                             overflow: elide;
+                        }
+
+                        if root.clipboard-fallback-visible && root.last-copied-text != "" : Rectangle {
+                            height: 34px;
+                            border-radius: 6px;
+                            background: MaterialPalette.surface_container_high;
+                            border-width: 1px;
+                            border-color: MaterialPalette.outline_variant;
+
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 8px;
+
+                                MaterialText {
+                                    vertical-alignment: center;
+                                    text: "Manual Copy Fallback:";
+                                    style: MaterialTypography.label_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+
+                                TextInput {
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                    read-only: true;
+                                    single-line: true;
+                                    text: root.last-copied-text;
+                                    font-size: 12px;
+                                    color: MaterialPalette.on_surface;
+                                }
+                            }
                         }
 
                         HorizontalDivider {}

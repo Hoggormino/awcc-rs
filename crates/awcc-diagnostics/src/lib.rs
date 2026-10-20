@@ -26,17 +26,18 @@ use tracing_subscriber::prelude::*;
 
 pub use event::{Category, Event, Severity};
 pub use export::{
-    BuildIdentityReport, DatabaseProvenance, DeviceProfileEvidence, EvidenceEnvelope,
-    EvidenceOrigin, ExportError, ExportedSettings, HostEnvironment, REPORT_SCHEMA_VERSION,
-    RedactionPolicySummary, SessionEvidence, SubsystemHealthEvidence, SupportBundle,
-    SupportExportInput, SupportReport, TelemetryEvidence, load_latest_persisted_evidence,
-    load_persisted_events,
+    BuildIdentityReport, DatabaseProvenance, DeviceProfileEvidence, EventCollectionStats,
+    EvidenceEnvelope, EvidenceOrigin, ExportError, ExportedSettings, HostEnvironment,
+    REPORT_SCHEMA_VERSION, RedactionPolicySummary, SessionEvidence, SubsystemHealthEvidence,
+    SupportBundle, SupportExportInput, SupportReport, TelemetryEvidence,
+    collect_and_merge_events_with_limits, load_latest_persisted_evidence, load_persisted_events,
 };
 pub use redact::{REDACTED, Redactor};
 pub use ring::{Delta, HasSeq, RingStats, SeqRing};
 pub use sink::{
     DEFAULT_MAX_FILES_PER_SESSION, DEFAULT_PER_FILE_BYTES, DEFAULT_TOTAL_BUDGET_BYTES, FileSink,
-    SinkConfig, SinkError, SinkStatus, cleanup_logs, default_log_dir, list_sessions,
+    ParsedSegmentFileName, SinkConfig, SinkError, SinkStatus, cleanup_logs, default_log_dir,
+    list_sessions, parse_session_segment_file_name, segment_path_sort_key,
 };
 
 /// Default bounded in-memory event ring capacity per process.
@@ -533,7 +534,7 @@ impl DiagnosticsRuntime {
                 .collect();
             for comp in expired_components {
                 if let Some(pending) = rl.pending_by_component.remove(&comp) {
-                    to_commit.push(self.assign_folded_event(pending));
+                    to_commit.push(Self::prepare_folded_event(pending));
                 }
             }
 
@@ -548,13 +549,11 @@ impl DiagnosticsRuntime {
                     if pending.key == key {
                         pending.suppressed_count += 1;
                         drop(rl);
-                        for ev in to_commit {
-                            self.commit_event(ev);
-                        }
+                        let _ = self.publish_events(to_commit);
                         return None;
                     }
                     if let Some(finished) = rl.pending_by_component.remove(&item.component) {
-                        to_commit.push(self.assign_folded_event(finished));
+                        to_commit.push(Self::prepare_folded_event(finished));
                     }
                 } else if let Some((last_key, last_at)) =
                     rl.last_key_by_component.get(&item.component)
@@ -589,27 +588,20 @@ impl DiagnosticsRuntime {
                         },
                     );
                     drop(rl);
-                    for ev in to_commit {
-                        self.commit_event(ev);
-                    }
+                    let _ = self.publish_events(to_commit);
                     return None;
                 }
                 rl.last_key_by_component
                     .insert(item.component.clone(), (key, now));
             } else if let Some(finished) = rl.pending_by_component.remove(&item.component) {
-                to_commit.push(self.assign_folded_event(finished));
+                to_commit.push(Self::prepare_folded_event(finished));
             }
         }
 
-        for ev in to_commit {
-            self.commit_event(ev);
-        }
-
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let unix_ms = time::now_unix_millis();
-        let ev = Event {
+        to_commit.push(Event {
             session_id: self.session_id.clone(),
-            seq,
+            seq: 0,
             ts_utc: time::rfc3339_millis(unix_ms),
             unix_ms,
             severity: item.severity,
@@ -623,52 +615,67 @@ impl DiagnosticsRuntime {
             repeat_count: None,
             message: item.message,
             fields: item.fields,
-        };
-        self.commit_event(ev);
-        Some(seq)
+        });
+        self.publish_events(to_commit)
     }
 
-    fn assign_folded_event(&self, pending: PendingFold) -> Event {
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+    fn prepare_folded_event(pending: PendingFold) -> Event {
         let unix_ms = time::now_unix_millis();
         let mut ev = pending.template;
-        ev.seq = seq;
+        ev.seq = 0;
         ev.unix_ms = unix_ms;
         ev.ts_utc = time::rfc3339_millis(unix_ms);
         ev.repeat_count = Some(pending.suppressed_count);
         ev
     }
 
-    fn commit_event(&self, ev: Event) {
-        if self.stderr_enabled
-            && (self.level_source != "default"
-                || ev.severity == Severity::Error
-                || ev.code.as_deref() == Some("invalid_log_env"))
-        {
-            let _ = writeln!(std::io::stderr(), "{}", ev.render_line());
+    /// Assign consecutive sequence numbers and push into `event_ring` inside a single critical
+    /// section so concurrent producers can never insert out of sequence order, then emit to stderr
+    /// and the background file sink after releasing the ring lock.
+    fn publish_events(&self, mut events: Vec<Event>) -> Option<u64> {
+        if events.is_empty() {
+            return None;
         }
-        if let Some(sink) = &self.sink
-            && let Ok(json_line) = serde_json::to_string(&ev)
-        {
-            let _ = sink.try_send_line(json_line);
+        let last_seq = {
+            let mut ring = lock(&self.event_ring);
+            let mut last = None;
+            for ev in &mut events {
+                let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+                ev.seq = seq;
+                ring.push(ev.clone());
+                last = Some(seq);
+            }
+            last
+        };
+        for ev in &events {
+            if self.stderr_enabled
+                && (self.level_source != "default"
+                    || ev.severity == Severity::Error
+                    || ev.code.as_deref() == Some("invalid_log_env"))
+            {
+                let _ = writeln!(std::io::stderr(), "{}", ev.render_line());
+            }
+            if let Some(sink) = &self.sink
+                && let Ok(json_line) = serde_json::to_string(ev)
+            {
+                let _ = sink.try_send_line(json_line);
+            }
         }
-        lock(&self.event_ring).push(ev);
+        last_seq
     }
 
     /// Flush any pending rate-limited failure folds immediately so snapshots/exports see the
     /// exact count.
     pub fn flush_rate_limits(&self) {
-        let pending_list: Vec<PendingFold> = {
+        let pending_list: Vec<Event> = {
             let mut rl = lock(&self.rate_limiter);
             let keys: Vec<String> = rl.pending_by_component.keys().cloned().collect();
             keys.into_iter()
                 .filter_map(|k| rl.pending_by_component.remove(&k))
+                .map(Self::prepare_folded_event)
                 .collect()
         };
-        for pending in pending_list {
-            let ev = self.assign_folded_event(pending);
-            self.commit_event(ev);
-        }
+        let _ = self.publish_events(pending_list);
     }
 
     /// Sequence-aware delta of application events since `cursor`.
@@ -1082,5 +1089,73 @@ mod tests {
         assert!(!ev.message.contains("alice") && !ev.message.contains("alienbox"));
         assert_eq!(ev.fields.get("location").unwrap(), "~/src/main.rs:42:9");
         assert!(!ev.fields.get("backtrace").unwrap().contains("alice"));
+    }
+
+    #[test]
+    fn concurrent_producers_and_folded_events_publish_strictly_increasing_sequences_without_gaps() {
+        let rt = DiagnosticsRuntime::new(DiagnosticsConfig {
+            app_name: "awcc-test",
+            resolved_level: ResolvedLogLevel {
+                level: Severity::Debug,
+                source: "test",
+                env_warning: None,
+            },
+            trace_raw_usb: false,
+            log_dir: None,
+            enable_file_sink: false,
+            enable_stderr_console: false,
+            event_ring_capacity: 4096,
+            rate_limit_window: Duration::from_secs(60),
+        });
+
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for worker_idx in 0..8usize {
+                let rt = &rt;
+                let barrier = &barrier;
+                s.spawn(move || {
+                    barrier.wait();
+                    let comp = format!("awcc::worker_{}", worker_idx % 4);
+                    for i in 0..120usize {
+                        // Interleave repeated WARN failures (triggering rate-limit folding and
+                        // fold-flush on subsequent INFO events) with INFO events and concurrent
+                        // `events_since` reads.
+                        let mut warn_ev =
+                            NewEvent::new(Severity::Warn, comp.clone(), "transient bus timeout");
+                        warn_ev.code = Some("bus_timeout".to_string());
+                        let _ = rt.record(warn_ev);
+
+                        if i % 3 == 0 {
+                            let mut info_ev = NewEvent::new(
+                                Severity::Info,
+                                comp.clone(),
+                                format!("recovered step {i}"),
+                            );
+                            info_ev.op_id = Some((worker_idx * 1000 + i) as u64);
+                            let _ = rt.record(info_ev);
+                        }
+                        if i % 15 == 0 {
+                            let delta = rt.events_since(0);
+                            assert_eq!(
+                                delta.missed, 0,
+                                "no events may be reported missed while under ring capacity"
+                            );
+                        }
+                    }
+                });
+            }
+        });
+
+        let delta = rt.events_since(0);
+        assert_eq!(delta.missed, 0);
+        assert_eq!(delta.items.len() as u64, delta.stats.lifetime_total);
+        assert_eq!(delta.stats.last_seq, delta.stats.lifetime_total);
+        for (idx, ev) in delta.items.iter().enumerate() {
+            let expected_seq = (idx + 1) as u64;
+            assert_eq!(
+                ev.seq, expected_seq,
+                "event ring sequences must be strictly consecutive 1..=N"
+            );
+        }
     }
 }

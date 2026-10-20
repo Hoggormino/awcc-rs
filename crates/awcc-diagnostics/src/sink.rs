@@ -17,7 +17,7 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -117,6 +117,8 @@ pub struct SinkStatus {
 enum Msg {
     Line(String),
     Flush(SyncSender<()>),
+    #[cfg(test)]
+    Pause(SyncSender<()>, mpsc::Receiver<()>),
     Shutdown,
 }
 
@@ -124,7 +126,6 @@ struct Shared {
     status: Mutex<SinkStatus>,
     evidence: Mutex<Option<String>>,
     dropped_queue_full: AtomicU64,
-    paused: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -135,6 +136,8 @@ pub struct FileSink {
     tx: SyncSender<Msg>,
     shared: Arc<Shared>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    pause_resume_tx: Mutex<Option<SyncSender<()>>>,
 }
 
 fn session_file_name(cfg: &SinkConfig, started_ms: u64, segment: u32) -> String {
@@ -274,16 +277,29 @@ impl Writer {
             let n = total - self.reported_queue_drops;
             self.reported_queue_drops = total;
             lock(&self.shared.status).dropped_queue_full = total;
-            let record = serde_json::json!({
-                "seq": 0,
-                "ts_utc": crate::time::rfc3339_millis(now_unix_millis()),
-                "severity": "WARN",
-                "component": "awcc::diagnostics",
-                "code": "events_dropped",
-                "repeat_count": n,
-                "message": format!("{n} event(s) were not written to the log file: writer queue was full"),
-            });
-            self.write_line(&record.to_string());
+            let unix_ms = now_unix_millis();
+            let record = crate::event::Event {
+                session_id: self.cfg.session_id.clone(),
+                seq: 0,
+                ts_utc: crate::time::rfc3339_millis(unix_ms),
+                unix_ms,
+                severity: crate::event::Severity::Warn,
+                component: "awcc::diagnostics".to_string(),
+                category: crate::event::Category::App,
+                op_id: None,
+                action: None,
+                outcome: None,
+                code: Some("events_dropped".to_string()),
+                elapsed_ms: None,
+                repeat_count: Some(n),
+                message: format!(
+                    "{n} event(s) were not written to the log file: writer queue was full"
+                ),
+                fields: std::collections::BTreeMap::new(),
+            };
+            if let Ok(line) = serde_json::to_string(&record) {
+                self.write_line(&line);
+            }
         }
     }
 
@@ -324,9 +340,6 @@ impl Writer {
     fn run(mut self, rx: &mpsc::Receiver<Msg>) {
         self.cleanup();
         loop {
-            while self.shared.paused.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(5));
-            }
             match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(Msg::Line(line)) => {
                     self.report_queue_drops();
@@ -339,6 +352,11 @@ impl Writer {
                     }
                     self.write_evidence();
                     let _ = ack.send(());
+                }
+                #[cfg(test)]
+                Ok(Msg::Pause(ack, resume_rx)) => {
+                    let _ = ack.send(());
+                    let _ = resume_rx.recv();
                 }
                 Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                     self.report_queue_drops();
@@ -376,7 +394,6 @@ impl FileSink {
             }),
             evidence: Mutex::new(None),
             dropped_queue_full: AtomicU64::new(0),
-            paused: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::sync_channel::<Msg>(cfg.queue_capacity.max(1));
         let writer = Writer {
@@ -403,6 +420,8 @@ impl FileSink {
             tx,
             shared,
             handle: Mutex::new(Some(handle)),
+            #[cfg(test)]
+            pause_resume_tx: Mutex::new(None),
         })
     }
 
@@ -459,6 +478,11 @@ impl FileSink {
     /// Flush and stop the writer, waiting up to `timeout`. Buffered events are written on a
     /// best-effort basis; abrupt termination (SIGKILL, power loss) can still lose them.
     pub fn shutdown(&self, timeout: Duration) {
+        #[cfg(test)]
+        {
+            // Ensure a paused writer is unparked so shutdown does not wait on a test pause.
+            let _ = lock(&self.pause_resume_tx).take();
+        }
         let deadline = Instant::now() + timeout;
         loop {
             match self.tx.try_send(Msg::Shutdown) {
@@ -484,7 +508,29 @@ impl FileSink {
 
     #[cfg(test)]
     pub(crate) fn set_paused(&self, paused: bool) {
-        self.shared.paused.store(paused, Ordering::Relaxed);
+        if paused {
+            let mut slot = lock(&self.pause_resume_tx);
+            if slot.is_some() {
+                return;
+            }
+            let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
+            let (resume_tx, resume_rx) = mpsc::sync_channel::<()>(1);
+            let mut msg = Msg::Pause(ack_tx, resume_rx);
+            loop {
+                match self.tx.try_send(msg) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(returned)) => {
+                        msg = returned;
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(TrySendError::Disconnected(_)) => return,
+                }
+            }
+            let _ = ack_rx.recv_timeout(Duration::from_secs(5));
+            *slot = Some(resume_tx);
+        } else if let Some(resume_tx) = lock(&self.pause_resume_tx).take() {
+            let _ = resume_tx.send(());
+        }
     }
 }
 
@@ -498,21 +544,52 @@ pub struct SessionFiles {
     pub newest_mtime: SystemTime,
 }
 
+/// Parsed metadata from a `session-<utc>-<pid>-<session>.<segment>.jsonl` filename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSegmentFileName {
+    pub started_utc_compact: String,
+    pub pid: u32,
+    pub session_id: String,
+    pub segment: u32,
+}
+
+/// Parse `session-<utc>-<pid>-<session>.<segment>.jsonl` with a numeric segment index.
+#[must_use]
+pub fn parse_session_segment_file_name(name: &str) -> Option<ParsedSegmentFileName> {
+    let rest = name.strip_prefix("session-")?;
+    let stem = rest.strip_suffix(".jsonl")?;
+    let (stem, segment_str) = stem.rsplit_once('.')?;
+    if segment_str.is_empty() || !segment_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let segment = segment_str.parse::<u32>().ok()?;
+    let mut parts = stem.splitn(3, '-');
+    let started_utc_compact = parts.next()?;
+    if started_utc_compact.is_empty()
+        || !started_utc_compact
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let sid = parts.next()?;
+    if sid.is_empty() || !sid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(ParsedSegmentFileName {
+        started_utc_compact: started_utc_compact.to_string(),
+        pid,
+        session_id: sid.to_string(),
+        segment,
+    })
+}
+
 /// Parse `session-<utc>-<pid>-<session>.<n>.jsonl` / `evidence-<session>.json`.
 #[must_use]
 pub fn parse_log_file_name(name: &str) -> Option<(String, Option<u32>)> {
-    if let Some(rest) = name.strip_prefix("session-")
-        && let Some(stem) = rest.strip_suffix(".jsonl")
-        && let Some((stem, segment)) = stem.rsplit_once('.')
-        && segment.chars().all(|c| c.is_ascii_digit())
-    {
-        let mut parts = stem.splitn(3, '-');
-        let _utc = parts.next()?;
-        let pid = parts.next()?.parse::<u32>().ok()?;
-        let sid = parts.next()?;
-        if sid.chars().all(|c| c.is_ascii_hexdigit()) && !sid.is_empty() {
-            return Some((sid.to_string(), Some(pid)));
-        }
+    if let Some(seg) = parse_session_segment_file_name(name) {
+        return Some((seg.session_id, Some(seg.pid)));
     }
     if let Some(rest) = name.strip_prefix("evidence-")
         && let Some(sid) = rest.strip_suffix(".json")
@@ -522,6 +599,21 @@ pub fn parse_log_file_name(name: &str) -> Option<(String, Option<u32>)> {
         return Some((sid.to_string(), None));
     }
     None
+}
+
+/// Sort key for paths within a session so numeric `.jsonl` segments (`0, 1, ..., 9, 10`) are
+/// ordered chronologically rather than lexicographically.
+#[must_use]
+pub fn segment_path_sort_key(path: &Path) -> (u8, String, u32, String) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Some(seg) = parse_session_segment_file_name(&name) {
+        (0, seg.started_utc_compact, seg.segment, name)
+    } else {
+        (1, String::new(), u32::MAX, name)
+    }
 }
 
 /// List log/evidence files grouped by session. Only regular files with recognised names are
@@ -562,6 +654,9 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionFiles> {
         if mtime > slot.newest_mtime {
             slot.newest_mtime = mtime;
         }
+    }
+    for session in by_session.values_mut() {
+        session.paths.sort_by_key(|p| segment_path_sort_key(p));
     }
     by_session.into_values().collect()
 }
@@ -652,7 +747,7 @@ mod tests {
             .flat_map(|s| s.paths)
             .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
             .collect();
-        files.sort();
+        files.sort_by_key(|p| segment_path_sort_key(p));
         files
             .iter()
             .flat_map(|p| {
@@ -727,7 +822,6 @@ mod tests {
         c.queue_capacity = 8;
         let sink = FileSink::start(c).expect("sink");
         sink.set_paused(true);
-        std::thread::sleep(Duration::from_millis(30));
 
         let started = Instant::now();
         let accepted = (0..500)
@@ -737,17 +831,62 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "emitters must never block on a stalled writer"
         );
-        assert!(accepted <= 9, "accepted {accepted}");
-        assert_eq!(sink.status().dropped_queue_full, (500 - accepted) as u64);
+        assert_eq!(
+            accepted, 8,
+            "acknowledged pause parks writer before queue fills"
+        );
+        let expected_dropped = (500 - accepted) as u64;
+        assert_eq!(sink.status().dropped_queue_full, expected_dropped);
+
+        sink.set_paused(false);
+        assert!(sink.flush(Duration::from_secs(10)));
+
+        // Trigger a second saturation burst so incremental drop reporting across multiple windows
+        // is also verified.
+        sink.set_paused(true);
+        let accepted_second = (500..600)
+            .filter(|i| sink.try_send_line(format!("{{\"n\":{i}}}")))
+            .count();
+        assert_eq!(accepted_second, 8);
+        let total_expected_dropped = expected_dropped + (100 - accepted_second) as u64;
+        assert_eq!(sink.status().dropped_queue_full, total_expected_dropped);
 
         sink.set_paused(false);
         assert!(sink.flush(Duration::from_secs(10)));
         sink.shutdown(Duration::from_secs(5));
+
         let lines = read_all_lines(&dir, "cccc0003");
+        let mut payload_count = 0usize;
+        let mut drop_events: Vec<crate::event::Event> = Vec::new();
+        for line in &lines {
+            let val: serde_json::Value =
+                serde_json::from_str(line).expect("every persisted line must be valid JSON");
+            if val.get("code").and_then(serde_json::Value::as_str) == Some("events_dropped") {
+                let ev: crate::event::Event = serde_json::from_str(line)
+                    .expect("events_dropped line must deserialize as a full Event");
+                assert_eq!(ev.session_id, "cccc0003");
+                assert_eq!(ev.seq, 0);
+                assert_eq!(ev.severity, crate::event::Severity::Warn);
+                drop_events.push(ev);
+            } else if val.get("n").is_some() {
+                payload_count += 1;
+            }
+        }
+        assert_eq!(payload_count, accepted + accepted_second);
         assert!(
-            lines.iter().any(|l| l.contains("events_dropped")
-                && l.contains(&format!("\"repeat_count\":{}", 500 - accepted))),
-            "a drop record states how many events were lost: {lines:?}"
+            !drop_events.is_empty(),
+            "at least one events_dropped Event must be persisted: {lines:?}"
+        );
+        let reported_sum: u64 = drop_events
+            .iter()
+            .map(|ev| {
+                ev.repeat_count
+                    .expect("events_dropped must carry repeat_count")
+            })
+            .sum();
+        assert_eq!(
+            reported_sum, total_expected_dropped,
+            "sum of incremental events_dropped repeat_count values must equal total dropped lines: {drop_events:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
