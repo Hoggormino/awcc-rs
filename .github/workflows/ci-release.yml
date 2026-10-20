@@ -59,6 +59,9 @@ jobs:
           node scripts/test-issue-intake.mjs
           node scripts/test-issue-investigate.mjs
 
+      - name: Run offline release publisher regression tests
+        run: python3 scripts/test-publish-release.py
+
       - name: Install Ubuntu 24.04 native build and packaging dependencies
         run: |
           sudo apt-get update

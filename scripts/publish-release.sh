@@ -83,9 +83,10 @@ if [[ "${MANIFEST_COMMIT}" != "${AWCC_GIT_SHA}" ]]; then
 fi
 
 # Generate release notes
-NOTES_FILE="$(mktemp "${TMPDIR:-/tmp}/awcc-rs-release-notes-XXXXXX.md")"
+RELEASE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/awcc-rs-publish-XXXXXX")"
+NOTES_FILE="${RELEASE_TMP}/release-notes.md"
 cleanup() {
-    rm -f "${NOTES_FILE}"
+    rm -rf -- "${RELEASE_TMP}"
 }
 trap cleanup EXIT
 
@@ -161,13 +162,49 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
 fi
 
 echo "==> Inspecting existing GitHub releases for ${REPO} tag ${RELEASE_TAG}..."
-EXISTING_RELEASE_JSON="$(gh api "repos/${REPO}/releases/tags/${RELEASE_TAG}" 2>/dev/null || true)"
+LOOKUP_EXIT_STATUS=0
+RELEASE_RESPONSE="$(gh api --include "repos/${REPO}/releases/tags/${RELEASE_TAG}" \
+    2>"${RELEASE_TMP}/lookup-error")" || LOOKUP_EXIT_STATUS=$?
+
+# gh prints the JSON error body to stdout even when it exits nonzero. Inspect the
+# actual HTTP status before accepting a release object; only 404 means missing.
+if ! EXISTING_RELEASE_JSON="$(python3 - "${RELEASE_RESPONSE}" "${LOOKUP_EXIT_STATUS}" "${RELEASE_TAG}" <<'PY'
+import json, re, sys
+
+response, exit_status, expected_tag = sys.argv[1:]
+headers, separator, body = response.replace("\r\n", "\n").partition("\n\n")
+status_line = headers.split("\n", 1)[0]
+status = re.fullmatch(r"HTTP/\S+ ([0-9]{3})(?: .*)?", status_line)
+if not separator or not status:
+    raise SystemExit("ERROR: Release lookup did not return a valid HTTP response.")
+http_status = int(status[1])
+if int(exit_status) != 0 and http_status == 404:
+    sys.exit(0)
+if int(exit_status) != 0 or http_status != 200:
+    raise SystemExit(f"ERROR: Release lookup failed (HTTP {http_status}, gh exit {exit_status}).")
+try:
+    release = json.loads(body)
+except json.JSONDecodeError as error:
+    raise SystemExit(f"ERROR: Release lookup returned invalid JSON: {error}") from error
+if (not isinstance(release, dict)
+        or type(release.get("id")) is not int or release["id"] <= 0
+        or release.get("tag_name") != expected_tag
+        or type(release.get("draft")) is not bool
+        or not isinstance(release.get("assets"), list)):
+    raise SystemExit("ERROR: Release lookup returned an invalid release object.")
+print(json.dumps(release))
+PY
+)"; then
+    cat "${RELEASE_TMP}/lookup-error" >&2
+    exit 1
+fi
 
 if [[ -n "${EXISTING_RELEASE_JSON}" ]]; then
-    IS_DRAFT="$(python3 -c 'import json,sys; print(str(json.loads(sys.stdin.read()).get("draft", False)).lower())' <<<"${EXISTING_RELEASE_JSON}")"
+    IS_DRAFT="$(python3 -c 'import json,sys; print(str(json.load(sys.stdin)["draft"]).lower())' <<<"${EXISTING_RELEASE_JSON}")"
     if [[ "${IS_DRAFT}" == "false" ]]; then
         echo "==> Release ${RELEASE_TAG} is already published. Verifying source identity and recorded asset manifest for safe retry..."
-        VERIFY_TMP="$(mktemp -d "${TMPDIR:-/tmp}/awcc-rs-pub-verify-XXXXXX")"
+        VERIFY_TMP="${RELEASE_TMP}/published"
+        mkdir -p "${VERIFY_TMP}"
         gh release download "${RELEASE_TAG}" --repo "${REPO}" --dir "${VERIFY_TMP}" --pattern "build-manifest.json" --pattern "SHA256SUMS"
         python3 - "${EXISTING_RELEASE_JSON}" "${VERIFY_TMP}/build-manifest.json" "${AWCC_GIT_SHA}" "${AWCC_VERSION}" "${ALL_ASSETS[@]}" <<'PY'
 import json, sys
@@ -219,16 +256,29 @@ PY
     fi
 fi
 
-# Check if a draft release for this tag already exists (gh api repos/:owner/:repo/releases lists drafts)
-DRAFT_ID="$(gh api "repos/${REPO}/releases?per_page=50" \
+# Drafts may only be visible through the release list. Search every page before
+# creating a new release, or reuse the validated draft returned by tag lookup.
+if [[ -n "${EXISTING_RELEASE_JSON}" ]]; then
+    DRAFT_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${EXISTING_RELEASE_JSON}")"
+else
+    DRAFT_ID="$(gh api --paginate --slurp "repos/${REPO}/releases?per_page=100" \
     | python3 -c '
 import json, sys
 tag = sys.argv[1]
-for r in json.load(sys.stdin):
-    if r.get("draft") and r.get("tag_name") == tag:
-        print(r["id"])
-        break
+pages = json.load(sys.stdin)
+if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+    raise SystemExit("ERROR: Draft discovery returned an invalid release list.")
+for page in pages:
+    for release in page:
+        if not isinstance(release, dict):
+            raise SystemExit("ERROR: Draft discovery returned an invalid release object.")
+        if release.get("draft") is True and release.get("tag_name") == tag:
+            if type(release.get("id")) is not int or release["id"] <= 0:
+                raise SystemExit("ERROR: Draft discovery returned an invalid release id.")
+            print(release["id"])
+            sys.exit(0)
 ' "${RELEASE_TAG}")"
+fi
 
 if [[ -n "${DRAFT_ID}" ]]; then
     echo "==> Resuming existing draft release (id=${DRAFT_ID}) for ${RELEASE_TAG}..."
