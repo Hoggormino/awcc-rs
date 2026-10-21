@@ -6,7 +6,7 @@
 //! `wValue = 0x0202`, `wIndex = 0` for send; `0xA1`, `0x01`, `0x0101`, `0` for receive)
 //! while providing deterministic simulation and write-audit instrumentation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1030,6 +1030,8 @@ pub struct EffectController<T: UsbHidTransport> {
     transport: T,
     zones: Vec<u8>,
     zone_effects: BTreeMap<u8, LightingEffect>,
+    commanded_zones: BTreeSet<u8>,
+    commanded_power_slots: BTreeSet<u16>,
     brightness: u8,
     pre_stealth_brightness: u8,
     stealth_enabled: bool,
@@ -1060,6 +1062,8 @@ impl<T: UsbHidTransport> EffectController<T> {
             transport,
             zones,
             zone_effects,
+            commanded_zones: BTreeSet::new(),
+            commanded_power_slots: BTreeSet::new(),
             brightness: initial_brightness,
             pre_stealth_brightness: initial_brightness,
             stealth_enabled: false,
@@ -1124,6 +1128,20 @@ impl<T: UsbHidTransport> EffectController<T> {
     #[must_use]
     pub const fn state_source(&self) -> LightingStateSource {
         self.state_source
+    }
+
+    /// Zones whose colour/effect has been explicitly commanded in this process (and is therefore
+    /// a remembered session value rather than the pre-seeded assumed cyan default).
+    #[must_use]
+    pub const fn commanded_zones(&self) -> &BTreeSet<u8> {
+        &self.commanded_zones
+    }
+
+    /// Power-button state slots (`0x005B..=0x0060`) whose colour has been explicitly commanded
+    /// in this process (and is therefore a remembered session value rather than an assumed default).
+    #[must_use]
+    pub const fn commanded_power_slots(&self) -> &BTreeSet<u16> {
+        &self.commanded_power_slots
     }
 
     fn brightness_file_path(&self) -> PathBuf {
@@ -1330,6 +1348,12 @@ impl<T: UsbHidTransport> EffectController<T> {
         match self.run_transaction(&reports) {
             Ok(receipt) => {
                 self.state_source = LightingStateSource::Commanded;
+                self.commanded_zones.extend(resolved.iter().copied());
+                if resolved.contains(&POWER_BUTTON_LED_ID) {
+                    for slot in PowerStateSlot::ALL {
+                        self.commanded_power_slots.insert(slot.slot_id());
+                    }
+                }
                 Ok(receipt)
             }
             Err(err) => {
@@ -1347,7 +1371,16 @@ impl<T: UsbHidTransport> EffectController<T> {
     ) -> Result<TransactionReceipt, UsbTransactionError> {
         let resolved = target.resolve(&self.zones);
         let reports = build_set_color_packets(color, &resolved);
-        self.run_transaction(&reports)
+        let receipt = self.run_transaction(&reports)?;
+        if !resolved.is_empty() {
+            self.state_source = LightingStateSource::Commanded;
+            self.commanded_zones.extend(resolved.iter().copied());
+            if resolved.contains(&POWER_BUTTON_LED_ID) {
+                self.commanded_power_slots
+                    .insert(PowerStateSlot::AcOn.slot_id());
+            }
+        }
+        Ok(receipt)
     }
 
     /// Program a single power-button state slot (`0x005B..=0x0060`) on LED `0x02`.
@@ -1364,7 +1397,16 @@ impl<T: UsbHidTransport> EffectController<T> {
         ) {
             reports.extend(build_set_color_packets(color, &[POWER_BUTTON_LED_ID]));
         }
-        self.run_transaction(&reports)
+        let receipt = self.run_transaction(&reports)?;
+        self.state_source = LightingStateSource::Commanded;
+        self.commanded_power_slots.insert(slot.slot_id());
+        if matches!(
+            slot,
+            PowerStateSlot::AcOn | PowerStateSlot::Charging | PowerStateSlot::DcOn
+        ) {
+            self.commanded_zones.insert(POWER_BUTTON_LED_ID);
+        }
+        Ok(receipt)
     }
 
     /// Program all 6 power-button state slots (`0x005B..=0x0060`) on LED `0x02` matching
@@ -1391,6 +1433,10 @@ impl<T: UsbHidTransport> EffectController<T> {
         match self.run_transaction(&reports) {
             Ok(receipt) => {
                 self.state_source = LightingStateSource::Commanded;
+                self.commanded_zones.insert(POWER_BUTTON_LED_ID);
+                for slot in PowerStateSlot::ALL {
+                    self.commanded_power_slots.insert(slot.slot_id());
+                }
                 Ok(receipt)
             }
             Err(err) => {

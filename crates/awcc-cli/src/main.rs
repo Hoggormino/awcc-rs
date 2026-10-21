@@ -940,12 +940,20 @@ pub fn execute_active_cli_command(
             )))
         }
         CliCommand::DaemonMode => {
-            bail!("daemon mode (-d) is not implemented in awcc-cli; no daemon was started")
+            bail!("daemon mode is dispatched before command execution")
         }
         CliCommand::GuiMode => {
             bail!("GUI mode (-g) is not part of awcc-cli; run `awcc-gui` instead")
         }
     }
+}
+
+/// Serve the privileged socket until the process is stopped (systemd sends SIGTERM).
+fn run_privileged_daemon() -> Result<CliOutput> {
+    let path = awcc_service::daemon::DEFAULT_SOCKET_PATH;
+    awcc_service::daemon::run_daemon(path)
+        .with_context(|| format!("failed to serve the privileged daemon socket at {path}"))?;
+    Ok(CliOutput::line(format!("daemon stopped ({path})")))
 }
 
 /// Hardware/profile construction, injectable so tests can prove which paths touch a backend.
@@ -1076,6 +1084,12 @@ pub fn run_with_log_dir(
         CliCommand::DiagnosticsSummary { .. } | CliCommand::DiagnosticsExport { .. } => {
             execute_passive_diagnostics_command(&inv.command, &inv, log_dir)
         }
+        CliCommand::DaemonMode if inv.sim_mode => Err(anyhow::anyhow!(
+            "daemon mode serves real hardware only and cannot be combined with --sim"
+        )),
+        // The daemon owns only the privileged kernel writes; it must not open USB or ACPI
+        // transports itself, so it is dispatched before any orchestrator is built.
+        CliCommand::DaemonMode => run_privileged_daemon(),
         other => backends.orchestrator(inv.sim_mode).and_then(|mut orch| {
             orch.set_trace_raw_usb(trace_raw_usb);
             execute_active_cli_command(other, &mut orch)

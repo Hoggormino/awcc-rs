@@ -15,8 +15,9 @@ Security fixes are applied to the latest release series on `main`. Please verify
 
 Because `awcc-rs` interacts with privileged hardware interfaces on Linux, the following areas are treated as security-sensitive:
 
-1. **Privileged Daemon IPC (`/tmp/awcc.sock`, `crates/awcc-service/src/daemon.rs`)**:
+1. **Privileged Daemon IPC (`/run/awcc/awcc.sock`, `crates/awcc-service/src/daemon.rs`)**:
    - The daemon validates incoming requests against a strict command allowlist (`WMAX` ACPI calls, Intel/AMD turbo sysfs paths, and `hwmon` PWM/boost paths) before execution. Any bypass of the allowlist or shell/argument injection is a critical vulnerability.
+   - The socket is mode `0666` (any local user may send requests), the same access model as the legacy daemon; only typed, validated requests are accepted and no shell string ever crosses it. Clients without the service never fall back to a per-call `pkexec` unless `AWCC_ALLOW_PKEXEC=1` is set.
 2. **State File Persistence (`/etc/awcc/prev-mode`, `/etc/awcc/brightness`)**:
    - `PosixStateStorage` refuses to read or write through symlinks (`O_NOFOLLOW`) to prevent local symlink-race file overwrite attacks.
 3. **Diagnostic Support Bundles & Redaction (`crates/awcc-diagnostics`)**:

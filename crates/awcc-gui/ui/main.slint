@@ -116,6 +116,10 @@ export component MainWindow inherits MaterialWindow {
     in property <color> zone-tron-color: #00f0ff;
     in property <color> zone-kbd-color: #00f0ff;
     in property <color> zone-power-color: #00f0ff;
+    in property <string> zone-logo-provenance: "Assumed default";
+    in property <string> zone-tron-provenance: "Assumed default";
+    in property <string> zone-kbd-provenance: "Assumed default";
+    in property <string> zone-power-provenance: "Assumed default";
     in property <string> elc-firmware-summary: "ELC controller diagnostics: not yet observed";
     // Why any telemetry value is unavailable or stale (empty when every reading is current).
     in property <string> telemetry-notice: "";
@@ -1059,11 +1063,21 @@ export component MainWindow inherits MaterialWindow {
                                         border-radius: 7px;
                                         background: root.zone-tron-color;
                                     }
-                                    MaterialText {
-                                        vertical-alignment: center;
-                                        text: "Stadium Top";
-                                        style: MaterialTypography.label_medium_prominent;
-                                        color: MaterialPalette.on_surface;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 1px;
+                                        MaterialText {
+                                            text: "Stadium Top";
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: MaterialPalette.on_surface;
+                                            overflow: elide;
+                                        }
+                                        MaterialText {
+                                            text: root.zone-tron-provenance;
+                                            style: MaterialTypography.label_small;
+                                            color: MaterialPalette.on_surface_variant;
+                                            overflow: elide;
+                                        }
                                     }
                                 }
                             }
@@ -1086,11 +1100,21 @@ export component MainWindow inherits MaterialWindow {
                                         border-radius: 7px;
                                         background: root.zone-logo-color;
                                     }
-                                    MaterialText {
-                                        vertical-alignment: center;
-                                        text: "Alienhead Logo";
-                                        style: MaterialTypography.label_medium_prominent;
-                                        color: MaterialPalette.on_surface;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 1px;
+                                        MaterialText {
+                                            text: "Alienhead Logo";
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: MaterialPalette.on_surface;
+                                            overflow: elide;
+                                        }
+                                        MaterialText {
+                                            text: root.zone-logo-provenance;
+                                            style: MaterialTypography.label_small;
+                                            color: MaterialPalette.on_surface_variant;
+                                            overflow: elide;
+                                        }
                                     }
                                 }
                             }
@@ -1113,11 +1137,21 @@ export component MainWindow inherits MaterialWindow {
                                         border-radius: 7px;
                                         background: root.zone-tron-color;
                                     }
-                                    MaterialText {
-                                        vertical-alignment: center;
-                                        text: "Stadium Bottom";
-                                        style: MaterialTypography.label_medium_prominent;
-                                        color: MaterialPalette.on_surface;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 1px;
+                                        MaterialText {
+                                            text: "Stadium Bottom";
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: MaterialPalette.on_surface;
+                                            overflow: elide;
+                                        }
+                                        MaterialText {
+                                            text: root.zone-tron-provenance;
+                                            style: MaterialTypography.label_small;
+                                            color: MaterialPalette.on_surface_variant;
+                                            overflow: elide;
+                                        }
                                     }
                                 }
                             }
@@ -1140,11 +1174,21 @@ export component MainWindow inherits MaterialWindow {
                                         border-radius: 7px;
                                         background: root.zone-power-color;
                                     }
-                                    MaterialText {
-                                        vertical-alignment: center;
-                                        text: "Power Button";
-                                        style: MaterialTypography.label_medium_prominent;
-                                        color: MaterialPalette.on_surface;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 1px;
+                                        MaterialText {
+                                            text: "Power Button";
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: MaterialPalette.on_surface;
+                                            overflow: elide;
+                                        }
+                                        MaterialText {
+                                            text: root.zone-power-provenance;
+                                            style: MaterialTypography.label_small;
+                                            color: MaterialPalette.on_surface_variant;
+                                            overflow: elide;
+                                        }
                                     }
                                 }
                             }
@@ -1178,11 +1222,21 @@ export component MainWindow inherits MaterialWindow {
                                         border-radius: 4px;
                                         background: root.zone-kbd-color;
                                     }
-                                    MaterialText {
-                                        vertical-alignment: center;
-                                        text: zone_label;
-                                        style: MaterialTypography.label_medium_prominent;
-                                        color: MaterialPalette.on_surface;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 1px;
+                                        MaterialText {
+                                            text: zone_label;
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: MaterialPalette.on_surface;
+                                            overflow: elide;
+                                        }
+                                        MaterialText {
+                                            text: root.zone-kbd-provenance;
+                                            style: MaterialTypography.label_small;
+                                            color: MaterialPalette.on_surface_variant;
+                                            overflow: elide;
+                                        }
                                     }
                                 }
                             }

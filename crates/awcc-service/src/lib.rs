@@ -21,7 +21,7 @@
 //! the optional acknowledgement read that follows it.
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -99,6 +99,13 @@ pub struct SystemSnapshot {
     pub lighting_persist_boot: bool,
     pub lighting_zone_colors: BTreeMap<u8, u32>,
     pub lighting_power_colors: BTreeMap<u16, u32>,
+    /// Zones (`u8`) whose colour/effect has been explicitly commanded in this session (making
+    /// their `lighting_zone_colors` entry a remembered session value rather than an assumed default).
+    pub lighting_commanded_zones: BTreeSet<u8>,
+    /// Power-button state slots (`0x005B..=0x0060`) whose colour has been explicitly commanded
+    /// in this session (making their `lighting_power_colors` entry a remembered session value
+    /// rather than an assumed default).
+    pub lighting_commanded_power_slots: BTreeSet<u16>,
     /// ELC firmware/config diagnostics. `NotObserved`/`Unavailable` never fall back to made-up
     /// values; `Stale` carries the age of the last good report and the failure that replaced it.
     pub elc_diagnostics: Observation<ElcDiagnosticsSummary>,
@@ -1112,6 +1119,8 @@ impl ThermalOrchestrator {
             lighting_persist_boot: self.lighting_persist_boot,
             lighting_zone_colors: self.lighting.transport().zone_colors().clone(),
             lighting_power_colors: self.lighting.transport().power_slot_colors().clone(),
+            lighting_commanded_zones: self.lighting.commanded_zones().clone(),
+            lighting_commanded_power_slots: self.lighting.commanded_power_slots().clone(),
             elc_diagnostics: self.elc_observation.clone(),
             lifecycle: self.lifecycle.clone(),
             operation_id: self.operation_id,
@@ -2966,8 +2975,40 @@ mod tests {
             first.lighting_state_source,
             LightingStateSource::AssumedDefault | LightingStateSource::PersistedBrightness
         ));
-        let after = orch.set_brightness(55);
-        assert_eq!(after.lighting_state_source, LightingStateSource::Commanded);
+        assert!(first.lighting_commanded_zones.is_empty());
+        assert!(first.lighting_commanded_power_slots.is_empty());
+
+        let after_dim = orch.set_brightness(55);
+        assert_eq!(
+            after_dim.lighting_state_source,
+            LightingStateSource::Commanded
+        );
+        assert!(
+            after_dim.lighting_commanded_zones.is_empty(),
+            "brightness alone must not mark uncommanded zone colour swatches as commanded"
+        );
+        assert!(after_dim.lighting_commanded_power_slots.is_empty());
+
+        let after_kbd = orch.apply_lighting(
+            LightingEffect::Static { color: 0xA855F7 },
+            ZoneTarget::Keyboard,
+            false,
+        );
+        for z in 0x04_u8..=0x07 {
+            assert!(after_kbd.lighting_commanded_zones.contains(&z));
+        }
+        assert!(!after_kbd.lighting_commanded_zones.contains(&0x03));
+        assert!(!after_kbd.lighting_commanded_zones.contains(&0x00));
+        assert!(!after_kbd.lighting_commanded_zones.contains(&0x02));
+        assert!(after_kbd.lighting_commanded_power_slots.is_empty());
+
+        let after_pwr = orch.set_power_button_colors(0x00F0FF, 0x00C8FF, 0xFFB400, 0xFF2828);
+        assert!(after_pwr.lighting_commanded_zones.contains(&0x02));
+        assert!(
+            after_pwr
+                .lighting_commanded_power_slots
+                .contains(&awcc_core::lighting::PowerStateSlot::AcOn.slot_id())
+        );
     }
 
     // --- Worker handle ------------------------------------------------------------------------

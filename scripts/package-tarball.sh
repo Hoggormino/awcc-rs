@@ -86,6 +86,7 @@ for req_file in \
     "share/awcc/database.json" \
     "share/awcc/package-format" \
     "share/applications/awcc-gui.desktop" \
+    "share/systemd/awccd.service" \
     "share/icons/hicolor/scalable/apps/awcc-gui.svg" \
     "share/icons/hicolor/256x256/apps/awcc-gui.png" \
     "share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" \

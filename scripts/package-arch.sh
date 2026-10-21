@@ -130,6 +130,7 @@ for req_file in \
     "usr/share/awcc/database.json" \
     "usr/share/awcc/package-format" \
     "usr/share/applications/awcc-gui.desktop" \
+    "usr/lib/systemd/system/awccd.service" \
     "usr/share/icons/hicolor/scalable/apps/awcc-gui.svg" \
     "usr/share/icons/hicolor/256x256/apps/awcc-gui.png" \
     "usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" \

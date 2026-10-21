@@ -95,6 +95,7 @@ if command -v rpm >/dev/null 2>&1; then
     grep -qx "/usr/share/awcc/database.json" <<<"${RPM_FILES}"
     grep -qx "/usr/share/awcc/package-format" <<<"${RPM_FILES}"
     grep -qx "/usr/share/applications/awcc-gui.desktop" <<<"${RPM_FILES}"
+    grep -qx "/usr/lib/systemd/system/awccd.service" <<<"${RPM_FILES}"
     grep -qx "/usr/share/licenses/awcc-rs/LICENSE" <<<"${RPM_FILES}"
     grep -qx "/usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" <<<"${RPM_FILES}"
 fi

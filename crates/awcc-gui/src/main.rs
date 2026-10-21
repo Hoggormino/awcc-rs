@@ -638,11 +638,34 @@ fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_slide
     } else {
         "Session Only"
     };
+    let is_commanded = snap.lighting_state_source == LightingStateSource::Commanded;
+    let logo_commanded = is_commanded && snap.lighting_commanded_zones.contains(&0x03);
+    let tron_commanded = is_commanded
+        && (snap.lighting_commanded_zones.contains(&0x00)
+            || snap.lighting_commanded_zones.contains(&0x01));
+    let kbd_commanded =
+        is_commanded && (0x04_u8..=0x07).any(|z| snap.lighting_commanded_zones.contains(&z));
+    let power_commanded = is_commanded
+        && (snap.lighting_commanded_zones.contains(&0x02)
+            || snap
+                .lighting_commanded_power_slots
+                .contains(&PowerStateSlot::AcOn.slot_id()));
+    let any_zone_commanded = logo_commanded || tron_commanded || kbd_commanded || power_commanded;
+    let all_zones_commanded = logo_commanded && tron_commanded && kbd_commanded && power_commanded;
+
     // The ELC protocol has no readback of colours or brightness: say where the values come from.
     let provenance = match snap.lighting_state_source {
-        LightingStateSource::Commanded => "",
+        LightingStateSource::Commanded if all_zones_commanded => {
+            " · remembered from last command (no ELC colour readback)"
+        }
+        LightingStateSource::Commanded if any_zone_commanded => {
+            " · remembered for commanded zones; others show assumed defaults"
+        }
+        LightingStateSource::Commanded => {
+            " · brightness commanded (remembered); zone swatches show assumed defaults"
+        }
         LightingStateSource::PersistedBrightness => {
-            " · brightness restored from saved setting, effect not yet commanded"
+            " · brightness restored from saved setting, effect & swatches assumed default"
         }
         LightingStateSource::AssumedDefault => " · assumed defaults, nothing commanded yet",
     };
@@ -678,6 +701,17 @@ fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_slide
     ui.set_zone_tron_color(u32_to_slint_color(tron_rgb));
     ui.set_zone_kbd_color(u32_to_slint_color(kbd_rgb));
     ui.set_zone_power_color(u32_to_slint_color(pwr_rgb));
+    let swatch_provenance = |commanded: bool| -> SharedString {
+        if commanded {
+            SharedString::from("Remembered (commanded)")
+        } else {
+            SharedString::from("Assumed default")
+        }
+    };
+    ui.set_zone_logo_provenance(swatch_provenance(logo_commanded));
+    ui.set_zone_tron_provenance(swatch_provenance(tron_commanded));
+    ui.set_zone_kbd_provenance(swatch_provenance(kbd_commanded));
+    ui.set_zone_power_provenance(swatch_provenance(power_commanded));
 
     ui.set_elc_firmware_summary(SharedString::from(format_elc_summary(
         &snap.elc_diagnostics,
@@ -2511,7 +2545,72 @@ mod tests {
             ui.get_active_lighting_summary()
                 .contains("assumed defaults")
         );
+        assert_eq!(ui.get_zone_logo_provenance().as_str(), "Assumed default");
+        assert_eq!(ui.get_zone_tron_provenance().as_str(), "Assumed default");
+        assert_eq!(ui.get_zone_kbd_provenance().as_str(), "Assumed default");
+        assert_eq!(ui.get_zone_power_provenance().as_str(), "Assumed default");
         assert!(ui.get_build_summary().starts_with("Build: awcc-gui "));
+
+        let mut orch = ThermalOrchestrator::new_simulated_m15_r6().expect("sim");
+        let after_dim = orch.set_brightness(55);
+        sync_snapshot_to_ui(&ui, &after_dim, true);
+        assert!(
+            ui.get_active_lighting_summary()
+                .contains("zone swatches show assumed defaults"),
+            "summary: {}",
+            ui.get_active_lighting_summary()
+        );
+        assert_eq!(ui.get_zone_logo_provenance().as_str(), "Assumed default");
+        assert_eq!(ui.get_zone_kbd_provenance().as_str(), "Assumed default");
+
+        let after_kbd = orch.apply_lighting(
+            LightingEffect::Static { color: 0xA855F7 },
+            ZoneTarget::Keyboard,
+            false,
+        );
+        sync_snapshot_to_ui(&ui, &after_kbd, true);
+        assert_eq!(
+            ui.get_zone_kbd_provenance().as_str(),
+            "Remembered (commanded)"
+        );
+        assert_eq!(ui.get_zone_logo_provenance().as_str(), "Assumed default");
+        assert_eq!(ui.get_zone_tron_provenance().as_str(), "Assumed default");
+        assert_eq!(ui.get_zone_power_provenance().as_str(), "Assumed default");
+        assert!(
+            ui.get_active_lighting_summary()
+                .contains("remembered for commanded zones; others show assumed defaults"),
+            "summary: {}",
+            ui.get_active_lighting_summary()
+        );
+
+        let after_all = orch.apply_lighting(
+            LightingEffect::Static { color: 0x00F0FF },
+            ZoneTarget::All,
+            true,
+        );
+        sync_snapshot_to_ui(&ui, &after_all, true);
+        assert_eq!(
+            ui.get_zone_logo_provenance().as_str(),
+            "Remembered (commanded)"
+        );
+        assert_eq!(
+            ui.get_zone_tron_provenance().as_str(),
+            "Remembered (commanded)"
+        );
+        assert_eq!(
+            ui.get_zone_kbd_provenance().as_str(),
+            "Remembered (commanded)"
+        );
+        assert_eq!(
+            ui.get_zone_power_provenance().as_str(),
+            "Remembered (commanded)"
+        );
+        assert!(
+            ui.get_active_lighting_summary()
+                .contains("remembered from last command (no ELC colour readback)"),
+            "summary: {}",
+            ui.get_active_lighting_summary()
+        );
 
         let healthy = healthy_snapshot();
         sync_snapshot_to_ui(&ui, &healthy, true);

@@ -18,7 +18,7 @@ All release artifacts target **Linux `x86_64` (`x86_64-unknown-linux-gnu`)** bui
 
 ### Runtime Hardware Prerequisites (Live Mode)
 
-- **Thermal / Fan / G-Mode / TCC**: Requires the `acpi_call` kernel module (`acpi_call-dkms`, exposing `/proc/acpi/call`) and either a running privileged `awccd` daemon (`/tmp/awcc.sock`) or PolicyKit (`pkexec`).
+- **Thermal / Fan / G-Mode / TCC**: Requires the `acpi_call` kernel module (`acpi_call-dkms`, exposing `/proc/acpi/call`) and the privileged `awccd` service (`sudo systemctl enable --now awccd.service`, socket `/run/awcc/awcc.sock`).
 - **RGB Lighting / Brightness / Stealth**: Communicates directly with the Alienware USB HID ELC controller (`0x187c:0x0550` or `0x187c:0x0551`) via `libusb`/`rusb`. Install `/etc/udev/rules.d/70-awcc.rules` and reload udev (`sudo udevadm control --reload-rules && sudo udevadm trigger`) for unprivileged access.
 
 ---

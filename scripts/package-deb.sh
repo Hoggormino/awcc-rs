@@ -49,6 +49,7 @@ mkdir -p \
     "${PKG_ROOT}/etc/awcc" \
     "${PKG_ROOT}/usr/bin" \
     "${PKG_ROOT}/usr/share/awcc" \
+    "${PKG_ROOT}/usr/lib/systemd/system" \
     "${PKG_ROOT}/usr/share/applications" \
     "${PKG_ROOT}/usr/share/icons/hicolor/scalable/apps" \
     "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps" \
@@ -63,6 +64,7 @@ install -m 0644 "${STAGED_DIR}/share/awcc/database.json" "${PKG_ROOT}/usr/share/
 printf 'deb\n' > "${PKG_ROOT}/usr/share/awcc/package-format"
 chmod 0644 "${PKG_ROOT}/usr/share/awcc/package-format"
 install -m 0644 "${STAGED_DIR}/share/applications/awcc-gui.desktop" "${PKG_ROOT}/usr/share/applications/awcc-gui.desktop"
+install -m 0644 "${STAGED_DIR}/share/systemd/awccd.service" "${PKG_ROOT}/usr/lib/systemd/system/awccd.service"
 install -m 0644 "${STAGED_DIR}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "${PKG_ROOT}/usr/share/icons/hicolor/scalable/apps/awcc-gui.svg"
 install -m 0644 "${STAGED_DIR}/share/icons/hicolor/256x256/apps/awcc-gui.png" "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps/awcc-gui.png"
 install -m 0644 "${STAGED_DIR}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "${PKG_ROOT}/usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"
@@ -162,6 +164,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     grep -q "./usr/bin/awcc-gui" <<<"${DEB_CONTENTS}"
     grep -q "./etc/awcc/database.json" <<<"${DEB_CONTENTS}"
     grep -q "./usr/share/awcc/package-format" <<<"${DEB_CONTENTS}"
+    grep -q "./usr/lib/systemd/system/awccd.service" <<<"${DEB_CONTENTS}"
 else
     ar t "${DEB_PATH}" | grep -qx "debian-binary"
     ar t "${DEB_PATH}" | grep -qx "control.tar.gz"

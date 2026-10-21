@@ -150,7 +150,7 @@ cd ${AWCC_TARBALL_BASENAME}
 
 ### Hardware Prerequisites (Live Hardware Mode)
 
-- **ACPI WMAX Thermal / Fan / G-Mode Control**: Requires the \`acpi_call\` kernel module (\`/proc/acpi/call\`) and either a running \`awccd\` socket service (\`/tmp/awcc.sock\`) or \`pkexec\` privileges.
+- **ACPI WMAX Thermal / Fan / G-Mode Control**: Requires the \`acpi_call\` kernel module (\`/proc/acpi/call\`) and the privileged \`awccd\` service (\`sudo systemctl enable --now awccd.service\`, socket \`/run/awcc/awcc.sock\`).
 - **Alienware ELC RGB Lighting (\`0x187c:0x0550\` / \`0x0551\`)**: Requires USB device read/write access via \`libusb-1.0\`.
 - **Simulation Mode (\`--sim\`)**: Runs on any Linux \`x86_64\` system without Alienware hardware, root privileges, or a GPU.
 EOF

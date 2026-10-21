@@ -8,7 +8,7 @@ This document provides the public-safe repository guidance, validation commands,
 - `crates/awcc-build-info` — Compile-time and runtime build identity (`--version`) shared by `awcc-cli` and `awcc-gui`.
 - `crates/awcc-diagnostics` — Structured `tracing` subscriber layer, sequence-aware `SeqRing<T>`, non-blocking rotating session log sink (`$XDG_STATE_HOME/awcc-rs/logs`, 50 MiB budget), allowlist PII redactor, panic hook crash capture, and passive `.zip` support-report bundler.
 - `crates/awcc-platform` — Transport traits (`ThermalTransport`, `StateStorage`, `ElcUsbTransport`), Linux backends (`/proc/acpi/call` WMAX, `hwmon`, `rusb` USB HID), and deterministic offline simulators (`SimBackend`, `SimFaults`, `MockElcDevice`, `SimUsbElcTransport`).
-- `crates/awcc-service` — Background worker (`ThermalServiceHandle`), `ThermalOrchestrator`, privileged Unix-socket allowlist daemon (`/tmp/awcc.sock`), and `evdev` hotkey keybinder.
+- `crates/awcc-service` — Background worker (`ThermalServiceHandle`), `ThermalOrchestrator`, privileged Unix-socket allowlist daemon (`/run/awcc/awcc.sock`), and `evdev` hotkey keybinder.
 - `crates/awcc-gui` — Resizable Slint Material 3 desktop application (`1120×720` normal down to `880×620` compact), simulation scenario selector (`--sim`), passive support export, and headless PNG screenshot renderer (`--screenshot`).
 - `crates/awcc-cli` — Command-line interface (`awcc-cli`) for thermal/fan/lighting control and passive diagnostics (`device-info`, `diagnostics summary`, `diagnostics export`).
 

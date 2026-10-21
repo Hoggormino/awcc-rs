@@ -29,6 +29,7 @@ System Installation from Binary Archive
   sudo install -Dm755 bin/awcc-gui /usr/local/bin/awcc-gui
   sudo install -Dm644 share/awcc/database.json /etc/awcc/database.json
   sudo install -Dm644 share/applications/awcc-gui.desktop /usr/local/share/applications/awcc-gui.desktop
+  sudo install -Dm644 share/systemd/awccd.service /etc/systemd/system/awccd.service   # then edit ExecStart to /usr/local/bin/awcc-cli -d
   sudo install -Dm644 share/icons/hicolor/scalable/apps/awcc-gui.svg /usr/local/share/icons/hicolor/scalable/apps/awcc-gui.svg
   sudo install -Dm644 share/icons/hicolor/256x256/apps/awcc-gui.png /usr/local/share/icons/hicolor/256x256/apps/awcc-gui.png
 
@@ -41,6 +42,8 @@ Hardware Access Prerequisites (Live Hardware Mode Only)
 -------------------------------------------------------
 1. ACPI WMAX Thermal / Fan / G-Mode Control:
    - Requires the `acpi_call` kernel module (`acpi_call-dkms` on Ubuntu/Debian/Arch, `akmod-acpi_call` on Fedora) providing `/proc/acpi/call`.
-   - Requires either a running `awccd` daemon on `/tmp/awcc.sock` or `pkexec` (polkit) privileges for ACPI WMAX writes.
+   - Requires the privileged `awccd` service listening on `/run/awcc/awcc.sock`. The .deb, .rpm and Arch packages install it as `awccd.service`; it is not started automatically. Enable it with:
+       sudo systemctl daemon-reload && sudo systemctl enable --now awccd.service
+   - Without the service, the GUI and CLI report "privileged service unavailable" instead of prompting for a password on every refresh. Running as root also works. Setting AWCC_ALLOW_PKEXEC=1 restores the legacy per-call `pkexec` fallback (one polkit prompt per hardware call).
 2. Alienware USB HID ELC RGB Lighting (`0x187c:0x0550` / `0x187c:0x0551`):
    - Requires read/write access to the USB HID device (via udev rule granting `MODE="0660", TAG+="uaccess"` for `idVendor=="187c", idProduct=="0550"` and `"0551"`).

@@ -196,7 +196,7 @@ Package installation scripts (`postinst`, `%post`, `.INSTALL`) intentionally per
 
 1. **ACPI WMAX Thermal, Fan Boost, TCC Offset & G-Mode Control**:
    - Requires the `acpi_call` kernel module (`acpi-call-dkms` on Ubuntu/Debian, `akmod-acpi_call` on Fedora, `acpi_call` / `acpi_call-dkms` on Arch/CachyOS) exposing `/proc/acpi/call`.
-   - Requires either a running `awccd` privileged daemon listening on `/tmp/awcc.sock` or `pkexec` (polkit) authorization to write `\_SB.<PREFIX>.WMAX` commands to `/proc/acpi/call`.
+   - Requires the packaged `awccd.service` (privileged daemon listening on `/run/awcc/awcc.sock`, enabled by the user with `systemctl enable --now awccd.service`) or root access to write `\_SB.<PREFIX>.WMAX` commands to `/proc/acpi/call`. The per-call `pkexec` fallback is opt-in via `AWCC_ALLOW_PKEXEC=1`.
 2. **Alienware USB HID ELC Lighting (`0x187c:0x0550` / `0x187c:0x0551`)**:
    - Requires read/write access to the USB device via `libusb-1.0` (either via a udev rule granting `MODE="0660", TAG+="uaccess"` for vendor `187c` products `0550`/`0551`, or root privileges).
 
