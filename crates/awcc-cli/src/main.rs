@@ -845,10 +845,15 @@ pub fn execute_active_cli_command(
             finish_operation(orch.execute(ServiceCommand::SetFanCurve(FanCurveConfig::default())))
         }
         CliCommand::ConfigureFanCurve(cfg) => {
-            let mut out = finish_operation(orch.execute(ServiceCommand::SetFanCurve(cfg)))?;
-            out.notes.push(
-                "the background service now owns the curve and keeps following temperatures after this command exits (see `awcc-cli service-status`)".to_string(),
-            );
+            let outcome = orch.execute(ServiceCommand::SetFanCurve(cfg));
+            let service_owned = outcome.snapshot.service_control.is_some();
+            let mut out = finish_operation(outcome)?;
+            let note = if service_owned {
+                "the background service owns this curve and manages it after this command exits"
+            } else {
+                "this process exits after this command; the curve will not keep following temperatures"
+            };
+            out.notes.push(note.to_string());
             Ok(out)
         }
         CliCommand::ApplyLighting {
@@ -1329,6 +1334,11 @@ mod tests {
             "the CLI must say the curve does not keep running: {:?}",
             out_fc.notes
         );
+        assert!(
+            out_fc.notes.iter().all(|n| !n.contains("background service")),
+            "a local curve must not claim service ownership: {:?}",
+            out_fc.notes
+        );
 
         // 4. Apply volatile static lighting to keyboard zone group
         let cmd_light = parse_cli_args(&to_args(&[
@@ -1359,6 +1369,91 @@ mod tests {
         let out_raw = execute_active_cli_command(cmd_raw, &mut orch).unwrap();
         assert!(out_raw.stdout.contains("platform=0x0F01"));
         assert!(out_raw.stdout.contains("2.0.5"));
+    }
+
+    #[test]
+    fn service_backed_fan_curve_reports_ownership_only_on_success() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use awcc_core::OperationLifecycle;
+        use awcc_service::{
+            RemoteThermal,
+            control::{ControlCore, ControlOp, NullSettingsSink},
+            ipc::ClientError,
+            settings::SettingsLoad,
+            wire::ThermalView,
+        };
+
+        struct SimulatedService {
+            core: ControlCore,
+            unavailable: Arc<AtomicBool>,
+        }
+
+        impl RemoteThermal for SimulatedService {
+            fn refresh(&mut self) -> Result<ThermalView, ClientError> {
+                Ok(self.core.refresh())
+            }
+
+            fn execute(
+                &mut self,
+                op: ControlOp,
+            ) -> Result<(ThermalView, OperationLifecycle), ClientError> {
+                if self.unavailable.load(Ordering::SeqCst) {
+                    return Err(ClientError::Unavailable("test connection lost".to_string()));
+                }
+                assert!(matches!(&op, ControlOp::ConfigureCurve(_)));
+                let reply = self.core.handle(op);
+                let lifecycle = reply
+                    .result
+                    .map_err(|error| ClientError::Rejected(error.message))?;
+                Ok((reply.view, lifecycle))
+            }
+        }
+
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let service = SimulatedService {
+            core: ControlCore::new(
+                ThermalOrchestrator::new_simulated_m15_r6().unwrap(),
+                SettingsLoad::Missing,
+                Arc::new(NullSettingsSink),
+                Duration::from_secs(2),
+            ),
+            unavailable: Arc::clone(&unavailable),
+        };
+        let mut orch = ThermalOrchestrator::new_service_backed(Box::new(service)).unwrap();
+        let cmd = parse_cli_args(&to_args(&[
+            "fancurve", "45", "10", "60", "40", "75", "75", "85", "100", "3",
+        ]))
+        .unwrap();
+        let out = execute_active_cli_command(cmd.clone(), &mut orch).unwrap();
+        assert!(
+            out.notes
+                .iter()
+                .any(|note| note.contains("background service owns this curve")),
+            "{:?}",
+            out.notes
+        );
+        assert!(
+            out.notes
+                .iter()
+                .all(|note| !note.contains("exits after this command")),
+            "{:?}",
+            out.notes
+        );
+
+        unavailable.store(true, Ordering::SeqCst);
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let code = emit(
+            &mut stdout,
+            &mut stderr,
+            execute_active_cli_command(cmd, &mut orch),
+        );
+        assert_eq!(code, 1);
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("test connection lost"), "{stderr}");
+        assert!(!stderr.contains("background service owns"), "{stderr}");
     }
 
     // --- Regression: setters used to print success after failure -------------------------------
