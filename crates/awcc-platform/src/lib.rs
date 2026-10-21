@@ -440,6 +440,58 @@ pub fn resolve_host_device_profile() -> Result<DeviceProfile, CoreError> {
     ))
 }
 
+/// Root-controlled database locations consulted by the privileged daemon, in order.
+pub const TRUSTED_DATABASE_PATHS: &[&str] = &[
+    "/opt/awcc-rs/service/current/share/awcc/database.json",
+    "/usr/share/awcc/database.json",
+    "/etc/awcc/database.json",
+];
+
+/// Resolve the host profile for the privileged daemon.
+///
+/// Unlike [`resolve_host_device_profile`] this ignores `AWCC_DATABASE_PATH`, the working
+/// directory and every user-controlled location: only the listed fixed files are read, each must
+/// be a regular, non-symlink file that is not writable by group or others (and owned by root when
+/// `require_root_owned`), otherwise the next candidate or the compiled-in database is used.
+pub fn resolve_trusted_host_device_profile(
+    candidates: &[PathBuf],
+    require_root_owned: bool,
+) -> Result<DeviceProfile, CoreError> {
+    use std::os::unix::fs::MetadataExt;
+    let mut db = None;
+    for path in candidates {
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.mode() & 0o022 != 0 || (require_root_owned && meta.uid() != 0) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        if let Ok(parsed) = awcc_core::Database::from_json_str(
+            &text,
+            awcc_core::DatabaseSource::SystemEtc(path.clone()),
+        ) {
+            db = Some(parsed);
+            break;
+        }
+    }
+    let db = match db {
+        Some(db) => db,
+        None => awcc_core::Database::load_embedded()?,
+    };
+    let device_name = read_dmi_product_name(None).unwrap_or_else(|| "Alienware m15 R6".to_string());
+    let smbios_id = read_dmi_smbios_id(None).unwrap_or_else(|| "0x0A86".to_string());
+    let cpu_vendor = read_cpu_vendor(None);
+    Ok(DeviceProfile::resolve(
+        &db,
+        device_name,
+        smbios_id,
+        cpu_vendor,
+    ))
+}
+
 /// Resolve the simulated `Alienware m15 R6` (`0x0A86`, `AMWW`, `GenuineIntel`) profile,
 /// honoring `AWCC_DATABASE_PATH` fail-closed when explicitly configured and otherwise using
 /// the compiled-in default database.

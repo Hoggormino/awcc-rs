@@ -1,41 +1,37 @@
-//! Privileged daemon Unix domain socket service (`/run/awcc/awcc.sock`), structured JSON RPC
-//! protocol (`DaemonRpcRequest` / `DaemonRpcResponse`), direct kernel I/O, and custom
-//! fan-curve IPC.
+//! The privileged daemon (`awccd`): exclusive ownership, daemon-owned thermal control, the framed
+//! authorized IPC server, and the low-level compatibility request types.
 //!
-//! Replaces the legacy C++ `pkexec`-string regex allowlist over `/run/awcc/awcc.sock` with a
-//! strictly typed, schema-validated JSON RPC protocol (`#[serde(deny_unknown_fields)]`)
-//! while preserving hermetic offline testability over temporary Unix sockets.
+//! `run_system_daemon` is the single production entry point (`awcc-cli --daemon`). It takes the
+//! exclusive lock first, resolves the device from root-controlled resources only, restores
+//! persisted settings through the normal eligibility checks, and serves clients until it receives
+//! SIGTERM/SIGINT, then leaves custom curve control through the verified path before exiting.
+//! See [`crate::control`] for scheduling and failure policy and [`crate::ipc`] for the protocol.
 
 use std::fs;
-use std::io::{Read, Write};
-use std::net::Shutdown;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use awcc_core::{AcpiPrefix, FanCurveConfig, FanCurvePoint};
-use awcc_platform::{CommandExecutor, LinuxAcpiTransport};
+use awcc_platform::{
+    CommandExecutor, HwmonProvider, LinuxAcpiTransport, PosixStateStore, TRUSTED_DATABASE_PATHS,
+    resolve_trusted_host_device_profile,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::ThermalOrchestrator;
+use crate::control::{
+    AsyncSettingsSink, ControlCore, ControlHandle, DEFAULT_TICK_INTERVAL, SettingsSink,
+};
+use crate::ipc::{
+    AllowlistAuthorizer, Authorizer, BuildSummary, DEFAULT_AUTHORIZED_USERS_PATH,
+    DEFAULT_LOCK_PATH, DaemonLock, IpcServer, OwnershipError, ServerConfig,
+};
+use crate::settings::{DEFAULT_STATE_DIR, SettingsLoad, SettingsStore};
 
 /// Default Unix domain socket path used by `awccd`.
 pub const DEFAULT_SOCKET_PATH: &str = "/run/awcc/awcc.sock";
-
-/// Environment variable that re-enables the per-call `pkexec` fallback for ordinary processes.
-///
-/// It is off by default: polling the hardware through `pkexec` raises a polkit prompt on every
-/// refresh. A privileged `awccd` daemon is the supported route for unprivileged clients.
-pub const ALLOW_PKEXEC_ENV: &str = "AWCC_ALLOW_PKEXEC";
-
-/// Message returned when a privileged operation is needed and no privileged route exists.
-pub const DAEMON_UNAVAILABLE_MESSAGE: &str = "Error: privileged service unavailable (start it with `sudo systemctl enable --now awccd.service`, or run as root)";
-
-/// Maximum wire request size in bytes accepted by `UnixSocketDaemon` (`4 KiB`).
-pub const MAX_RPC_WIRE_BYTES: usize = 4096;
 
 /// Structured RPC request sent over `/run/awcc/awcc.sock` to the privileged daemon.
 ///
@@ -410,240 +406,6 @@ pub fn try_direct_kernel_io(cmd: &str) -> Option<String> {
     try_direct_rpc_kernel_io(&req)
 }
 
-/// Unix domain socket server and client serving structured [`DaemonRpcRequest`] messages.
-pub struct UnixSocketDaemon {
-    socket_path: PathBuf,
-    running: Arc<AtomicBool>,
-    executor: CommandExecutor,
-    active_fan_curve: Arc<Mutex<FanCurveConfig>>,
-}
-
-impl UnixSocketDaemon {
-    #[must_use]
-    pub fn new(socket_path: impl Into<PathBuf>, executor: CommandExecutor) -> Self {
-        Self {
-            socket_path: socket_path.into(),
-            running: Arc::new(AtomicBool::new(false)),
-            executor,
-            active_fan_curve: Arc::new(Mutex::new(FanCurveConfig::default())),
-        }
-    }
-
-    #[must_use]
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
-    }
-
-    #[must_use]
-    pub fn running_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.running)
-    }
-
-    #[must_use]
-    pub fn active_fan_curve(&self) -> FanCurveConfig {
-        self.active_fan_curve
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
-    }
-
-    /// Validate and execute a structured [`DaemonRpcRequest`] directly inside the daemon.
-    #[must_use]
-    pub fn execute_rpc(&self, req: &DaemonRpcRequest) -> DaemonRpcResponse {
-        if let Err(err) = req.validate() {
-            return DaemonRpcResponse::err(err);
-        }
-        match req {
-            DaemonRpcRequest::StopFanCurve => {
-                if let Ok(mut guard) = self.active_fan_curve.lock() {
-                    guard.enabled = false;
-                }
-                DaemonRpcResponse::ok("OK: Custom fan curve stopped")
-            }
-            DaemonRpcRequest::ConfigureFanCurve { config } => {
-                if let Ok(mut guard) = self.active_fan_curve.lock() {
-                    *guard = config.clone();
-                }
-                DaemonRpcResponse::ok("OK: Custom fan curve active")
-            }
-            DaemonRpcRequest::AcpiWmax { .. } | DaemonRpcRequest::SetCpuTurbo { .. } => {
-                if let Some(direct_out) = try_direct_rpc_kernel_io(req) {
-                    return DaemonRpcResponse::ok(direct_out);
-                }
-                let canonical = req.to_canonical_command();
-                let out = (self.executor)(&canonical);
-                if out.starts_with("Error:") {
-                    DaemonRpcResponse::err(out)
-                } else {
-                    DaemonRpcResponse::ok(out)
-                }
-            }
-        }
-    }
-
-    /// Decode a wire payload as a structured JSON [`DaemonRpcRequest`] and return a serialized
-    /// [`DaemonRpcResponse`]. Raw legacy shell strings are rejected over the wire.
-    #[must_use]
-    pub fn handle_wire_payload(&self, raw_payload: &str) -> DaemonRpcResponse {
-        let trimmed = raw_payload.trim();
-        let Ok(req) = serde_json::from_str::<DaemonRpcRequest>(trimmed) else {
-            return DaemonRpcResponse::err(
-                "Error: Command not allowed (structured DaemonRpcRequest JSON required)",
-            );
-        };
-        self.execute_rpc(&req)
-    }
-
-    /// Execute a canonical command string or JSON RPC request in-process by first converting
-    /// into a structured [`DaemonRpcRequest`].
-    #[must_use]
-    pub fn execute_direct(&self, cmd: &str) -> String {
-        let trimmed = cmd.trim();
-        if trimmed.starts_with('{') {
-            return self.handle_wire_payload(trimmed).into_executor_string();
-        }
-        let Some(req) = DaemonRpcRequest::from_legacy_command(cmd) else {
-            return "Error: Command not allowed".to_string();
-        };
-        self.execute_rpc(&req).into_executor_string()
-    }
-
-    /// Serve incoming client connections on `self.socket_path` until `self.running` becomes `false`.
-    ///
-    /// Only structured JSON [`DaemonRpcRequest`] payloads are accepted on the socket; raw shell
-    /// command strings are rejected without ever reaching the command executor.
-    pub fn serve_blocking(&self) -> std::io::Result<()> {
-        if let Some(parent) = self.socket_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-        if self.socket_path.exists() {
-            let _ = fs::remove_file(&self.socket_path);
-        }
-        let listener = UnixListener::bind(&self.socket_path)?;
-        // Any local user may talk to the daemon; safety comes from the typed, validated RPC
-        // allowlist (no shell strings cross the socket), matching the legacy daemon's access model.
-        fs::set_permissions(&self.socket_path, fs::Permissions::from_mode(0o666))?;
-        listener.set_nonblocking(true)?;
-        self.running.store(true, Ordering::SeqCst);
-
-        while self.running.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((mut stream, _addr)) => {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                    let mut buf = [0u8; MAX_RPC_WIRE_BYTES];
-                    if let Ok(n) = stream.read(&mut buf)
-                        && n > 0
-                    {
-                        let req_str = String::from_utf8_lossy(&buf[..n]);
-                        let resp = self.handle_wire_payload(&req_str);
-                        if let Ok(mut encoded) = serde_json::to_vec(&resp) {
-                            encoded.push(b'\n');
-                            let _ = stream.write_all(&encoded);
-                        }
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(15));
-                }
-                Err(_) => break,
-            }
-        }
-
-        let _ = fs::remove_file(&self.socket_path);
-        Ok(())
-    }
-
-    /// Stop the daemon loop and unlink the Unix socket file.
-    pub fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
-        let _ = fs::remove_file(&self.socket_path);
-    }
-}
-
-impl Drop for UnixSocketDaemon {
-    fn drop(&mut self) {
-        if self.running.load(Ordering::SeqCst) {
-            self.stop();
-        }
-    }
-}
-
-/// Send a structured [`DaemonRpcRequest`] over a Unix domain socket and decode the
-/// [`DaemonRpcResponse`].
-pub fn send_rpc_to_socket(
-    socket_path: &Path,
-    req: &DaemonRpcRequest,
-) -> std::io::Result<DaemonRpcResponse> {
-    let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-    let mut payload = serde_json::to_vec(req)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    payload.push(b'\n');
-    stream.write_all(&payload)?;
-    let _ = stream.shutdown(Shutdown::Write);
-    let mut resp_str = String::new();
-    stream.read_to_string(&mut resp_str)?;
-    serde_json::from_str::<DaemonRpcResponse>(resp_str.trim())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-/// Convert a canonical command into a structured [`DaemonRpcRequest`], send it over the
-/// Unix domain socket as JSON RPC, and return the executor response string.
-///
-/// Unallowed or arbitrary shell command strings are rejected client-side before touching the socket.
-pub fn send_command_to_socket(socket_path: &Path, cmd: &str) -> std::io::Result<String> {
-    let Some(req) = DaemonRpcRequest::from_legacy_command(cmd) else {
-        return Ok("Error: Command not allowed".to_string());
-    };
-    let resp = send_rpc_to_socket(socket_path, &req)?;
-    Ok(resp.into_executor_string())
-}
-
-/// Construct a production `CommandExecutor`:
-/// 1. Tries direct in-process file I/O (`fs::write` + `fs::read_to_string`) on `/proc/acpi/call`
-///    or sysfs when the current process has write permission (zero `pkexec`/`sh` overhead).
-/// 2. Otherwise translates the operation into a structured [`DaemonRpcRequest`] and sends it over
-///    `/run/awcc/awcc.sock` when the privileged `awccd` daemon is listening.
-/// 3. Falls back to a per-call `pkexec` only when `AWCC_ALLOW_PKEXEC=1`; otherwise reports that the
-///    privileged service is unavailable instead of raising a polkit prompt on every call.
-#[must_use]
-pub fn default_linux_command_executor(socket_path: PathBuf) -> CommandExecutor {
-    Arc::new(move |cmd: &str| {
-        if let Some(resp) = try_direct_kernel_io(cmd) {
-            return resp;
-        }
-        if socket_path.exists()
-            && let Some(req) = DaemonRpcRequest::from_legacy_command(cmd)
-            && let Ok(resp) = send_rpc_to_socket(&socket_path, &req)
-        {
-            return resp.into_executor_string();
-        }
-        if !Path::new("/proc/acpi/call").exists() && cmd.contains("/proc/acpi/call") {
-            return "Error: /proc/acpi/call not found (load acpi_call kernel module)".to_string();
-        }
-        if cmd.contains("pkexec") && !pkexec_fallback_allowed() {
-            return DAEMON_UNAVAILABLE_MESSAGE.to_string();
-        }
-        match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
-            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-            Ok(out) => format!(
-                "Error: command exited with {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            Err(e) => format!("Error: failed to spawn shell command: {e}"),
-        }
-    })
-}
-
-fn pkexec_fallback_allowed() -> bool {
-    std::env::var(ALLOW_PKEXEC_ENV).is_ok_and(|v| v == "1")
-}
-
 /// Executor used inside the privileged daemon: direct kernel I/O only, never `pkexec` or a shell.
 #[must_use]
 pub fn daemon_command_executor() -> CommandExecutor {
@@ -658,12 +420,199 @@ pub fn daemon_command_executor() -> CommandExecutor {
     })
 }
 
-/// Run the privileged daemon until its running flag is cleared. Blocks the calling thread.
+/// How the daemon is wired (tests inject temporary paths and a permissive authorizer).
+pub struct DaemonOptions {
+    pub socket_path: PathBuf,
+    pub lock_path: PathBuf,
+    pub state_dir: PathBuf,
+    pub authorizer: Arc<dyn Authorizer>,
+    pub build: BuildSummary,
+    pub tick_interval: Duration,
+    /// Require runtime directories/files to be owned by the current user (production).
+    pub strict_owner: bool,
+}
+
+impl DaemonOptions {
+    /// Production wiring under `/run/awcc`, `/var/lib/awcc` and `/etc/awcc`.
+    #[must_use]
+    pub fn system(build: BuildSummary) -> Self {
+        Self {
+            socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
+            lock_path: PathBuf::from(DEFAULT_LOCK_PATH),
+            state_dir: PathBuf::from(DEFAULT_STATE_DIR),
+            authorizer: Arc::new(AllowlistAuthorizer::new(
+                DEFAULT_AUTHORIZED_USERS_PATH,
+                "/etc/passwd",
+                true,
+            )),
+            build,
+            tick_interval: DEFAULT_TICK_INTERVAL,
+            strict_owner: true,
+        }
+    }
+}
+
+/// Why the daemon could not start.
+#[derive(Debug)]
+pub enum DaemonError {
+    Ownership(OwnershipError),
+    Device(String),
+    Io(String),
+}
+
+impl std::fmt::Display for DaemonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ownership(e) => write!(f, "{e}"),
+            Self::Device(m) => write!(f, "cannot resolve the device: {m}"),
+            Self::Io(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for DaemonError {}
+
+impl From<OwnershipError> for DaemonError {
+    fn from(e: OwnershipError) -> Self {
+        Self::Ownership(e)
+    }
+}
+
+/// A running daemon: exclusive lock, control thread, settings writer and IPC server.
+pub struct Daemon {
+    control: ControlHandle,
+    server: IpcServer,
+    sink: Arc<AsyncSettingsSink>,
+    _lock: DaemonLock,
+}
+
+impl Daemon {
+    /// Take exclusive ownership, build the orchestrator with `make_orchestrator` (called only after
+    /// the lock is held, so a second daemon never touches hardware), restore persisted settings
+    /// and bind the socket.
+    ///
+    /// # Errors
+    /// See [`DaemonError`].
+    pub fn start(
+        options: DaemonOptions,
+        make_orchestrator: impl FnOnce(&DaemonOptions) -> Result<ThermalOrchestrator, String>,
+    ) -> Result<Self, DaemonError> {
+        let lock = DaemonLock::acquire(&options.lock_path, options.strict_owner)?;
+        let orchestrator = make_orchestrator(&options).map_err(DaemonError::Device)?;
+        let (device_name, acpi_prefix) = orchestrator.device_identity();
+        let store = SettingsStore::new(&options.state_dir);
+        let load = store.load(&device_name, &acpi_prefix);
+        let block_overwrite = matches!(load, SettingsLoad::Incompatible { .. })
+            .then(|| "saved settings use a newer schema and are never overwritten".to_string());
+        let sink = Arc::new(
+            AsyncSettingsSink::spawn(store, block_overwrite)
+                .map_err(|e| DaemonError::Io(format!("cannot start settings writer: {e}")))?,
+        );
+        let core = ControlCore::new(
+            orchestrator,
+            load,
+            Arc::clone(&sink) as Arc<dyn SettingsSink>,
+            options.tick_interval,
+        );
+        let control = ControlHandle::spawn(core)
+            .map_err(|e| DaemonError::Io(format!("cannot start control thread: {e}")))?;
+        let server = IpcServer::bind(
+            ServerConfig {
+                socket_path: options.socket_path.clone(),
+                authorizer: Arc::clone(&options.authorizer),
+                build: options.build.clone(),
+                device_name,
+                acpi_prefix,
+            },
+            control.clone(),
+            &lock,
+        )?;
+        tracing::info!(
+            target: "awcc_service::daemon",
+            category = "app",
+            action = "start",
+            outcome = "serving",
+            code = "daemon_started",
+            "daemon serving on {}",
+            options.socket_path.display()
+        );
+        Ok(Self {
+            control,
+            server,
+            sink,
+            _lock: lock,
+        })
+    }
+
+    /// Serve until `stop` is set, then stop gracefully. Returns the shutdown report.
+    #[must_use]
+    pub fn run(self, stop: &AtomicBool) -> String {
+        self.server.serve(stop);
+        let report = self
+            .control
+            .stop(Duration::from_secs(8))
+            .unwrap_or_else(|| "shutdown: control thread did not finish within 8s".to_string());
+        let durable = self.sink.flush(Duration::from_secs(2));
+        format!(
+            "{report}; settings {}",
+            if durable {
+                "saved"
+            } else {
+                "not confirmed saved"
+            }
+        )
+    }
+
+    #[must_use]
+    pub fn control(&self) -> &ControlHandle {
+        &self.control
+    }
+}
+
+/// Production orchestrator for the daemon: root-controlled device database, direct kernel I/O,
+/// state under `/var/lib/awcc`.
+fn system_orchestrator(options: &DaemonOptions) -> Result<ThermalOrchestrator, String> {
+    let candidates: Vec<PathBuf> = TRUSTED_DATABASE_PATHS.iter().map(PathBuf::from).collect();
+    let profile =
+        resolve_trusted_host_device_profile(&candidates, true).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&options.state_dir).map_err(|e| e.to_string())?;
+    let transport = LinuxAcpiTransport::new(
+        profile.device_name.clone(),
+        profile.acpi_prefix,
+        HwmonProvider::default(),
+        daemon_command_executor(),
+    );
+    let state = PosixStateStore::with_override_path(options.state_dir.join("prev_mode"));
+    Ok(ThermalOrchestrator::new(
+        profile,
+        Box::new(transport),
+        Box::new(state),
+    ))
+}
+
+/// Run the privileged daemon until SIGTERM/SIGINT. The single production entry point.
 ///
 /// # Errors
-/// Returns the I/O error if the socket directory or socket cannot be created.
-pub fn run_daemon(socket_path: impl Into<PathBuf>) -> std::io::Result<()> {
-    UnixSocketDaemon::new(socket_path, daemon_command_executor()).serve_blocking()
+/// Returns the reason the daemon could not start (another daemon owns the lock, unsafe runtime
+/// paths, device resolution failure, I/O errors).
+pub fn run_system_daemon(build: BuildSummary) -> Result<String, DaemonError> {
+    let stop = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(signal, Arc::clone(&stop))
+            .map_err(|e| DaemonError::Io(format!("cannot install signal handler: {e}")))?;
+    }
+    let daemon = Daemon::start(DaemonOptions::system(build), system_orchestrator)?;
+    let report = daemon.run(&stop);
+    tracing::info!(
+        target: "awcc_service::daemon",
+        category = "app",
+        action = "stop",
+        outcome = "done",
+        code = "daemon_stopped",
+        "{report}"
+    );
+    let _ = Ordering::SeqCst;
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -729,155 +678,10 @@ mod tests {
     }
 
     #[test]
-    fn daemon_creates_its_socket_directory_and_makes_the_socket_reachable() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("awcc_rust_run_dir_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let sock_path = dir.join("nested").join("awcc.sock");
-        let daemon = Arc::new(UnixSocketDaemon::new(
-            &sock_path,
-            Arc::new(|_| "0x0\0".to_string()),
-        ));
-        let running = daemon.running_flag();
-        let worker = Arc::clone(&daemon);
-        let handle = std::thread::spawn(move || worker.serve_blocking());
-        for _ in 0..100 {
-            if sock_path.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let mode = fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o666);
-        running.store(false, Ordering::SeqCst);
-        handle.join().unwrap().unwrap();
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn daemon_executor_never_shells_out_for_a_refused_write() {
         // A write the daemon cannot perform must surface as an error string, never run `sh`.
         let out =
             daemon_command_executor()("echo 1 | pkexec tee /nonexistent/awcc-test > /dev/null");
         assert!(out.starts_with("Error:"), "{out}");
-    }
-
-    #[test]
-    fn client_executor_does_not_raise_polkit_prompts_without_a_daemon() {
-        if pkexec_fallback_allowed() {
-            return;
-        }
-        let missing = std::env::temp_dir().join("awcc_rust_no_such_daemon.sock");
-        let _ = fs::remove_file(&missing);
-        // A turbo write is not served by direct I/O in an unprivileged test process and does not
-        // mention /proc/acpi/call, so it reaches the former `pkexec` fallback.
-        let out = default_linux_command_executor(missing)(
-            "echo 1 | pkexec tee /sys/devices/system/cpu/cpufreq/boost > /dev/null",
-        );
-        let privileged = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/sys/devices/system/cpu/cpufreq/boost")
-            .is_ok();
-        if !privileged {
-            assert_eq!(out, DAEMON_UNAVAILABLE_MESSAGE);
-        }
-    }
-
-    #[test]
-    fn unix_socket_daemon_roundtrips_commands_and_cleans_up_socket() {
-        let sock_path =
-            std::env::temp_dir().join(format!("awcc_rust_daemon_test_{}.sock", std::process::id()));
-        let _ = fs::remove_file(&sock_path);
-
-        let executor_calls = Arc::new(Mutex::new(Vec::<String>::new()));
-        let executor_calls_clone = Arc::clone(&executor_calls);
-
-        let daemon = Arc::new(UnixSocketDaemon::new(
-            &sock_path,
-            Arc::new(move |cmd| {
-                executor_calls_clone.lock().unwrap().push(cmd.to_string());
-                if cmd.contains("0x14 {0xb") {
-                    "0xa0\0".to_string()
-                } else {
-                    "0x0\0".to_string()
-                }
-            }),
-        ));
-
-        let d_thread = Arc::clone(&daemon);
-        let handle = std::thread::spawn(move || {
-            d_thread.serve_blocking().unwrap();
-        });
-
-        // Wait until socket appears
-        for _ in 0..40 {
-            if sock_path.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(sock_path.exists());
-
-        // 1. Direct structured JSON RPC call over the socket
-        let rpc_resp = send_rpc_to_socket(
-            &sock_path,
-            &DaemonRpcRequest::AcpiWmax {
-                prefix: AcpiPrefix::Amww,
-                subcmd: 0x14,
-                arg1: 0x0b,
-                arg2: 0,
-                arg3: 0,
-            },
-        )
-        .unwrap();
-        assert!(rpc_resp.ok);
-        assert_eq!(rpc_resp.output, "0xa0\0");
-
-        // 2. Legacy command helper converts to structured RPC before sending over socket
-        let valid_cmd = "pkexec sh -c 'echo \"\\_SB.AMWW.WMAX 0 0x14 {0xb,0x0,0x0,0x00}\" > /proc/acpi/call && cat /proc/acpi/call'";
-        let resp = send_command_to_socket(&sock_path, valid_cmd).unwrap();
-        assert_eq!(resp, "0xa0\0");
-
-        let blocked_resp = send_command_to_socket(&sock_path, "uname -a").unwrap();
-        assert_eq!(blocked_resp, "Error: Command not allowed");
-
-        // 3. Raw legacy shell string sent directly over the Unix socket wire is rejected!
-        let calls_before_raw = executor_calls.lock().unwrap().len();
-        {
-            let mut raw_stream = UnixStream::connect(&sock_path).unwrap();
-            raw_stream.write_all(valid_cmd.as_bytes()).unwrap();
-            let _ = raw_stream.shutdown(Shutdown::Write);
-            let mut wire_reply = String::new();
-            raw_stream.read_to_string(&mut wire_reply).unwrap();
-            let decoded: DaemonRpcResponse = serde_json::from_str(wire_reply.trim()).unwrap();
-            assert!(!decoded.ok);
-            assert!(
-                decoded
-                    .error
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("structured DaemonRpcRequest JSON required")
-            );
-        }
-        assert_eq!(
-            executor_calls.lock().unwrap().len(),
-            calls_before_raw,
-            "raw shell string on socket wire must never reach the executor"
-        );
-
-        // 4. Fan curve configuration via structured RPC
-        let fc_resp =
-            send_command_to_socket(&sock_path, "FANCURVE 45 10 60 40 75 75 85 100 4").unwrap();
-        assert_eq!(fc_resp, "OK: Custom fan curve active");
-        assert!(daemon.active_fan_curve().enabled);
-        assert_eq!(daemon.active_fan_curve().hysteresis_c, 4);
-
-        let stop_resp = send_rpc_to_socket(&sock_path, &DaemonRpcRequest::StopFanCurve).unwrap();
-        assert!(stop_resp.ok);
-        assert!(!daemon.active_fan_curve().enabled);
-
-        daemon.stop();
-        handle.join().unwrap();
-        assert!(!sock_path.exists());
     }
 }

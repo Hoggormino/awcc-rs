@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release-meta.sh
 source "${SCRIPT_DIR}/release-meta.sh"
+# shellcheck source=scripts/service-payload.sh
+source "${SCRIPT_DIR}/service-payload.sh"
 
 DO_BUILD=0
 ENFORCE_GLIBC_MAX=""
@@ -135,6 +137,10 @@ for bin in awcc-cli awcc-gui; do
     assert_binary_identity "${OUT_DIR}/bin/${bin}" "staged ${bin}"
 done
 echo "==> Staged binaries report the expected build identity (commit ${AWCC_GIT_SHA}, dirty=${AWCC_GIT_DIRTY})"
+
+# Privileged-service payload used by the AppImage/tarball `service install|update` commands.
+build_service_payload "${OUT_DIR}"
+verify_service_payload "${OUT_DIR}/${SERVICE_PAYLOAD_RELATIVE}"
 
 # Normalize modification timestamps inside staging directory
 find "${OUT_DIR}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +

@@ -6,6 +6,8 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release-meta.sh
 source "${SCRIPT_DIR}/release-meta.sh"
+# shellcheck source=scripts/service-payload.sh
+source "${SCRIPT_DIR}/service-payload.sh"
 
 STAGED_DIR="${AWCC_REPO_ROOT}/dist/staging/${AWCC_TARBALL_BASENAME}"
 OUT_DIR="${AWCC_REPO_ROOT}/dist"
@@ -92,6 +94,14 @@ ln -sf "awcc-gui.png" "${APPDIR}/.DirIcon"
 install -m 0755 "${STAGED_DIR}/bin/awcc-cli" "${APPDIR}/usr/bin/awcc-cli"
 install -m 0755 "${STAGED_DIR}/bin/awcc-gui" "${APPDIR}/usr/bin/awcc-gui"
 install -m 0644 "${STAGED_DIR}/share/awcc/database.json" "${APPDIR}/usr/share/awcc/database.json"
+# Privileged-service payload (read by `--install-service` / `--update-service`).
+if [[ ! -d "${STAGED_DIR}/${SERVICE_PAYLOAD_RELATIVE}" ]]; then
+    echo "ERROR: staged directory has no ${SERVICE_PAYLOAD_RELATIVE}; re-run stage-release-payload.sh" >&2
+    exit 1
+fi
+verify_service_payload "${STAGED_DIR}/${SERVICE_PAYLOAD_RELATIVE}"
+mkdir -p "${APPDIR}/usr/${SERVICE_PAYLOAD_RELATIVE}"
+cp -a "${STAGED_DIR}/${SERVICE_PAYLOAD_RELATIVE}/." "${APPDIR}/usr/${SERVICE_PAYLOAD_RELATIVE}/"
 printf 'appimage\n' > "${APPDIR}/usr/share/awcc/package-format"
 chmod 0644 "${APPDIR}/usr/share/awcc/package-format"
 install -m 0644 "${STAGED_DIR}/share/applications/awcc-gui.desktop" "${APPDIR}/usr/share/applications/awcc-gui.desktop"
@@ -202,6 +212,10 @@ for req_file in \
     "usr/lib/libusb-1.0.so.0" \
     "usr/share/awcc/database.json" \
     "usr/share/awcc/package-format" \
+    "usr/${SERVICE_PAYLOAD_RELATIVE}/MANIFEST.sha256" \
+    "usr/${SERVICE_PAYLOAD_RELATIVE}/bin/awcc-cli" \
+    "usr/${SERVICE_PAYLOAD_RELATIVE}/lib/libusb-1.0.so.0" \
+    "usr/${SERVICE_PAYLOAD_RELATIVE}/share/awcc/database.json" \
     "usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" \
     "usr/share/licenses/awcc-rs/LICENSE" \
     "usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md"; do
@@ -210,6 +224,22 @@ for req_file in \
         exit 1
     fi
 done
+
+# The service payload must verify inside the finished image, and its binary must be the release
+# binary; the AppRun must carry the service flag mappings.
+verify_service_payload "${SQUASH_ROOT}/usr/${SERVICE_PAYLOAD_RELATIVE}"
+if ! cmp -s "${SQUASH_ROOT}/usr/bin/awcc-cli" "${SQUASH_ROOT}/usr/${SERVICE_PAYLOAD_RELATIVE}/bin/awcc-cli"; then
+    echo "ERROR: service payload awcc-cli differs from usr/bin/awcc-cli" >&2
+    exit 1
+fi
+if ! cmp -s "${AWCC_REPO_ROOT}/packaging/linux/AppRun" "${SQUASH_ROOT}/AppRun"; then
+    echo "ERROR: AppRun inside the AppImage differs from packaging/linux/AppRun" >&2
+    exit 1
+fi
+if [[ -n "$(find "${SQUASH_ROOT}/usr/${SERVICE_PAYLOAD_RELATIVE}" -type l -print -quit)" ]]; then
+    echo "ERROR: service payload contains symlinks" >&2
+    exit 1
+fi
 
 # Verify excluded base/driver libraries were NOT bundled into usr/lib
 for forbidden in libc.so.6 libm.so.6 libgcc_s.so.1 libGL.so.1 libEGL.so.1 libwayland-client.so.0 libX11.so.6 libfontconfig.so.1; do

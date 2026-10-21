@@ -29,6 +29,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::control::ControlOp;
+use crate::ipc::{ClientError, DaemonClient, DaemonLock};
+use crate::wire::{ControlStatus, ThermalView, WireObservation, WireSensor, WireTelemetry};
 use awcc_core::{
     DatabaseSource, DeviceProfile, FanCurveConfig, Observation, OperationError, OperationLifecycle,
     OperationSuccess, SensorReading, SimScenario, TelemetrySnapshot, ThermalMode, ThermalModeState,
@@ -57,8 +60,13 @@ use awcc_platform::{
 pub use awcc_platform::{resolve_host_device_profile, resolve_simulated_m15_r6_profile};
 use thiserror::Error;
 
+pub mod control;
 pub mod daemon;
+pub mod installer;
+pub mod ipc;
 pub mod keybinder;
+pub mod settings;
+pub mod wire;
 
 /// Default bounded capacity of the in-memory hardware write-audit ring.
 pub const DEFAULT_AUDIT_RING_CAPACITY: usize = 256;
@@ -122,6 +130,10 @@ pub struct SystemSnapshot {
     /// Sequence-aware accounting for `write_audit_log`: distinguishes lifetime write count,
     /// currently retained entries, evicted entries, and entries cleared from the visible view.
     pub audit_stats: RingStats,
+    /// Control status reported by the background service, when thermal control is service-owned.
+    pub service_control: Option<ControlStatus>,
+    /// Why the background service is not reachable, when thermal control is service-owned.
+    pub service_error: Option<String>,
 }
 
 impl SystemSnapshot {
@@ -721,6 +733,11 @@ pub struct ThermalOrchestrator {
     synced_acpi_seq: usize,
     synced_usb_seq: usize,
     trace_raw_usb: bool,
+    /// When set, thermal control belongs to the background service and this orchestrator only
+    /// presents its state (lighting stays local).
+    remote: Option<RemoteState>,
+    /// Exclusive daemon-lock held by direct maintenance mode.
+    exclusive: Option<DaemonLock>,
 }
 
 impl ThermalOrchestrator {
@@ -785,30 +802,70 @@ impl ThermalOrchestrator {
             synced_acpi_seq: 0,
             synced_usb_seq: 0,
             trace_raw_usb: false,
+            remote: None,
+            exclusive: None,
         }
     }
 
-    /// Construct a production Linux hardware orchestrator backed by `LinuxAcpiTransport`
-    /// (`/tmp/awcc.sock` + `/proc/acpi/call`), `HwmonProvider`, `PosixStateStore`, and
-    /// `LinuxUsbElcTransport` (`187c:0550` / `0x0551`).
+    /// Construct the production orchestrator: thermal control is owned by the background service
+    /// (reached over `/run/awcc/awcc.sock`), lighting uses the local USB transport.
+    ///
+    /// Construction performs no hardware access and no IPC: the service is contacted by the first
+    /// refresh, so an absent service shows up as explicit "unavailable" state, never as a failure
+    /// to start.
     pub fn new_hardware() -> Result<Self, awcc_core::CoreError> {
+        let client = DaemonClient::system("awcc-client", env!("CARGO_PKG_VERSION"));
+        Self::new_service_backed(Box::new(client))
+    }
+
+    /// Service-backed orchestrator with an injected remote (tests, alternative sockets).
+    pub fn new_service_backed(
+        remote: Box<dyn RemoteThermal>,
+    ) -> Result<Self, awcc_core::CoreError> {
         let profile = resolve_host_device_profile()?;
-        let executor =
-            daemon::default_linux_command_executor(PathBuf::from(daemon::DEFAULT_SOCKET_PATH));
-        let acpi_transport = LinuxAcpiTransport::new(
+        let mut orch = Self::with_lighting_transport(
+            profile,
+            Box::new(InertThermalTransport),
+            Box::new(MemoryStateStorage::new(None)),
+            Box::new(LinuxUsbElcTransport::new()),
+        );
+        orch.remote = Some(RemoteState {
+            client: remote,
+            view: None,
+            received: None,
+            error: None,
+        });
+        Ok(orch)
+    }
+
+    /// Explicit maintenance mode: drive the hardware directly from this process.
+    ///
+    /// It takes the same exclusive daemon lock, so it fails clearly (without touching hardware)
+    /// while the background service is running, and the service cannot start while this process
+    /// holds it. Requires root.
+    pub fn new_hardware_direct() -> Result<Self, String> {
+        let lock = DaemonLock::acquire(std::path::Path::new(crate::ipc::DEFAULT_LOCK_PATH), true)
+            .map_err(|e| e.to_string())?;
+        let candidates: Vec<PathBuf> = awcc_platform::TRUSTED_DATABASE_PATHS
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let profile = awcc_platform::resolve_trusted_host_device_profile(&candidates, true)
+            .map_err(|e| e.to_string())?;
+        let transport = LinuxAcpiTransport::new(
             profile.device_name.clone(),
             profile.acpi_prefix,
             HwmonProvider::default(),
-            executor,
+            daemon::daemon_command_executor(),
         );
-        let state_store = PosixStateStore::new();
-        let usb_transport = LinuxUsbElcTransport::new();
-        Ok(Self::with_lighting_transport(
+        let mut orch = Self::with_lighting_transport(
             profile,
-            Box::new(acpi_transport),
-            Box::new(state_store),
-            Box::new(usb_transport),
-        ))
+            Box::new(transport),
+            Box::new(PosixStateStore::new()),
+            Box::new(LinuxUsbElcTransport::new()),
+        );
+        orch.exclusive = Some(lock);
+        Ok(orch)
     }
 
     /// Construct a default simulated Alienware m15 R6 orchestrator (`--sim`).
@@ -979,6 +1036,9 @@ impl ThermalOrchestrator {
     /// kept as `Unavailable` and is retried only by an explicit `Refresh` command, not after every
     /// operation.
     pub fn query_snapshot(&mut self) -> SystemSnapshot {
+        if self.remote.is_some() {
+            return self.remote_snapshot();
+        }
         let now = (self.clock)();
 
         let game_shift = {
@@ -1127,6 +1187,8 @@ impl ThermalOrchestrator {
             command_seq: 0,
             write_audit_log: combined_audit,
             audit_stats,
+            service_control: None,
+            service_error: None,
         };
 
         if let Some(diag) = global_diagnostics() {
@@ -1636,6 +1698,45 @@ impl ThermalOrchestrator {
         }
     }
 
+    /// `(device name, ACPI prefix)` this orchestrator controls.
+    #[must_use]
+    pub fn device_identity(&self) -> (String, String) {
+        (
+            self.profile.device_name.clone(),
+            self.profile.acpi_prefix.to_string(),
+        )
+    }
+
+    /// Drop the active curve *without* any hardware write or mode restoration.
+    ///
+    /// Used when another accepted command supersedes the curve (that command defines the mode now)
+    /// or when a failed activation must not leave a half-configured curve behind.
+    pub fn cancel_curve_without_restore(&mut self) {
+        self.fan_curve.enabled = false;
+        self.last_curve_boost = None;
+        self.pre_curve_mode = None;
+    }
+
+    /// Forget the last written curve boost so the next evaluation writes unconditionally
+    /// (used after resume, when the remembered hardware state can no longer be trusted).
+    pub fn reset_curve_memory(&mut self) {
+        self.last_curve_boost = None;
+    }
+
+    /// `true` while the orchestrator itself is applying a custom curve.
+    #[must_use]
+    pub const fn curve_enabled(&self) -> bool {
+        self.fan_curve.enabled
+    }
+
+    /// The verified thermal profile that stopping the curve restores.
+    #[must_use]
+    pub fn curve_restore_mode(&self) -> ThermalMode {
+        self.pre_curve_mode
+            .or_else(|| self.storage.load_pre_gmode())
+            .unwrap_or(ThermalMode::Balanced)
+    }
+
     /// Evaluate the active custom fan curve against current CPU/GPU temperatures with hysteresis.
     ///
     /// A tick that needs no write is passive (no operation is recorded); a tick that writes is a
@@ -1858,6 +1959,12 @@ impl ThermalOrchestrator {
 
     /// Handle a single `ServiceCommand` and return the resulting `SystemSnapshot`.
     pub fn handle_command(&mut self, cmd: ServiceCommand) -> SystemSnapshot {
+        if self.remote.is_some() {
+            match self.remote_command(&cmd) {
+                RemoteRouting::Handled(snap) => return *snap,
+                RemoteRouting::Local => {}
+            }
+        }
         match cmd {
             ServiceCommand::Refresh => {
                 // An explicit refresh is the only passive path allowed to re-probe ELC
@@ -1922,6 +2029,323 @@ impl ThermalOrchestrator {
             }
         });
         CommandOutcome { snapshot, result }
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Service-backed thermal control
+// -------------------------------------------------------------------------------------------
+
+/// Client side of the background service as seen by the orchestrator.
+pub trait RemoteThermal: Send {
+    /// Latest authoritative state (the service decides whether to re-read hardware).
+    fn refresh(&mut self) -> Result<ThermalView, ClientError>;
+    /// Execute one state-changing operation to completion on the service.
+    fn execute(&mut self, op: ControlOp) -> Result<(ThermalView, OperationLifecycle), ClientError>;
+}
+
+impl RemoteThermal for DaemonClient {
+    fn refresh(&mut self) -> Result<ThermalView, ClientError> {
+        self.snapshot(Duration::from_millis(1500))
+    }
+
+    fn execute(&mut self, op: ControlOp) -> Result<(ThermalView, OperationLifecycle), ClientError> {
+        use crate::ipc::Op;
+        let wire = match op {
+            ControlOp::SetThermalMode(mode) => Op::SetThermalMode { mode },
+            ControlOp::ToggleGMode => Op::ToggleGMode,
+            ControlOp::ApplyManualBoost {
+                cpu_boost_pct,
+                gpu_boost_pct,
+            } => Op::ApplyManualBoost {
+                cpu_boost_pct,
+                gpu_boost_pct,
+            },
+            ControlOp::SetCpuTurbo(enabled) => Op::SetCpuTurbo { enabled },
+            ControlOp::SetTccOffset(offset) => Op::SetTccOffset { offset },
+            ControlOp::ConfigureCurve(config) => Op::ConfigureFanCurve { config },
+            ControlOp::StopCurve => Op::StopFanCurve,
+            ControlOp::SetRestoreAtStartup(enabled) => Op::SetRestoreAtStartup { enabled },
+        };
+        DaemonClient::execute(self, wire).map(|r| (r.view, r.lifecycle))
+    }
+}
+
+struct RemoteState {
+    client: Box<dyn RemoteThermal>,
+    view: Option<ThermalView>,
+    received: Option<Instant>,
+    error: Option<String>,
+}
+
+enum RemoteRouting {
+    Handled(Box<SystemSnapshot>),
+    Local,
+}
+
+/// Thermal transport of a service-backed orchestrator: it can never reach hardware, so every
+/// read is an explicit failure and every write is rejected.
+struct InertThermalTransport;
+
+impl InertThermalTransport {
+    const WHY: &'static str = "thermal control is owned by the background service";
+    fn err() -> TransportError {
+        TransportError::TransportUnavailable(Self::WHY.to_string())
+    }
+}
+
+impl ThermalTransport for InertThermalTransport {
+    fn is_simulated(&self) -> bool {
+        false
+    }
+    fn scenario(&self) -> SimScenario {
+        SimScenario::Normal
+    }
+    fn set_scenario(&mut self, _scenario: SimScenario) {}
+    fn query_raw_thermal_mode(&mut self) -> Result<u32, TransportError> {
+        Err(Self::err())
+    }
+    fn query_game_shift_status(&mut self) -> Result<bool, TransportError> {
+        Err(Self::err())
+    }
+    fn set_raw_thermal_mode(&mut self, _mode_code: u16) -> Result<(), TransportError> {
+        Err(Self::err())
+    }
+    fn set_game_shift_status(&mut self, _enabled: bool) -> Result<(), TransportError> {
+        Err(Self::err())
+    }
+    fn query_telemetry(&mut self) -> TelemetrySnapshot {
+        WireTelemetry::unavailable(Self::WHY).to_core()
+    }
+    fn set_fan_boost(&mut self, _cpu: u8, _gpu: u8) -> Result<(), TransportError> {
+        Err(Self::err())
+    }
+    fn query_cpu_turbo(&mut self) -> Result<bool, TransportError> {
+        Err(Self::err())
+    }
+    fn set_cpu_turbo(&mut self, _enabled: bool) -> Result<(), TransportError> {
+        Err(Self::err())
+    }
+    fn query_tcc_offset(&mut self) -> SensorReading<u8> {
+        SensorReading::Unavailable {
+            reason: Self::WHY.to_string(),
+        }
+    }
+    fn set_tcc_offset(&mut self, _offset: u8) -> Result<(), TransportError> {
+        Err(Self::err())
+    }
+    fn write_audit_log(&self) -> &[WriteAuditEntry] {
+        &[]
+    }
+}
+
+impl ThermalOrchestrator {
+    fn remote_op_for(cmd: &ServiceCommand) -> Option<ControlOp> {
+        Some(match cmd {
+            ServiceCommand::SetThermalMode(m) => ControlOp::SetThermalMode(*m),
+            ServiceCommand::ToggleGMode => ControlOp::ToggleGMode,
+            ServiceCommand::ApplyManualBoost {
+                cpu_boost_pct,
+                gpu_boost_pct,
+            } => ControlOp::ApplyManualBoost {
+                cpu_boost_pct: *cpu_boost_pct,
+                gpu_boost_pct: *gpu_boost_pct,
+            },
+            ServiceCommand::SetCpuTurbo(e) => ControlOp::SetCpuTurbo(*e),
+            ServiceCommand::SetTccOffset(o) => ControlOp::SetTccOffset(*o),
+            ServiceCommand::SetFanCurve(cfg) if cfg.enabled => {
+                ControlOp::ConfigureCurve(cfg.clone())
+            }
+            ServiceCommand::SetFanCurve(_) => ControlOp::StopCurve,
+            _ => return None,
+        })
+    }
+
+    fn remote_command(&mut self, cmd: &ServiceCommand) -> RemoteRouting {
+        match cmd {
+            ServiceCommand::Refresh => {
+                self.remote_pull();
+                RemoteRouting::Local
+            }
+            // The service owns the schedule; a client tick must never drive control.
+            ServiceCommand::StepFanCurve => {
+                RemoteRouting::Handled(Box::new(self.remote_snapshot()))
+            }
+            other => {
+                let Some(op) = Self::remote_op_for(other) else {
+                    return RemoteRouting::Local;
+                };
+                let label = other.label();
+                self.operation_id += 1;
+                let id = self.operation_id;
+                let started = (self.clock)();
+                let outcome = self.remote.as_mut().map(|r| r.client.execute(op));
+                let lifecycle = match outcome {
+                    Some(Ok((view, lifecycle))) => {
+                        if let Some(r) = self.remote.as_mut() {
+                            r.view = Some(view);
+                            r.received = Some((self.clock)());
+                            r.error = None;
+                        }
+                        lifecycle
+                    }
+                    Some(Err(err)) => {
+                        let text = err.to_string();
+                        if matches!(
+                            err,
+                            ClientError::Unavailable(_)
+                                | ClientError::AccessDenied(_)
+                                | ClientError::ProtocolMismatch(_)
+                                | ClientError::MissingCapability(_)
+                        ) && let Some(r) = self.remote.as_mut()
+                        {
+                            r.error = Some(text.clone());
+                        }
+                        OperationLifecycle::Failed {
+                            summary: label.clone(),
+                            error: text,
+                        }
+                    }
+                    None => OperationLifecycle::Failed {
+                        summary: label.clone(),
+                        error: "no service connection".to_string(),
+                    },
+                };
+                tracing::info!(
+                    target: "awcc_service::operation",
+                    category = "app",
+                    op_id = id,
+                    action = label,
+                    outcome = lifecycle.badge_label(),
+                    code = "service_operation",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "{}",
+                    lifecycle.detail_message()
+                );
+                self.lifecycle = lifecycle;
+                RemoteRouting::Handled(Box::new(self.remote_snapshot()))
+            }
+        }
+    }
+
+    fn remote_pull(&mut self) {
+        let now = (self.clock)();
+        if let Some(r) = self.remote.as_mut() {
+            match r.client.refresh() {
+                Ok(view) => {
+                    r.view = Some(view);
+                    r.received = Some(now);
+                    r.error = None;
+                }
+                Err(e) => r.error = Some(e.to_string()),
+            }
+        }
+    }
+
+    fn remote_snapshot(&mut self) -> SystemSnapshot {
+        if self
+            .remote
+            .as_ref()
+            .is_some_and(|r| r.view.is_none() && r.error.is_none())
+        {
+            self.remote_pull();
+        }
+        let now = (self.clock)();
+        self.sync_chronological_audit_log();
+        let mut combined_audit: Vec<WriteAuditEntry> = self
+            .chronological_audit_log
+            .as_slice()
+            .iter()
+            .map(|s| s.0.clone())
+            .collect();
+        let audit_stats = self.chronological_audit_log.stats();
+        let (view, error, elapsed) = match self.remote.as_ref() {
+            Some(r) => (
+                r.view.clone(),
+                r.error.clone(),
+                r.received
+                    .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
+            ),
+            None => (None, None, 0),
+        };
+        let waiting = "waiting for the background service";
+        let reason = error.clone().unwrap_or_else(|| waiting.to_string());
+        let shown = match (&view, &error) {
+            (Some(v), None) => Some(v.clone()),
+            (Some(v), Some(e)) => Some(v.disconnected(elapsed, e)),
+            (None, _) => None,
+        };
+        let unavailable_obs = || Observation::Unavailable {
+            reason: reason.clone(),
+        };
+        let (
+            thermal_mode_state,
+            game_shift,
+            pre_gmode,
+            telemetry,
+            cpu_turbo,
+            tcc,
+            fan_curve,
+            control,
+        ) = match &shown {
+            Some(v) => (
+                v.thermal_mode_state.clone(),
+                v.game_shift.to_core(),
+                v.pre_gmode_restore_target,
+                v.telemetry.to_core(),
+                v.cpu_turbo.to_core(),
+                v.tcc_offset_c.to_core(),
+                v.fan_curve.clone(),
+                Some(v.control.clone()),
+            ),
+            None => (
+                ThermalView::placeholder_unavailable(&reason),
+                unavailable_obs(),
+                None,
+                WireTelemetry::unavailable(&reason).to_core(),
+                unavailable_obs(),
+                WireSensor::<u8>::Unavailable {
+                    reason: reason.clone(),
+                }
+                .to_core(),
+                FanCurveConfig::default(),
+                None,
+            ),
+        };
+        if let Some(v) = &shown {
+            combined_audit.extend(v.audit.iter().cloned());
+        }
+        let _ = WireObservation::<bool>::NotObserved;
+        SystemSnapshot {
+            profile: self.profile.clone(),
+            is_simulated: false,
+            scenario: SimScenario::Normal,
+            thermal_mode_state,
+            game_shift,
+            pre_gmode_restore_target: pre_gmode,
+            telemetry,
+            cpu_turbo,
+            tcc_offset_c: tcc,
+            fan_curve,
+            lighting_brightness_pct: self.lighting.brightness(),
+            lighting_stealth_enabled: self.lighting.is_stealth(),
+            lighting_state_source: self.lighting.state_source(),
+            lighting_last_effect: self.lighting_last_effect,
+            lighting_last_target: self.lighting_last_target.clone(),
+            lighting_persist_boot: self.lighting_persist_boot,
+            lighting_zone_colors: self.lighting.transport().zone_colors().clone(),
+            lighting_power_colors: self.lighting.transport().power_slot_colors().clone(),
+            lighting_commanded_zones: self.lighting.commanded_zones().clone(),
+            lighting_commanded_power_slots: self.lighting.commanded_power_slots().clone(),
+            elc_diagnostics: self.elc_observation.clone(),
+            lifecycle: self.lifecycle.clone(),
+            operation_id: self.operation_id,
+            command_seq: 0,
+            write_audit_log: combined_audit,
+            audit_stats,
+            service_control: control,
+            service_error: error,
+        }
     }
 }
 

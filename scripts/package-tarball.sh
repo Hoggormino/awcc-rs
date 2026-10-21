@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release-meta.sh
 source "${SCRIPT_DIR}/release-meta.sh"
+# shellcheck source=scripts/service-payload.sh
+source "${SCRIPT_DIR}/service-payload.sh"
 
 STAGED_DIR="${AWCC_REPO_ROOT}/dist/staging/${AWCC_TARBALL_BASENAME}"
 OUT_DIR="${AWCC_REPO_ROOT}/dist"
@@ -87,6 +89,10 @@ for req_file in \
     "share/awcc/package-format" \
     "share/applications/awcc-gui.desktop" \
     "share/systemd/awccd.service" \
+    "share/awcc/service-payload/MANIFEST.sha256" \
+    "share/awcc/service-payload/bin/awcc-cli" \
+    "share/awcc/service-payload/lib/libusb-1.0.so.0" \
+    "share/awcc/service-payload/share/awcc/database.json" \
     "share/icons/hicolor/scalable/apps/awcc-gui.svg" \
     "share/icons/hicolor/256x256/apps/awcc-gui.png" \
     "share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" \
@@ -103,6 +109,9 @@ for req_file in \
         exit 1
     fi
 done
+
+# The service payload must survive archiving intact (no symlinks, manifest still verifies).
+verify_service_payload "${EXTRACTED_ROOT}/${SERVICE_PAYLOAD_RELATIVE}"
 
 if [[ "${RUN_SMOKE}" -eq 1 ]]; then
     mapfile -t IDENTITY_ARGS < <(smoke_identity_args tarball)

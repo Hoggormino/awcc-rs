@@ -847,7 +847,7 @@ pub fn execute_active_cli_command(
         CliCommand::ConfigureFanCurve(cfg) => {
             let mut out = finish_operation(orch.execute(ServiceCommand::SetFanCurve(cfg)))?;
             out.notes.push(
-                "awcc-cli exits after this command: continuous curve tracking only runs inside a long-lived service such as awcc-gui".to_string(),
+                "the background service now owns the curve and keeps following temperatures after this command exits (see `awcc-cli service-status`)".to_string(),
             );
             Ok(out)
         }
@@ -948,12 +948,24 @@ pub fn execute_active_cli_command(
     }
 }
 
-/// Serve the privileged socket until the process is stopped (systemd sends SIGTERM).
+/// Build identity advertised by the daemon handshake.
+fn daemon_build_summary() -> awcc_service::ipc::BuildSummary {
+    let info = awcc_build_info::BuildInfo::current();
+    awcc_service::ipc::BuildSummary {
+        version: info.version.clone(),
+        commit: info.commit.clone().unwrap_or_else(|| "unknown".to_string()),
+        package_format: awcc_build_info::detect_package_format()
+            .as_str()
+            .to_string(),
+    }
+}
+
+/// Run the privileged daemon (the single entry point shared by every installation format) until
+/// SIGTERM/SIGINT. It owns thermal control; see `awcc_service::control` for the policies.
 fn run_privileged_daemon() -> Result<CliOutput> {
-    let path = awcc_service::daemon::DEFAULT_SOCKET_PATH;
-    awcc_service::daemon::run_daemon(path)
-        .with_context(|| format!("failed to serve the privileged daemon socket at {path}"))?;
-    Ok(CliOutput::line(format!("daemon stopped ({path})")))
+    let report = awcc_service::daemon::run_system_daemon(daemon_build_summary())
+        .context("the privileged daemon could not run")?;
+    Ok(CliOutput::line(format!("daemon stopped: {report}")))
 }
 
 /// Hardware/profile construction, injectable so tests can prove which paths touch a backend.

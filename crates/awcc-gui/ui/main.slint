@@ -144,6 +144,26 @@ export component MainWindow inherits MaterialWindow {
     in-out property <bool> clipboard-fallback-visible: false;
     in-out property <bool> trace-raw-usb: false;
 
+    // Background service (installation, ownership, status). All values are reported facts:
+    // nothing here claims installed/running/active before the operation completed.
+    in property <string> service-state-label: "Checking…";
+    in property <string> service-state-detail: "";
+    in property <string> service-managed-by: "";
+    in property <string> service-curve-summary: "";
+    in property <string> service-version-line: "";
+    in property <bool> service-state-is-problem: false;
+    in property <bool> service-can-install: false;
+    in property <bool> service-can-update: false;
+    in property <bool> service-can-remove: false;
+    in property <bool> service-busy: false;
+    in property <string> service-progress: "";
+    in property <string> service-result: "";
+    in property <bool> service-result-is-error: false;
+    in property <bool> service-restore-available: false;
+    in-out property <bool> service-restore-at-startup: false;
+    in-out property <bool> service-confirming-install: false;
+    in-out property <bool> service-confirming-remove: false;
+
     // Callbacks to Rust service controller
     callback request-refresh();
     callback select-thermal-mode(string);
@@ -171,6 +191,11 @@ export component MainWindow inherits MaterialWindow {
     callback clear-audit-history();
     callback select-audit-row(int);
     callback copy-selected-audit-row();
+    callback refresh-service-status();
+    callback install-service();
+    callback update-service();
+    callback uninstall-service();
+    callback set-restore-at-startup(bool);
 
     init => {
         Palette.color-scheme = ColorScheme.dark;
@@ -1778,6 +1803,167 @@ export component MainWindow inherits MaterialWindow {
                 ElevatedCard {
                     VerticalLayout {
                         padding: 14px;
+                        spacing: 8px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
+                            MaterialText {
+                                text: "Background Service";
+                                style: MaterialTypography.title_medium;
+                                color: MaterialPalette.on_surface;
+                            }
+                            MaterialText {
+                                text: root.service-state-label;
+                                style: MaterialTypography.label_large;
+                                color: root.service-state-is-problem ? MaterialPalette.error : MaterialPalette.primary;
+                            }
+                        }
+
+                        MaterialText {
+                            text: "A privileged service keeps your fan curve running after this window closes. The GUI itself never needs administrator rights.";
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.on_surface_variant;
+                            wrap: word-wrap;
+                        }
+
+                        if root.service-state-detail != "" : MaterialText {
+                            text: root.service-state-detail;
+                            style: MaterialTypography.body_small;
+                            color: root.service-state-is-problem ? MaterialPalette.error : MaterialPalette.on_surface_variant;
+                            wrap: word-wrap;
+                        }
+                        if root.service-version-line != "" : MaterialText {
+                            text: root.service-version-line;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.on_surface_variant;
+                            wrap: word-wrap;
+                        }
+                        if root.service-curve-summary != "" : MaterialText {
+                            text: root.service-curve-summary;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.on_surface_variant;
+                            wrap: word-wrap;
+                        }
+
+                        if root.service-restore-available : HorizontalLayout {
+                            height: 34px;
+                            alignment: space-between;
+                            VerticalLayout {
+                                alignment: center;
+                                MaterialText {
+                                    text: "Restore fan curve at startup";
+                                    style: MaterialTypography.body_medium;
+                                    color: MaterialPalette.on_surface;
+                                }
+                                MaterialText {
+                                    text: "Off by default. When on, the saved curve resumes at boot once sensors and thermal mode check out.";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+                            }
+                            Switch {
+                                width: 52px;
+                                height: 32px;
+                                y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                enabled: !root.service-busy;
+                                checked: root.service-restore-at-startup;
+                                checked_state_changed(enabled) => {
+                                    root.set-restore-at-startup(enabled);
+                                }
+                            }
+                        }
+
+                        if root.service-confirming-install : VerticalLayout {
+                            spacing: 6px;
+                            MaterialText {
+                                text: "This installs a persistent system service and enables it at boot. You will be asked for administrator authorization. Nothing is installed until you confirm.";
+                                style: MaterialTypography.body_small;
+                                color: MaterialPalette.on_surface;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                FilledButton {
+                                    text: "Confirm install";
+                                    enabled: !root.service-busy;
+                                    clicked => { root.install-service(); }
+                                }
+                                OutlineButton {
+                                    text: "Cancel";
+                                    enabled: !root.service-busy;
+                                    clicked => { root.service-confirming-install = false; }
+                                }
+                            }
+                        }
+
+                        if root.service-confirming-remove : VerticalLayout {
+                            spacing: 6px;
+                            MaterialText {
+                                text: "This stops and removes the background service installed by this application. Saved settings are kept.";
+                                style: MaterialTypography.body_small;
+                                color: MaterialPalette.on_surface;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                FilledButton {
+                                    text: "Confirm removal";
+                                    enabled: !root.service-busy;
+                                    clicked => { root.uninstall-service(); }
+                                }
+                                OutlineButton {
+                                    text: "Cancel";
+                                    enabled: !root.service-busy;
+                                    clicked => { root.service-confirming-remove = false; }
+                                }
+                            }
+                        }
+
+                        if root.service-progress != "" : MaterialText {
+                            text: root.service-progress;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.primary;
+                            wrap: word-wrap;
+                        }
+                        if root.service-result != "" : MaterialText {
+                            text: root.service-result;
+                            style: MaterialTypography.body_small;
+                            color: root.service-result-is-error ? MaterialPalette.error : MaterialPalette.on_surface_variant;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            if root.service-can-install && !root.service-confirming-install : FilledButton {
+                                text: "Install background service";
+                                enabled: !root.service-busy;
+                                clicked => { root.service-confirming-install = true; root.service-confirming-remove = false; }
+                            }
+                            if root.service-can-update : TonalButton {
+                                text: "Update service";
+                                enabled: !root.service-busy;
+                                clicked => { root.update-service(); }
+                            }
+                            if root.service-can-remove && !root.service-confirming-remove : OutlineButton {
+                                text: "Remove service";
+                                enabled: !root.service-busy;
+                                clicked => { root.service-confirming-remove = true; root.service-confirming-install = false; }
+                            }
+                            OutlineButton {
+                                text: "Check status";
+                                enabled: !root.service-busy;
+                                clicked => { root.refresh-service-status(); }
+                            }
+                        }
+                    }
+                }
+
+                ElevatedCard {
+                    VerticalLayout {
+                        padding: 14px;
                         spacing: 12px;
 
                         MaterialText {
@@ -1793,12 +1979,12 @@ export component MainWindow inherits MaterialWindow {
                             VerticalLayout {
                                 alignment: center;
                                 MaterialText {
-                                    text: "Automatic Telemetry & Fan Curve Refresh";
+                                    text: "Automatic Telemetry Refresh";
                                     style: MaterialTypography.body_medium;
                                     color: MaterialPalette.on_surface;
                                 }
                                 MaterialText {
-                                    text: "Periodically polls CPU/GPU sensors and steps the custom fan curve when active.";
+                                    text: "Only controls how often this window updates its readings. The background service evaluates the fan curve on its own schedule.";
                                     style: MaterialTypography.body_small;
                                     color: MaterialPalette.on_surface_variant;
                                 }
