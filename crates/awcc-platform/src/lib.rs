@@ -447,17 +447,40 @@ pub const TRUSTED_DATABASE_PATHS: &[&str] = &[
     "/etc/awcc/database.json",
 ];
 
+/// A privileged daemon cannot select a hardware profile without a real host identity.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum HostProfileError {
+    #[error("DMI {0} is missing, empty or unreadable; refusing to guess a hardware profile")]
+    MissingDmi(&'static str),
+    #[error(transparent)]
+    Database(#[from] CoreError),
+}
+
 /// Resolve the host profile for the privileged daemon.
 ///
 /// Unlike [`resolve_host_device_profile`] this ignores `AWCC_DATABASE_PATH`, the working
 /// directory and every user-controlled location: only the listed fixed files are read, each must
 /// be a regular, non-symlink file that is not writable by group or others (and owned by root when
 /// `require_root_owned`), otherwise the next candidate or the compiled-in database is used.
+/// Missing DMI identity is an error; the daemon never substitutes a simulated device identity.
 pub fn resolve_trusted_host_device_profile(
     candidates: &[PathBuf],
     require_root_owned: bool,
-) -> Result<DeviceProfile, CoreError> {
+) -> Result<DeviceProfile, HostProfileError> {
+    resolve_trusted_host_device_profile_with_dmi(candidates, require_root_owned, None, None)
+}
+
+fn resolve_trusted_host_device_profile_with_dmi(
+    candidates: &[PathBuf],
+    require_root_owned: bool,
+    product_path: Option<&Path>,
+    sku_path: Option<&Path>,
+) -> Result<DeviceProfile, HostProfileError> {
     use std::os::unix::fs::MetadataExt;
+    let device_name =
+        read_dmi_product_name(product_path).ok_or(HostProfileError::MissingDmi("product_name"))?;
+    let smbios_id =
+        read_dmi_smbios_id(sku_path).ok_or(HostProfileError::MissingDmi("product_sku"))?;
     let mut db = None;
     for path in candidates {
         let Ok(meta) = fs::symlink_metadata(path) else {
@@ -481,8 +504,6 @@ pub fn resolve_trusted_host_device_profile(
         Some(db) => db,
         None => awcc_core::Database::load_embedded()?,
     };
-    let device_name = read_dmi_product_name(None).unwrap_or_else(|| "Alienware m15 R6".to_string());
-    let smbios_id = read_dmi_smbios_id(None).unwrap_or_else(|| "0x0A86".to_string());
     let cpu_vendor = read_cpu_vendor(None);
     Ok(DeviceProfile::resolve(
         &db,
@@ -1343,6 +1364,48 @@ impl ThermalTransport for SimBackend {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privileged_profile_resolution_requires_real_dmi_identity() {
+        let dir = std::env::temp_dir().join(format!("awcc-trusted-profile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let product = dir.join("product_name");
+        let sku = dir.join("product_sku");
+        let resolve =
+            || resolve_trusted_host_device_profile_with_dmi(&[], false, Some(&product), Some(&sku));
+        assert_eq!(
+            resolve().unwrap_err(),
+            HostProfileError::MissingDmi("product_name")
+        );
+        fs::write(&product, "Alienware m15 R6\n").unwrap();
+        assert_eq!(
+            resolve().unwrap_err(),
+            HostProfileError::MissingDmi("product_sku")
+        );
+        fs::write(&sku, " \n").unwrap();
+        assert_eq!(
+            resolve().unwrap_err(),
+            HostProfileError::MissingDmi("product_sku")
+        );
+        fs::write(&sku, "0A86\n").unwrap();
+        let profile = resolve().unwrap();
+        assert_eq!(profile.device_name, "Alienware m15 R6");
+        assert_eq!(profile.smbios_system_id, "0x0A86");
+        assert!(profile.matched_in_database);
+        fs::write(&product, "\n").unwrap();
+        assert_eq!(
+            resolve().unwrap_err(),
+            HostProfileError::MissingDmi("product_name")
+        );
+        fs::remove_file(&product).unwrap();
+        fs::create_dir(&product).unwrap();
+        assert_eq!(
+            resolve().unwrap_err(),
+            HostProfileError::MissingDmi("product_name")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn passive_queries_produce_zero_write_audit_entries() {

@@ -13,6 +13,8 @@ Included Resources
 - share/icons/hicolor/scalable/apps/awcc-gui.svg : Scalable application icon
 - share/icons/hicolor/256x256/apps/awcc-gui.png : 256x256 PNG application icon
 - share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml : AppStream metadata
+- share/awcc/service-payload/ : Verified service executable, database and private runtime libraries for AppImage installation
+- share/systemd/awccd.service : System service unit for native/manual installations
 - share/licenses/awcc-rs/LICENSE : BSD-2-Clause project license
 - share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md : Third-party notices
 
@@ -22,6 +24,57 @@ Quick Start (Simulation Mode — No Hardware or Root Required)
   AWCC_DATABASE_PATH=./share/awcc/database.json ./bin/awcc-cli --sim device-info
   AWCC_DATABASE_PATH=./share/awcc/database.json ./bin/awcc-cli --sim query-mode
   AWCC_DATABASE_PATH=./share/awcc/database.json ./bin/awcc-gui --sim
+
+AppImage Background Service
+----------------------------
+The AppImage opens the unprivileged GUI. Live thermal/fan control uses a separate
+privileged system service. In Settings, choose Install background service and
+confirm the installation; only the installer requests administrator authorization.
+Simulation and screenshot modes do not inspect or install the host service.
+
+The same operations are available without opening a GUI (replace the example
+filename with your downloaded AppImage):
+  ./AWCC-linux-x86_64.AppImage --service-status
+  ./AWCC-linux-x86_64.AppImage --service-status --json
+  ./AWCC-linux-x86_64.AppImage --install-service
+  ./AWCC-linux-x86_64.AppImage --update-service
+  ./AWCC-linux-x86_64.AppImage --uninstall-service
+
+Installation copies the verified service payload into a root-owned release under
+/opt/awcc-rs/service, creates awccd.service and enables/starts it. The installed
+service does not execute the AppImage or use its temporary mount. You may close
+the GUI, move or delete the original AppImage, or reboot without removing the
+installed service. Download a new AppImage and use Update service to update it.
+Updates preserve the service's enabled/disabled and running/stopped state.
+
+The initial fresh installation through polkit or sudo authorizes the invoking
+desktop user. Updates preserve the existing authorization policy. A direct root
+installation does not guess which desktop account to allow.
+To manage access explicitly, use an installed awcc-cli or the AppImage:
+  sudo awcc-cli service authorize "$USER"
+  sudo awcc-cli service revoke <user-or-uid>
+  awcc-cli service authorized-users
+  sudo ./AWCC-linux-x86_64.AppImage --appimage-extract-and-run --cli service authorize "$USER"
+
+If FUSE is unavailable, add --appimage-extract-and-run before the AppImage option.
+The elevated installer uses extraction automatically, so it does not depend on
+root being able to read the user's FUSE mount. If desktop authorization is not
+available, follow the terminal command printed by the installer; for example:
+  sudo ./AWCC-linux-x86_64.AppImage --appimage-extract-and-run --service-apply install
+
+Removing the service keeps saved settings. To explicitly remove the service and
+its saved settings, use --uninstall-service --purge. The AppImage installer refuses
+to replace or remove a native-package or manually managed awccd.service; use that
+installation's package manager or administrator procedure instead.
+
+The service maintains the custom fan curve after the GUI closes. Restoring the
+saved curve when the service starts is a separate, default-off preference in
+Settings. It can also be changed with:
+  ./AWCC-linux-x86_64.AppImage --cli service restore-at-startup on
+  ./AWCC-linux-x86_64.AppImage --cli service restore-at-startup off
+Enabling this preference does not enable a disabled systemd unit. Restoration
+requires valid saved curve intent and successful hardware/sensor checks. Status
+and GUI settings report restoration and settings-save failures.
 
 System Installation from Binary Archive
 ---------------------------------------
@@ -33,6 +86,13 @@ System Installation from Binary Archive
   sudo install -Dm644 share/icons/hicolor/scalable/apps/awcc-gui.svg /usr/local/share/icons/hicolor/scalable/apps/awcc-gui.svg
   sudo install -Dm644 share/icons/hicolor/256x256/apps/awcc-gui.png /usr/local/share/icons/hicolor/256x256/apps/awcc-gui.png
 
+This is a manual installation: edit the installed unit's ExecStart as noted above,
+then authorize your desktop account and start the service:
+  sudo awcc-cli service authorize "$USER"
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now awccd
+Update/remove these manually installed files with the same administrator procedure.
+
 Runtime Shared Library Requirements (x86_64 Linux, glibc >= 2.39 / Ubuntu 24.04+)
 ---------------------------------------------------------------------------------
 - Common (`awcc-cli` & `awcc-gui`): `libusb-1.0.so.0`, `libc.so.6`, `libgcc_s.so.1`
@@ -42,8 +102,11 @@ Hardware Access Prerequisites (Live Hardware Mode Only)
 -------------------------------------------------------
 1. ACPI WMAX Thermal / Fan / G-Mode Control:
    - Requires the `acpi_call` kernel module (`acpi_call-dkms` on Ubuntu/Debian/Arch, `akmod-acpi_call` on Fedora) providing `/proc/acpi/call`.
-   - Requires the privileged `awccd` service listening on `/run/awcc/awcc.sock`. The .deb, .rpm and Arch packages install it as `awccd.service`; it is not started automatically. Enable it with:
-       sudo systemctl daemon-reload && sudo systemctl enable --now awccd.service
-   - Without the service, the GUI and CLI report "privileged service unavailable" instead of prompting for a password on every refresh. Running as root also works. Setting AWCC_ALLOW_PKEXEC=1 restores the legacy per-call `pkexec` fallback (one polkit prompt per hardware call).
+   - Requires the privileged `awccd` service listening on `/run/awcc/awcc.sock`. The .deb, .rpm and Arch packages install it as `awccd.service`; it is not started automatically. Authorize your desktop account, then enable it with:
+       sudo awcc-cli service authorize "$USER"
+       sudo systemctl daemon-reload
+       sudo systemctl enable --now awccd
+   - Authorization is stored in root-managed /etc/awcc/authorized-users, one local username or numeric UID per line; blank lines and # comments are accepted. Root is always authorized. The file and its containing directories must be root-owned and not writable by group or others. Authorization changes apply to subsequent requests without restarting the daemon.
+   - Without the service, the GUI and CLI report "privileged service unavailable" without prompting on each refresh. Install/start the service and authorize your desktop account; normal thermal commands use the service even when the client runs as root. On a host without systemd, an administrator can run `sudo awcc-cli -d` manually or supervise it with the host's service manager; the AppImage installer requires systemd.
 2. Alienware USB HID ELC RGB Lighting (`0x187c:0x0550` / `0x187c:0x0551`):
    - Requires read/write access to the USB HID device (via udev rule granting `MODE="0660", TAG+="uaccess"` for `idVendor=="187c", idProduct=="0550"` and `"0551"`).

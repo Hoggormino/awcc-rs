@@ -10,11 +10,15 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
 fn hostile_command(args: &[&str]) -> (Command, PathBuf) {
     let cwd = std::env::temp_dir().join(format!(
-        "awcc_cli_hostile_{}_{}",
+        "awcc_cli_hostile_{}_{}_{}",
         std::process::id(),
+        NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed),
         args.join("_")
             .replace(|c: char| !c.is_ascii_alphanumeric(), "")
     ));
@@ -95,4 +99,33 @@ fn backend_start_failure_exits_nonzero_and_keeps_stdout_clean() {
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("error: "));
+}
+
+#[test]
+fn service_status_is_passive_and_reports_availability_as_json() {
+    let out = run(&["service", "status", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["installation"]["managed_by"].is_string());
+    assert!(report["daemon"]["state"].is_string());
+}
+
+#[test]
+fn elevated_helper_setup_errors_follow_the_jsonl_protocol() {
+    // This test binary has no bundled service payload. It must fail before an installation
+    // can start, including under a root test runner, and still speak the elevation protocol.
+    let out = run(&["service-apply", "install"]);
+    assert_eq!(out.status.code(), Some(1));
+    let event: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(event["event"], "failed");
+    assert!(event["message"].is_string());
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

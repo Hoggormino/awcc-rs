@@ -16,8 +16,8 @@ use super::unit::{SERVICE_ROOT, render_unit};
 use super::{
     ApplyOutcome, ApplyReport, Detection, INSTALLER_ID, InstallError, InstallPaths, OwnerRecord,
     Ownership, Progress, ProgressStep, RecordedIntent, RollbackSummary, SCHEMA_VERSION,
-    ServiceAction, Systemd, UNIT_NAME, UnitProps, detect, ensure_dir_chain, io_context,
-    write_atomic,
+    ServiceAction, Systemd, UNIT_NAME, UnitProps, check_existing_dir_chain, detect,
+    ensure_dir_chain, io_context, write_atomic,
 };
 use super::{HostRunner, PayloadError};
 
@@ -327,6 +327,19 @@ pub fn apply(
     ensure_dir_chain(paths, "/var/lib/awcc", 0o755)?;
     let _lock = acquire_lock(paths)?;
 
+    // Recovery and stale staging cleanup run before deploy creates its directories. Validate
+    // those paths first so cleanup cannot follow an administrator's symlink elsewhere.
+    for logical in [
+        format!("{SERVICE_ROOT}/releases"),
+        "/etc/systemd/system".to_owned(),
+        "/etc/awcc".to_owned(),
+    ] {
+        check_existing_dir_chain(paths, &logical)?;
+    }
+
+    // Recovery can replace files and restart the service too. Do not begin it while the
+    // manager is unavailable or the current running state cannot be established.
+    run.systemd.show()?;
     let recovered = recover(&mut run)?;
     let det = detect(paths, ctx.runner, ctx.options.command_timeout);
     match action {
@@ -641,6 +654,8 @@ fn deploy(
     if fresh && matches!(action, ServiceAction::Update) {
         return Err(InstallError::NotInstalled);
     }
+    // Query failure must not be mistaken for an intentionally stopped service.
+    let props = run.systemd.show()?;
     let source = ctx
         .payload
         .ok_or_else(|| PayloadError::Missing("no payload source configured".to_owned()))?;
@@ -683,7 +698,6 @@ fn deploy(
         && prev_target.as_deref() == Some(new_target.as_str())
         && release_intact
     {
-        let props = det.props.clone().unwrap_or_default();
         return Ok(ApplyReport {
             action: action.name().to_owned(),
             outcome: ApplyOutcome::Unchanged,
@@ -698,7 +712,6 @@ fn deploy(
     }
 
     // Capture everything a rollback needs.
-    let props = run.systemd.show().map_err(InstallError::from)?;
     let unit_path = paths.unit_path();
     let previous = PreviousState {
         current_target: prev_target.clone(),
@@ -848,10 +861,13 @@ fn deploy_steps(
     }
 
     journal.phase = Phase::Switched;
-    if ctx.options.authorized_users_seed.is_some()
-        && fs::symlink_metadata(paths.authorized_users_path()).is_err()
-    {
-        journal.created_authorized_users = true;
+    if fresh && ctx.options.authorized_users_seed.is_some() {
+        journal.created_authorized_users = match fs::symlink_metadata(paths.authorized_users_path())
+        {
+            Ok(_) => false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(error) => return Err(fail("inspecting authorized-users", error)),
+        };
     }
     save_journal(paths, journal).map_err(|e| fail("journal", e))?;
     run.emit(
@@ -1024,7 +1040,7 @@ fn uninstall(
         return Err(InstallError::NotInstalled);
     };
     let mut notes = Vec::new();
-    let props: UnitProps = det.props.clone().unwrap_or_default();
+    let props: UnitProps = run.systemd.show()?;
 
     if props.active() {
         run.emit(

@@ -139,6 +139,11 @@ impl SettingsStore {
                 reason: "settings file is group/world-writable".to_string(),
             };
         }
+        if meta.uid() != rustix::process::geteuid().as_raw() {
+            return SettingsLoad::Invalid {
+                reason: "settings file is not owned by the service user".to_string(),
+            };
+        }
         let mut text = String::new();
         if let Err(e) = (&mut file)
             .take(MAX_SETTINGS_BYTES)
@@ -189,13 +194,31 @@ impl SettingsStore {
     /// Atomically replace the settings file.
     ///
     /// # Errors
-    /// Returns the underlying I/O error; the previous file is left untouched on failure.
+    /// Returns the underlying I/O error. Failures before rename leave the previous file untouched;
+    /// a directory-fsync failure after rename means the new file's durability is uncertain.
     pub fn save(&self, settings: &ServiceSettings) -> std::io::Result<()> {
         let dir = self
             .path
             .parent()
             .ok_or_else(|| std::io::Error::other("settings path has no parent directory"))?;
         fs::create_dir_all(dir)?;
+        let meta = fs::symlink_metadata(dir)?;
+        if !meta.is_dir()
+            || meta.mode() & 0o022 != 0
+            || meta.uid() != rustix::process::geteuid().as_raw()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "settings directory must be owned by the service user and not writable by others",
+            ));
+        }
+        if let SettingsLoad::Incompatible { found_version } =
+            self.load(&settings.device_name, &settings.acpi_prefix)
+        {
+            return Err(std::io::Error::other(format!(
+                "refusing to overwrite settings schema {found_version} with schema {SETTINGS_SCHEMA_VERSION}"
+            )));
+        }
         let mut stored = settings.clone();
         stored.curve.enabled = false;
         let mut body = serde_json::to_vec_pretty(&stored).map_err(std::io::Error::other)?;
@@ -319,5 +342,38 @@ mod tests {
             store.load("M15", "AMWW"),
             SettingsLoad::Invalid { .. }
         ));
+    }
+
+    #[test]
+    fn save_refuses_a_newer_schema_even_if_it_appeared_after_loading() {
+        let d = dir("newer_after_load");
+        let store = SettingsStore::new(&d);
+        assert_eq!(store.load("M15", "AMWW"), SettingsLoad::Missing);
+        let future = br#"{"schema_version":99,"future":"preserve this"}"#;
+        fs::write(store.path(), future).unwrap();
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let error = store
+            .save(&ServiceSettings::fresh("M15", "AMWW"))
+            .unwrap_err();
+        assert!(error.to_string().contains("schema 99"));
+        assert_eq!(fs::read(store.path()).unwrap(), future);
+    }
+
+    #[test]
+    fn save_refuses_a_shared_or_symlinked_settings_directory() {
+        let d = dir("unsafe_dir");
+        let store = SettingsStore::new(&d);
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(store.save(&ServiceSettings::fresh("M15", "AMWW")).is_err());
+        assert!(!store.path().exists());
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&d, &link).unwrap();
+        assert!(
+            SettingsStore::new(&link)
+                .save(&ServiceSettings::fresh("M15", "AMWW"))
+                .is_err()
+        );
+        assert!(!store.path().exists());
     }
 }

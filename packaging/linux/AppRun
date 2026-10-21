@@ -23,18 +23,8 @@ fi
 
 export PATH="$APPDIR/usr/bin${PATH:+:$PATH}"
 
-INVOKED_NAME="$(basename -- "${ARGV0:-$0}")"
-case "$INVOKED_NAME" in
-    awcc-cli*)
-        exec "$APPDIR/usr/bin/awcc-cli" "$@"
-        ;;
-esac
-
-if [ "${1:-}" = "--cli" ] || [ "${1:-}" = "cli" ]; then
-    shift
-    exec "$APPDIR/usr/bin/awcc-cli" "$@"
-fi
-
+# Translate service flags even when the image itself is named awcc-cli.AppImage. The elevated
+# relaunch uses the canonical image path with --service-apply, regardless of its filename.
 case "${1:-}" in
     --install-service)
         shift
@@ -57,5 +47,17 @@ case "${1:-}" in
         exec "$APPDIR/usr/bin/awcc-cli" service-apply "$@"
         ;;
 esac
+
+INVOKED_NAME="$(basename -- "${ARGV0:-$0}")"
+case "$INVOKED_NAME" in
+    awcc-cli*)
+        exec "$APPDIR/usr/bin/awcc-cli" "$@"
+        ;;
+esac
+
+if [ "${1:-}" = "--cli" ] || [ "${1:-}" = "cli" ]; then
+    shift
+    exec "$APPDIR/usr/bin/awcc-cli" "$@"
+fi
 
 exec "$APPDIR/usr/bin/awcc-gui" "$@"

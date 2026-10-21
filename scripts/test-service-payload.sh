@@ -136,13 +136,13 @@ echo
 EOF
     chmod 0755 "${appdir}/usr/bin/awcc-cli" "${appdir}/usr/bin/awcc-gui"
 
-    local got
+    local got invoked_name="AppRun"
     expect_output() {
         local want="$1"
         shift
-        got="$(env -u DISPLAY -u WAYLAND_DISPLAY APPDIR="${appdir}" "${appdir}/AppRun" "$@")"
-        [[ "${got}" == "${want}" ]] || die "AppRun $*: expected '${want}', got '${got}'"
-        pass "AppRun $* -> ${want}"
+        got="$(env -u DISPLAY -u WAYLAND_DISPLAY ARGV0="${invoked_name}" APPDIR="${appdir}" "${appdir}/AppRun" "$@")"
+        [[ "${got}" == "${want}" ]] || die "AppRun (${invoked_name}) $*: expected '${want}', got '${got}'"
+        pass "AppRun (${invoked_name}) $* -> ${want}"
     }
     expect_output "CLI: [service] [install]" --install-service
     expect_output "CLI: [service] [update]" --update-service
@@ -156,6 +156,19 @@ EOF
     expect_output "CLI: [device-info]" cli device-info
     expect_output "GUI: [--sim]" --sim
     expect_output "GUI:"
+
+    # Elevation relaunches the canonical image path. Its real filename may itself select CLI
+    # mode, so service flags must still be translated before the name-based dispatch.
+    for invoked_name in awcc-cli awcc-cli.AppImage; do
+        expect_output "CLI: [service] [install]" --install-service
+        expect_output "CLI: [service] [update]" --update-service
+        expect_output "CLI: [service] [uninstall] [--purge]" --uninstall-service --purge
+        expect_output "CLI: [service] [status] [--json]" --service-status --json
+        expect_output "CLI: [service-apply] [install]" --service-apply install
+        expect_output "CLI: [service-apply] [uninstall] [--purge]" --service-apply uninstall --purge
+        expect_output "CLI: [service] [install]" service install
+        expect_output "CLI: [--version]" --version
+    done
 }
 check_apprun_mapping "${APPRUN_SRC}"
 

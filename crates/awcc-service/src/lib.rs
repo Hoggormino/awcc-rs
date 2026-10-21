@@ -65,6 +65,7 @@ pub mod daemon;
 pub mod installer;
 pub mod ipc;
 pub mod keybinder;
+pub mod management;
 pub mod settings;
 pub mod wire;
 
@@ -424,6 +425,7 @@ pub enum ServiceCommand {
     SetCpuTurbo(bool),
     SetTccOffset(u8),
     SetFanCurve(FanCurveConfig),
+    SetRestoreAtStartup(bool),
     StepFanCurve,
     ApplyLighting {
         effect: LightingEffect,
@@ -478,6 +480,10 @@ impl ServiceCommand {
             Self::SetTccOffset(offset) => format!("Set CPU TCC offset to {offset}°C"),
             Self::SetFanCurve(cfg) if cfg.enabled => "Apply custom fan curve".to_string(),
             Self::SetFanCurve(_) => "Stop custom fan curve".to_string(),
+            Self::SetRestoreAtStartup(enabled) => format!(
+                "{} custom curve restoration at service startup",
+                if *enabled { "Enable" } else { "Disable" }
+            ),
             Self::StepFanCurve => "Custom fan curve step".to_string(),
             Self::ApplyLighting { effect, target, .. } => {
                 format!("Apply {} to {}", effect.name(), target.label())
@@ -1326,9 +1332,24 @@ impl ThermalOrchestrator {
 
     /// Execute a thermal mode transition with two-step G-Mode rollback protection.
     pub fn set_thermal_mode(&mut self, target: ThermalMode) -> SystemSnapshot {
-        self.run_op(&format!("Switch thermal mode to {target}"), |s| {
+        let snap = self.run_op(&format!("Switch thermal mode to {target}"), |s| {
             s.exec_thermal_mode(target)
-        })
+        });
+        self.finish_curve_override(snap)
+    }
+
+    fn finish_curve_override(&mut self, mut snap: SystemSnapshot) -> SystemSnapshot {
+        if matches!(
+            &snap.lifecycle,
+            OperationLifecycle::Accepted { .. } | OperationLifecycle::Confirmed { .. }
+        ) {
+            self.cancel_curve_without_restore();
+            snap.fan_curve = self.fan_curve.clone();
+        } else {
+            // A failed or rolled-back command may still have changed part of the hardware state.
+            self.reset_curve_memory();
+        }
+        snap
     }
 
     fn exec_thermal_mode(&mut self, target: ThermalMode) -> Settled {
@@ -1340,12 +1361,6 @@ impl ThermalOrchestrator {
                     self.profile.device_name
                 ),
             });
-        }
-
-        // Switching to a fixed profile disables custom fan curve if one was running
-        if target != ThermalMode::Manual && self.fan_curve.enabled {
-            self.fan_curve.enabled = false;
-            self.last_curve_boost = None;
         }
 
         if target == ThermalMode::GMode {
@@ -1434,7 +1449,8 @@ impl ThermalOrchestrator {
 
     /// Toggle G-Mode on or off, restoring the prior saved thermal mode when exiting G-Mode.
     pub fn toggle_gmode(&mut self) -> SystemSnapshot {
-        self.run_op("Toggle G-Mode", Self::exec_toggle_gmode)
+        let snap = self.run_op("Toggle G-Mode", Self::exec_toggle_gmode);
+        self.finish_curve_override(snap)
     }
 
     fn exec_toggle_gmode(&mut self) -> Settled {
@@ -1508,9 +1524,10 @@ impl ThermalOrchestrator {
             gpu_boost_pct,
         }
         .label();
-        self.run_op(&label, |s| {
+        let snap = self.run_op(&label, |s| {
             s.exec_manual_boost(cpu_boost_pct, gpu_boost_pct)
-        })
+        });
+        self.finish_curve_override(snap)
     }
 
     fn exec_manual_boost(&mut self, cpu_boost_pct: u8, gpu_boost_pct: u8) -> Settled {
@@ -1625,7 +1642,17 @@ impl ThermalOrchestrator {
     /// Configure or stop the custom temperature-to-fan-boost curve.
     pub fn set_fan_curve(&mut self, config: FanCurveConfig) -> SystemSnapshot {
         let label = ServiceCommand::SetFanCurve(config.clone()).label();
-        self.run_op(&label, |s| s.exec_fan_curve_config(config))
+        let stopping = !config.enabled;
+        let snap = self.run_op(&label, |s| s.exec_fan_curve_config(config));
+        if stopping
+            && matches!(
+                &snap.lifecycle,
+                OperationLifecycle::Accepted { .. } | OperationLifecycle::Confirmed { .. }
+            )
+        {
+            self.pre_curve_mode = None;
+        }
+        snap
     }
 
     fn exec_fan_curve_config(&mut self, config: FanCurveConfig) -> Settled {
@@ -1664,7 +1691,7 @@ impl ThermalOrchestrator {
         let was_enabled = self.fan_curve.enabled;
         self.fan_curve = config;
         self.last_curve_boost = None;
-        if !was_enabled {
+        if !was_enabled && self.pre_curve_mode.is_none() {
             return Settled::Terminal(OperationLifecycle::Accepted {
                 summary: "No custom fan curve is active in this process — nothing was stopped"
                     .to_string(),
@@ -1672,11 +1699,15 @@ impl ThermalOrchestrator {
             });
         }
 
-        let restore = self
-            .pre_curve_mode
-            .take()
-            .or_else(|| self.storage.load_pre_gmode())
-            .unwrap_or(ThermalMode::Balanced);
+        let Some(restore) = self.curve_restore_mode() else {
+            return Settled::Terminal(OperationLifecycle::Failed {
+                summary: "Custom fan curve stopped, but no verified firmware profile is available"
+                    .to_string(),
+                error:
+                    "the previous thermal profile is unknown; select a supported profile explicitly"
+                        .to_string(),
+            });
+        };
         match self.exec_thermal_mode(restore) {
             Settled::Written {
                 label,
@@ -1731,10 +1762,13 @@ impl ThermalOrchestrator {
 
     /// The verified thermal profile that stopping the curve restores.
     #[must_use]
-    pub fn curve_restore_mode(&self) -> ThermalMode {
+    pub fn curve_restore_mode(&self) -> Option<ThermalMode> {
         self.pre_curve_mode
             .or_else(|| self.storage.load_pre_gmode())
-            .unwrap_or(ThermalMode::Balanced)
+            .filter(|mode| {
+                !matches!(mode, ThermalMode::Manual | ThermalMode::GMode)
+                    && self.profile.entry.supports_thermal_mode(*mode)
+            })
     }
 
     /// Evaluate the active custom fan curve against current CPU/GPU temperatures with hysteresis.
@@ -1744,7 +1778,16 @@ impl ThermalOrchestrator {
     pub fn step_fan_curve(&mut self) -> SystemSnapshot {
         match self.plan_fan_curve_step() {
             CurvePlan::Write(plan) => {
-                self.run_op("Custom fan curve step", |s| s.exec_fan_curve_write(&plan))
+                let snap = self.run_op("Custom fan curve step", |s| s.exec_fan_curve_write(&plan));
+                if !matches!(
+                    &snap.lifecycle,
+                    OperationLifecycle::Accepted { .. } | OperationLifecycle::Confirmed { .. }
+                ) {
+                    // A failed readback must not make hysteresis suppress a retry at the same
+                    // temperature: the remembered target is not known to match the hardware.
+                    self.reset_curve_memory();
+                }
+                snap
             }
             CurvePlan::NotNeeded(_) | CurvePlan::NoTemperature(_) => self.query_snapshot(),
         }
@@ -1983,6 +2026,14 @@ impl ThermalOrchestrator {
             ServiceCommand::SetCpuTurbo(enabled) => self.set_cpu_turbo(enabled),
             ServiceCommand::SetTccOffset(offset) => self.set_tcc_offset(offset),
             ServiceCommand::SetFanCurve(cfg) => self.set_fan_curve(cfg),
+            ServiceCommand::SetRestoreAtStartup(_) => {
+                self.run_op("Configure service startup restoration", |_| {
+                    Settled::Terminal(OperationLifecycle::Failed {
+                        summary: "Service settings are unavailable".to_owned(),
+                        error: "startup restoration requires the background service".to_owned(),
+                    })
+                })
+            }
             ServiceCommand::StepFanCurve => self.step_fan_curve(),
             ServiceCommand::ApplyLighting {
                 effect,
@@ -2157,6 +2208,9 @@ impl ThermalOrchestrator {
                 ControlOp::ConfigureCurve(cfg.clone())
             }
             ServiceCommand::SetFanCurve(_) => ControlOp::StopCurve,
+            ServiceCommand::SetRestoreAtStartup(enabled) => {
+                ControlOp::SetRestoreAtStartup(*enabled)
+            }
             _ => return None,
         })
     }
@@ -2169,6 +2223,7 @@ impl ThermalOrchestrator {
             }
             // The service owns the schedule; a client tick must never drive control.
             ServiceCommand::StepFanCurve => {
+                self.remote_pull();
                 RemoteRouting::Handled(Box::new(self.remote_snapshot()))
             }
             other => {
@@ -2659,6 +2714,98 @@ mod tests {
     }
 
     #[test]
+    fn client_curve_ticks_refresh_daemon_state_without_driving_control() {
+        use crate::control::{ControlCore, NullSettingsSink};
+        use crate::settings::SettingsLoad;
+        use std::sync::atomic::AtomicBool;
+
+        struct Remote {
+            core: ControlCore,
+            refreshes: Arc<AtomicU64>,
+            operations: Arc<AtomicU64>,
+            unavailable: Arc<AtomicBool>,
+        }
+        impl RemoteThermal for Remote {
+            fn refresh(&mut self) -> Result<ThermalView, ClientError> {
+                if self.unavailable.load(Ordering::SeqCst) {
+                    return Err(ClientError::Unavailable("test daemon stopped".to_owned()));
+                }
+                let count = self.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut view = self.core.refresh();
+                view.fan_curve.enabled = true;
+                view.telemetry.cpu_temp_c = WireSensor::Valid {
+                    value: 50 + u16::try_from(count).unwrap(),
+                    unit: "°C".to_owned(),
+                };
+                Ok(view)
+            }
+            fn execute(
+                &mut self,
+                op: ControlOp,
+            ) -> Result<(ThermalView, OperationLifecycle), ClientError> {
+                self.operations.fetch_add(1, Ordering::SeqCst);
+                let reply = self.core.handle(op);
+                Ok((
+                    reply.view,
+                    reply
+                        .result
+                        .map_err(|error| ClientError::Rejected(error.message))?,
+                ))
+            }
+        }
+        let refreshes = Arc::new(AtomicU64::new(0));
+        let operations = Arc::new(AtomicU64::new(0));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let remote = Remote {
+            core: ControlCore::new(
+                sim(),
+                SettingsLoad::Missing,
+                Arc::new(NullSettingsSink),
+                Duration::from_secs(2),
+            ),
+            refreshes: Arc::clone(&refreshes),
+            operations: Arc::clone(&operations),
+            unavailable: Arc::clone(&unavailable),
+        };
+        let mut client = ThermalOrchestrator::new_service_backed(Box::new(remote)).unwrap();
+        let first = client.query_snapshot();
+        assert!(first.fan_curve.enabled);
+        let tick = client.execute(ServiceCommand::StepFanCurve);
+        assert!(tick.result.is_none());
+        assert_ne!(
+            first.telemetry.cpu_temp_c,
+            tick.snapshot.telemetry.cpu_temp_c
+        );
+        assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+        assert_eq!(operations.load(Ordering::SeqCst), 0);
+
+        let preference = client.execute(ServiceCommand::SetRestoreAtStartup(true));
+        assert!(preference.result.unwrap().is_ok());
+        assert!(
+            preference
+                .snapshot
+                .service_control
+                .unwrap()
+                .restore_at_startup
+        );
+        assert_eq!(operations.load(Ordering::SeqCst), 1);
+
+        unavailable.store(true, Ordering::SeqCst);
+        let lost = client.execute(ServiceCommand::StepFanCurve);
+        assert!(
+            lost.snapshot
+                .service_error
+                .unwrap()
+                .contains("test daemon stopped")
+        );
+        assert!(matches!(
+            lost.snapshot.telemetry.cpu_temp_c,
+            SensorReading::Stale { .. }
+        ));
+        assert_eq!(operations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn startup_and_passive_refresh_perform_zero_hardware_writes() {
         let mut orch = sim();
         let snap1 = orch.query_snapshot();
@@ -2814,6 +2961,53 @@ mod tests {
             }
             other => panic!("expected Accepted without readback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn failed_curve_step_retries_at_the_same_temperature_then_restores_hysteresis() {
+        let mut orch = sim();
+        let mut cfg = FanCurveConfig {
+            enabled: true,
+            ..FanCurveConfig::default()
+        };
+        for point in &mut cfg.cpu_points {
+            point.boost_pct = 75;
+        }
+        for point in &mut cfg.gpu_points {
+            point.boost_pct = 65;
+        }
+        let configured = orch.set_fan_curve(cfg);
+        assert!(matches!(
+            configured.lifecycle,
+            OperationLifecycle::Confirmed { .. }
+        ));
+
+        orch.set_sim_faults(SimFaults {
+            fan_boost_readback_stuck: true,
+            ..SimFaults::default()
+        });
+        orch.reset_curve_memory();
+        let failed = orch.step_fan_curve();
+        assert!(matches!(
+            failed.lifecycle,
+            OperationLifecycle::Failed { .. }
+        ));
+        let retry = orch.step_fan_curve();
+        assert!(matches!(retry.lifecycle, OperationLifecycle::Failed { .. }));
+        assert!(retry.operation_id > failed.operation_id);
+        assert!(retry.write_count() > failed.write_count());
+        assert!(orch.curve_enabled());
+
+        orch.set_sim_faults(SimFaults::default());
+        let recovered = orch.step_fan_curve();
+        assert!(matches!(
+            recovered.lifecycle,
+            OperationLifecycle::Confirmed { .. }
+        ));
+        assert!(recovered.operation_id > retry.operation_id);
+        let stable = orch.step_fan_curve();
+        assert_eq!(stable.operation_id, recovered.operation_id);
+        assert_eq!(stable.write_count(), recovered.write_count());
     }
 
     #[test]

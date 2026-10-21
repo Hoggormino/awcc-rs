@@ -404,27 +404,30 @@ impl AllowlistAuthorizer {
     }
 }
 
-fn read_bounded_regular(path: &Path, require_root_owned: bool) -> Result<String, String> {
+fn read_bounded_regular(path: &Path, owner: Option<u32>) -> std::io::Result<String> {
     let mut options = OpenOptions::new();
     options
         .read(true)
         .custom_flags((OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK).bits() as i32);
-    let mut file = options.open(path).map_err(|e| e.to_string())?;
-    let meta = file.metadata().map_err(|e| e.to_string())?;
+    let mut file = options.open(path)?;
+    let meta = file.metadata()?;
     if !meta.is_file() {
-        return Err("not a regular file".to_string());
+        return Err(std::io::Error::other("not a regular file"));
     }
     if meta.len() > 64 * 1024 {
-        return Err("file too large".to_string());
+        return Err(std::io::Error::other("file too large"));
     }
-    if require_root_owned && (meta.uid() != 0 || meta.mode() & 0o022 != 0) {
-        return Err("must be owned by root and not group/world-writable".to_string());
+    if owner.is_some_and(|uid| meta.uid() != uid || meta.mode() & 0o022 != 0) {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "unsafe file ownership or group/world-writable permissions",
+        ));
     }
     let mut text = String::new();
-    (&mut file)
-        .take(64 * 1024)
-        .read_to_string(&mut text)
-        .map_err(|e| e.to_string())?;
+    (&mut file).take(64 * 1024 + 1).read_to_string(&mut text)?;
+    if text.len() > 64 * 1024 {
+        return Err(std::io::Error::other("file too large"));
+    }
     Ok(text)
 }
 
@@ -440,14 +443,15 @@ impl Authorizer for AllowlistAuthorizer {
         if uid == 0 {
             return Ok(());
         }
-        let users = match read_bounded_regular(&self.users_file, self.require_root_owned) {
-            Ok(t) => t,
-            Err(e) if e.contains("No such file") => {
-                return Err("no authorized users are configured".to_string());
-            }
-            Err(e) => return Err(format!("authorized-users file rejected: {e}")),
-        };
-        let passwd = read_bounded_regular(&self.passwd_file, false).unwrap_or_default();
+        let users =
+            match read_bounded_regular(&self.users_file, self.require_root_owned.then_some(0)) {
+                Ok(t) => t,
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    return Err("no authorized users are configured".to_string());
+                }
+                Err(e) => return Err(format!("authorized-users file rejected: {e}")),
+            };
+        let passwd = read_bounded_regular(&self.passwd_file, None).unwrap_or_default();
         for line in users.lines() {
             let entry = line.split('#').next().unwrap_or("").trim();
             if entry.is_empty() {
@@ -474,7 +478,11 @@ pub mod authorized_users {
     /// # Errors
     /// Returns the read error.
     pub fn list(path: &Path) -> std::io::Result<BTreeSet<String>> {
-        match fs::read_to_string(path) {
+        list_entries(path, None)
+    }
+
+    fn list_entries(path: &Path, owner: Option<u32>) -> std::io::Result<BTreeSet<String>> {
+        match read_bounded_regular(path, owner) {
             Ok(text) => Ok(text
                 .lines()
                 .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
@@ -497,7 +505,7 @@ pub mod authorized_users {
         let dir = path
             .parent()
             .ok_or_else(|| std::io::Error::other("no parent directory"))?;
-        fs::create_dir_all(dir)?;
+        ensure_private_dir(dir, true).map_err(std::io::Error::other)?;
         let tmp = dir.join(format!(".authorized-users.{}.tmp", std::process::id()));
         let _ = fs::remove_file(&tmp);
         let mut body = String::from(
@@ -506,6 +514,11 @@ pub mod authorized_users {
         for e in entries {
             body.push_str(e);
             body.push('\n');
+        }
+        if body.len() > 64 * 1024 {
+            return Err(std::io::Error::other(
+                "authorized-users file would be too large",
+            ));
         }
         let mut f = OpenOptions::new()
             .write(true)
@@ -529,7 +542,8 @@ pub mod authorized_users {
                 "user must be a plain name or numeric UID",
             ));
         }
-        let mut entries = list(path)?;
+        validate_parent(path)?;
+        let mut entries = list_entries(path, Some(rustix::process::getuid().as_raw()))?;
         if !entries.insert(user.to_string()) {
             return Ok(false);
         }
@@ -542,12 +556,20 @@ pub mod authorized_users {
     /// # Errors
     /// Returns an error on I/O failure.
     pub fn remove(path: &Path, user: &str) -> std::io::Result<bool> {
-        let mut entries = list(path)?;
+        validate_parent(path)?;
+        let mut entries = list_entries(path, Some(rustix::process::getuid().as_raw()))?;
         if !entries.remove(user) {
             return Ok(false);
         }
         write(path, &entries)?;
         Ok(true)
+    }
+
+    fn validate_parent(path: &Path) -> std::io::Result<()> {
+        let dir = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("no parent directory"))?;
+        ensure_private_dir(dir, true).map_err(std::io::Error::other)
     }
 }
 
@@ -648,7 +670,7 @@ fn ensure_private_dir(dir: &Path, strict_owner: bool) -> Result<(), OwnershipErr
                 )));
             }
             if strict_owner
-                && (meta.uid() != rustix::process::getuid().as_raw() || meta.mode() & 0o002 != 0)
+                && (meta.uid() != rustix::process::getuid().as_raw() || meta.mode() & 0o022 != 0)
             {
                 return Err(OwnershipError::Unsafe(format!(
                     "{} has unsafe ownership or permissions",
@@ -808,6 +830,31 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
         .map(|c| c.uid.as_raw())
 }
 
+fn authorization_error(ctx: &ServerContext, uid: Option<u32>, id: &str) -> Option<Response> {
+    let verdict = match uid {
+        Some(uid) => ctx.cfg.authorizer.authorize(uid).map_err(|r| (uid, r)),
+        None => Err((u32::MAX, "peer credentials unavailable".to_string())),
+    };
+    verdict.err().map(|(uid, reason)| {
+        tracing::warn!(
+            target: "awcc_service::ipc",
+            category = "app",
+            action = "authorize",
+            outcome = "denied",
+            code = "access_denied",
+            uid = uid,
+            "peer refused: {reason}"
+        );
+        Response::err(
+            id,
+            ErrorClass::AccessDenied,
+            format!(
+                "access denied: {reason}. An administrator can run `sudo awcc-cli service authorize <user>`"
+            ),
+        )
+    })
+}
+
 fn handle_connection(mut stream: UnixStream, ctx: &ServerContext) {
     let uid = peer_uid(&stream);
     let hello: Result<ClientHello, _> = recv_json(&mut stream, Instant::now() + HANDSHAKE_DEADLINE);
@@ -830,31 +877,8 @@ fn handle_connection(mut stream: UnixStream, ctx: &ServerContext) {
     };
     let deadline = Instant::now() + HANDSHAKE_DEADLINE;
     // Authorization is decided on the kernel-reported identity, before any state is revealed.
-    let verdict = match uid {
-        Some(uid) => ctx.cfg.authorizer.authorize(uid).map_err(|r| (uid, r)),
-        None => Err((u32::MAX, "peer credentials unavailable".to_string())),
-    };
-    if let Err((uid, reason)) = verdict {
-        tracing::warn!(
-            target: "awcc_service::ipc",
-            category = "app",
-            action = "authorize",
-            outcome = "denied",
-            code = "access_denied",
-            uid = uid,
-            "peer refused: {reason}"
-        );
-        let _ = send_json(
-            &mut stream,
-            &Response::err(
-                "",
-                ErrorClass::AccessDenied,
-                format!(
-                    "access denied: {reason}. An administrator can run `sudo awcc-cli service authorize <user>`"
-                ),
-            ),
-            deadline,
-        );
+    if let Some(response) = authorization_error(ctx, uid, "") {
+        let _ = send_json(&mut stream, &response, deadline);
         return;
     }
     if hello.protocol_min > PROTOCOL_VERSION || hello.protocol_max < MIN_SUPPORTED_PROTOCOL {
@@ -907,6 +931,16 @@ fn handle_connection(mut stream: UnixStream, ctx: &ServerContext) {
             }
             Err(_) => return,
         };
+        // Revoking a user must also affect an existing connection; otherwise a peer can keep
+        // its privileged session alive indefinitely after removal from the allowlist.
+        if let Some(response) = authorization_error(ctx, uid, &request.id) {
+            let _ = send_json(
+                &mut stream,
+                &response,
+                Instant::now() + Duration::from_secs(1),
+            );
+            return;
+        }
         let response = dispatch(ctx, request);
         if send_json(
             &mut stream,
@@ -1314,7 +1348,13 @@ impl DaemonClient {
     ) -> Result<Response, FrameError> {
         let deadline = Instant::now() + timeout;
         send_json(&mut session.stream, request, deadline)?;
-        recv_json(&mut session.stream, deadline)
+        let response: Response = recv_json(&mut session.stream, deadline)?;
+        if response.id != request.id {
+            return Err(FrameError::Malformed(
+                "response request id does not match the request".to_string(),
+            ));
+        }
+        Ok(response)
     }
 
     /// Passive probe: handshake and status only; never touches hardware.
@@ -1377,19 +1417,25 @@ impl DaemonClient {
     pub fn execute(&self, op: Op) -> Result<OperationReport, ClientError> {
         let id = new_request_id();
         let request = Request { id: id.clone(), op };
-        let first = (|| {
-            let mut session = self.connect()?;
-            Self::call(
-                &mut session,
-                &request,
-                OPERATION_DEADLINE + Duration::from_secs(3),
-            )
-            .map_err(|e| ClientError::Unavailable(e.to_string()))
-        })();
+        // A failed connection/handshake means the operation was never submitted. Preserve that
+        // definite failure instead of reporting an unknown outcome and retaining fresh state.
+        let mut session = self.connect()?;
+        let first = Self::call(
+            &mut session,
+            &request,
+            OPERATION_DEADLINE + Duration::from_secs(3),
+        );
         match first {
+            Ok(Response {
+                body:
+                    Body::Err {
+                        kind: ErrorClass::Timeout,
+                        message,
+                    },
+                ..
+            }) => self.reconcile(&id, &message),
             Ok(response) => Self::report(response),
-            Err(ClientError::Unavailable(detail)) => self.reconcile(&id, &detail),
-            Err(other) => Err(other),
+            Err(error) => self.reconcile(&id, &error.to_string()),
         }
     }
 
@@ -1497,6 +1543,16 @@ mod tests {
         fn authorize(&self, uid: u32) -> Result<(), String> {
             self.0.lock().unwrap().push(uid);
             Ok(())
+        }
+    }
+    struct SwitchableAuthorizer(AtomicBool);
+    impl Authorizer for SwitchableAuthorizer {
+        fn authorize(&self, _uid: u32) -> Result<(), String> {
+            if self.0.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("authorization revoked".to_string())
+            }
         }
     }
 
@@ -1637,6 +1693,117 @@ mod tests {
             report.lifecycle,
             OperationLifecycle::Confirmed { .. } | OperationLifecycle::Accepted { .. }
         ));
+        d.finish();
+    }
+
+    #[test]
+    fn disconnected_operations_are_known_unavailable_before_submission() {
+        let dir = base_dir("no-service");
+        let client = DaemonClient::new(dir.join("missing.sock"), "test", "1");
+        let error = client.execute(Op::StopFanCurve).unwrap_err();
+        assert!(matches!(error, ClientError::Unavailable(_)), "{error:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn client_rejects_a_response_for_another_request() {
+        let d = start("response-id");
+        let mut session = d.client().connect().unwrap();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        session.stream = stream;
+        send_json(
+            &mut peer,
+            &Response {
+                id: "a-different-request".to_string(),
+                body: Body::Unknown,
+            },
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        let error = DaemonClient::call(
+            &mut session,
+            &Request {
+                id: "expected-request".to_string(),
+                op: Op::Status,
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(matches!(error, FrameError::Malformed(_)), "{error:?}");
+        d.finish();
+    }
+
+    #[test]
+    fn explicit_operation_timeout_is_reconciled_without_replaying() {
+        let d = start("timeout-reconcile");
+        let hello = d.client().connect().unwrap().hello;
+        let view = d.client().snapshot(Duration::from_secs(1)).unwrap();
+        let socket = d.dir.join("timeout.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let responder = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut request_id = None;
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _: ClientHello = recv_json(&mut stream, deadline).unwrap();
+                send_json(&mut stream, &hello, deadline).unwrap();
+                let request: Request = recv_json(&mut stream, deadline).unwrap();
+                let response = if attempt == 0 {
+                    assert_eq!(request.op, Op::StopFanCurve);
+                    request_id = Some(request.id.clone());
+                    Response::err(&request.id, ErrorClass::Timeout, "still running")
+                } else {
+                    assert_eq!(
+                        request.op,
+                        Op::QueryOperation {
+                            request_id: request_id.take().unwrap(),
+                        },
+                        "reconciliation must query the original id, never replay the write"
+                    );
+                    Response {
+                        id: request.id,
+                        body: Body::Completed {
+                            view: Box::new(view.clone()),
+                            lifecycle: OperationLifecycle::Idle,
+                        },
+                    }
+                };
+                send_json(&mut stream, &response, deadline).unwrap();
+            }
+        });
+        let result = DaemonClient::new(&socket, "test", "1").execute(Op::StopFanCurve);
+        assert!(result.is_ok(), "{result:?}");
+        responder.join().unwrap();
+        d.finish();
+    }
+
+    #[test]
+    fn revoked_authorization_denies_requests_on_existing_connections() {
+        let authorizer = Arc::new(SwitchableAuthorizer(AtomicBool::new(true)));
+        let d = start_with("revoke", authorizer.clone());
+        let mut stream = raw_connect(&d);
+        handshake(&mut stream);
+        let before = d.client().snapshot(Duration::from_secs(1)).unwrap();
+        authorizer.0.store(false, Ordering::SeqCst);
+        let response = call(
+            &mut stream,
+            "revoked-write",
+            Op::SetThermalMode {
+                mode: ThermalMode::Quiet,
+            },
+        );
+        assert_eq!(response.id, "revoked-write");
+        assert!(matches!(
+            response.body,
+            Body::Err {
+                kind: ErrorClass::AccessDenied,
+                ..
+            }
+        ));
+        authorizer.0.store(true, Ordering::SeqCst);
+        let after = d.client().snapshot(Duration::from_secs(1)).unwrap();
+        assert_eq!(after.thermal_mode_state, before.thermal_mode_state);
+        assert_eq!(after.operation_id, before.operation_id);
         d.finish();
     }
 
@@ -1825,6 +1992,50 @@ mod tests {
     }
 
     #[test]
+    fn runtime_directory_cannot_be_writable_by_the_group_or_others() {
+        let dir = base_dir("runtime-permissions");
+        let lock_path = dir.join("daemon.lock");
+        for mode in [0o775, 0o757] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(matches!(
+                DaemonLock::acquire(&lock_path, true),
+                Err(OwnershipError::Unsafe(_))
+            ));
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        drop(DaemonLock::acquire(&lock_path, true).unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dropping_an_unrun_daemon_stops_its_worker_and_releases_ownership() {
+        let dir = base_dir("drop-unrun");
+        let opts = options(&dir, Arc::new(AllowAll));
+        let lock_path = opts.lock_path.clone();
+        let daemon = Daemon::start(opts, sim).unwrap();
+        let control = daemon.control().clone();
+        drop(daemon);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match DaemonLock::acquire(&lock_path, false) {
+                Ok(lock) => {
+                    drop(lock);
+                    break;
+                }
+                Err(OwnershipError::AlreadyRunning(_)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => panic!("worker did not release ownership: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            control.request(ControlRequest::Refresh, Duration::from_millis(50)),
+            Err(SubmitError::Stopped)
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn stale_sockets_are_replaced_but_other_files_and_symlinks_are_refused() {
         let dir = base_dir("stale");
         fs::create_dir_all(dir.join("run")).unwrap();
@@ -1844,6 +2055,8 @@ mod tests {
             DaemonError::Ownership(OwnershipError::Unsafe(_))
         ));
         assert_eq!(fs::read(dir.join("run/awcc.sock")).unwrap(), b"precious");
+        // Failed startup must stop its already-spawned worker before relinquishing ownership.
+        drop(DaemonLock::acquire(&dir.join("run/daemon.lock"), false).unwrap());
 
         // A symlink in the socket path is never followed.
         fs::remove_file(dir.join("run/awcc.sock")).unwrap();
@@ -2041,6 +2254,32 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_management_rejects_symlinks_oversized_files_and_unsafe_writes() {
+        let dir = base_dir("allow-management");
+        let users = dir.join("authorized-users");
+        let target = dir.join("target");
+        fs::write(&target, "alice\n").unwrap();
+        std::os::unix::fs::symlink(&target, &users).unwrap();
+        assert!(authorized_users::list(&users).is_err());
+        assert!(authorized_users::add(&users, "bob").is_err());
+        assert!(authorized_users::remove(&users, "alice").is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "alice\n");
+        fs::remove_file(&users).unwrap();
+        fs::write(&users, "alice\n").unwrap();
+        fs::set_permissions(&users, fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(authorized_users::add(&users, "bob").is_err());
+        assert!(authorized_users::remove(&users, "alice").is_err());
+        fs::set_permissions(&users, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(authorized_users::add(&users, "bob").is_err());
+        assert!(authorized_users::remove(&users, "alice").is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&users, vec![b'a'; 64 * 1024 + 1]).unwrap();
+        assert!(authorized_users::list(&users).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn two_clients_share_one_authoritative_state_and_the_service_outlives_both() {
         let d = start("shared");
         let a = d.client();
@@ -2086,7 +2325,11 @@ mod tests {
         assert_eq!(tick.operation_id, out.snapshot.operation_id);
         // The service goes away: readings turn stale/unavailable, never current-looking.
         d.finish();
-        let after = orch.handle_command(ServiceCommand::Refresh);
+        // A command can discover the loss before the next refresh; it was never submitted and
+        // must also invalidate the previously fresh view.
+        let failed = orch.execute(ServiceCommand::SetThermalMode(ThermalMode::Balanced));
+        assert!(failed.result.expect("outcome").is_err());
+        let after = failed.snapshot;
         assert!(after.service_error.is_some());
         assert!(!matches!(
             after.telemetry.cpu_temp_c,
@@ -2096,7 +2339,7 @@ mod tests {
             after.thermal_mode_state,
             awcc_core::ThermalModeState::Unknown { .. }
         ));
-        let failed = orch.execute(ServiceCommand::SetThermalMode(ThermalMode::Balanced));
-        assert!(failed.result.expect("outcome").is_err());
+        let refreshed = orch.handle_command(ServiceCommand::Refresh);
+        assert!(refreshed.service_error.is_some());
     }
 }

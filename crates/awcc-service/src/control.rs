@@ -33,6 +33,7 @@
 //! The GPU temperature falls back to the CPU temperature (the pre-existing curve behaviour).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -41,6 +42,7 @@ use std::time::{Duration, Instant, SystemTime};
 use awcc_core::{FanCurveConfig, OperationLifecycle, SensorReading, ThermalMode, ThermalModeState};
 
 use crate::daemon::{DaemonRpcRequest, try_direct_rpc_kernel_io};
+use crate::ipc::DaemonLock;
 use crate::settings::{
     SETTINGS_SCHEMA_VERSION, ServiceSettings, SettingsLoad, SettingsStore, validate_curve,
 };
@@ -176,11 +178,30 @@ impl AsyncSettingsSink {
     /// # Errors
     /// Returns the I/O error if the thread cannot be spawned.
     pub fn spawn(store: SettingsStore, block_overwrite: Option<String>) -> std::io::Result<Self> {
+        Self::spawn_with_owner(store, block_overwrite, None)
+    }
+
+    pub(crate) fn spawn_owned(
+        store: SettingsStore,
+        block_overwrite: Option<String>,
+        ownership: Arc<DaemonLock>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with_owner(store, block_overwrite, Some(ownership))
+    }
+
+    fn spawn_with_owner(
+        store: SettingsStore,
+        block_overwrite: Option<String>,
+        ownership: Option<Arc<DaemonLock>>,
+    ) -> std::io::Result<Self> {
         let shared = Arc::new((Mutex::new(PersistState::default()), Condvar::new()));
         let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("awcc-settings".to_string())
             .spawn(move || {
+                // A timed-out filesystem write must finish before a successor daemon can
+                // acquire ownership and persist newer settings.
+                let _ownership = ownership;
                 let (lock, cv) = &*worker;
                 loop {
                     let next = {
@@ -260,20 +281,25 @@ impl SettingsSink for AsyncSettingsSink {
 
 impl Drop for AsyncSettingsSink {
     fn drop(&mut self) {
-        {
+        let idle = {
             let (lock, cv) = &*self.shared;
             let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
             state.closing = true;
             cv.notify_all();
-        }
+            state.pending.is_none() && !state.in_flight
+        };
         if let Some(handle) = self
             .thread
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+            && (idle || handle.is_finished())
         {
             let _ = handle.join();
         }
+        // Shutdown explicitly flushes with a deadline. A writer stuck in filesystem I/O must
+        // not turn dropping the sink into an unbounded second wait. An idle writer can safely
+        // exit now; a busy writer retains the shared state and ownership guard until it exits.
     }
 }
 
@@ -299,8 +325,17 @@ pub struct ControlCore {
     sensor_missing_since: Option<Instant>,
     cpu_sensor_fresh: bool,
     pending_fallback_restore: Option<ThermalMode>,
+    restore_required: bool,
     needs_revalidation: bool,
     last_view: Option<ThermalView>,
+    view_revision: u64,
+}
+
+fn operation_succeeded(lifecycle: &OperationLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        OperationLifecycle::Accepted { .. } | OperationLifecycle::Confirmed { .. }
+    )
 }
 
 impl ControlCore {
@@ -373,8 +408,10 @@ impl ControlCore {
             sensor_missing_since: None,
             cpu_sensor_fresh: false,
             pending_fallback_restore: None,
+            restore_required: false,
             needs_revalidation: false,
             last_view: None,
+            view_revision: 0,
         };
         core.startup_restore();
         core
@@ -420,12 +457,14 @@ impl ControlCore {
         cfg.enabled = true;
         let outcome = self.orch.execute(ServiceCommand::SetFanCurve(cfg));
         let lifecycle = outcome.snapshot.lifecycle.clone();
-        if matches!(lifecycle, OperationLifecycle::Failed { .. }) {
-            self.orch.cancel_curve_without_restore();
-            self.enter_restore_failed(format!("{why}: {}", lifecycle.detail_message()));
+        if !operation_succeeded(&lifecycle) {
+            let restored = self.restore_after_failed_activation(why, &lifecycle);
+            self.view_from(&restored);
             return false;
         }
         self.state = ControlState::Active;
+        self.restore_required = false;
+        self.pending_fallback_restore = None;
         self.failure_reason = None;
         self.sensor_missing_since = None;
         self.last_eval = Some(self.now());
@@ -499,6 +538,7 @@ impl ControlCore {
             control: self.build_status(),
         };
         self.last_view = Some(view.clone());
+        self.view_revision = self.view_revision.wrapping_add(1);
         view
     }
 
@@ -529,7 +569,7 @@ impl ControlCore {
                             "Restore fan curve at startup: {}",
                             if value { "on" } else { "off" }
                         ),
-                        caveat: "saved for the next daemon start; no hardware write was performed"
+                        caveat: "queued for persistence; no hardware write was performed"
                             .to_string(),
                     }),
                     view,
@@ -558,12 +598,8 @@ impl ControlCore {
         let outcome = self.orch.execute(ServiceCommand::SetFanCurve(cfg.clone()));
         let lifecycle = outcome.snapshot.lifecycle.clone();
         let mut snap = outcome.snapshot;
-        if matches!(lifecycle, OperationLifecycle::Failed { .. }) {
-            self.orch.cancel_curve_without_restore();
-            self.state = ControlState::Idle;
-            self.failure_reason = Some(lifecycle.detail_message());
-            self.last_outcome = Some(lifecycle.detail_message());
-            snap.fan_curve.enabled = false;
+        if !operation_succeeded(&lifecycle) {
+            snap = self.restore_after_failed_activation("curve activation", &lifecycle);
         } else {
             cfg.enabled = false;
             self.settings.curve = cfg;
@@ -573,6 +609,7 @@ impl ControlCore {
             self.failure_reason = None;
             self.sensor_missing_since = None;
             self.pending_fallback_restore = None;
+            self.restore_required = false;
             self.last_eval = Some(self.now());
             self.last_outcome = Some(lifecycle.detail_message());
         }
@@ -583,20 +620,55 @@ impl ControlCore {
         }
     }
 
+    /// Activation can fail after the hardware has entered Manual mode. Leave through the normal
+    /// verified restoration path before suspending evaluation; do not discard its restore target.
+    /// A failed replacement keeps the previous saved curve and intent, so recovery can resume it.
+    fn restore_after_failed_activation(
+        &mut self,
+        why: &str,
+        lifecycle: &OperationLifecycle,
+    ) -> SystemSnapshot {
+        let target = self
+            .pending_fallback_restore
+            .or_else(|| self.orch.curve_restore_mode());
+        let snap = self.leave_curve();
+        let restore_failed = !operation_succeeded(&snap.lifecycle);
+        self.restore_required = restore_failed;
+        self.pending_fallback_restore = target.filter(|_| restore_failed);
+        self.state = if restore_failed || self.settings.intent_active {
+            ControlState::Fallback
+        } else {
+            ControlState::Idle
+        };
+        self.sensor_missing_since = None;
+        self.failure_reason = Some(format!(
+            "{why}: {}; firmware restoration: {}",
+            lifecycle.detail_message(),
+            snap.lifecycle.detail_message()
+        ));
+        self.last_outcome = self.failure_reason.clone();
+        snap
+    }
+
     fn stop_curve(&mut self) -> ControlReply {
-        let was_applying = self.orch.curve_enabled();
-        let mut cfg = self.settings.curve.clone();
-        cfg.enabled = false;
-        let outcome = self.orch.execute(ServiceCommand::SetFanCurve(cfg));
-        let lifecycle = outcome.snapshot.lifecycle.clone();
-        let snap = outcome.snapshot;
-        let restore_failed = matches!(lifecycle, OperationLifecycle::Failed { .. });
+        let was_applying = self.orch.curve_enabled() || self.restore_required;
+        let target = self
+            .pending_fallback_restore
+            .or_else(|| self.orch.curve_restore_mode());
+        let snap = self.leave_curve();
+        let lifecycle = snap.lifecycle.clone();
+        let restore_failed = !operation_succeeded(&lifecycle);
         // The user's intent is "stop" regardless; a failed restore is reported, not hidden.
         self.settings.intent_active = false;
         self.persist();
-        self.state = ControlState::Idle;
+        self.state = if restore_failed {
+            ControlState::Fallback
+        } else {
+            ControlState::Idle
+        };
         self.sensor_missing_since = None;
-        self.pending_fallback_restore = None;
+        self.pending_fallback_restore = target.filter(|_| restore_failed);
+        self.restore_required = restore_failed;
         self.failure_reason = restore_failed.then(|| lifecycle.detail_message());
         self.last_outcome = Some(if was_applying {
             lifecycle.detail_message()
@@ -608,6 +680,31 @@ impl ControlCore {
             view: self.view_from(&snap),
             result: Ok(lifecycle),
         }
+    }
+
+    /// Retry an interrupted firmware restoration even though the local curve has already been
+    /// disabled. An absent verified target remains an explicit failure until the user selects a
+    /// supported profile; it must not turn into a successful "nothing to stop" response.
+    fn leave_curve(&mut self) -> SystemSnapshot {
+        if self.restore_required && !self.orch.curve_enabled() {
+            if let Some(target) = self.pending_fallback_restore {
+                return self
+                    .orch
+                    .execute(ServiceCommand::SetThermalMode(target))
+                    .snapshot;
+            }
+            let mut snap = self.orch.query_snapshot();
+            snap.lifecycle = OperationLifecycle::Failed {
+                summary: "Custom fan curve is stopped, but firmware restoration is unresolved"
+                    .to_string(),
+                error: "no verified firmware profile is available; select a supported profile explicitly"
+                    .to_string(),
+            };
+            return snap;
+        }
+        let mut cfg = self.settings.curve.clone();
+        cfg.enabled = false;
+        self.orch.execute(ServiceCommand::SetFanCurve(cfg)).snapshot
     }
 
     fn run_thermal_op(&mut self, op: ControlOp) -> ControlReply {
@@ -633,7 +730,7 @@ impl ControlCore {
         let outcome = self.orch.execute(command);
         let lifecycle = outcome.snapshot.lifecycle.clone();
         let mut snap = outcome.snapshot;
-        let accepted = !matches!(lifecycle, OperationLifecycle::Failed { .. });
+        let accepted = operation_succeeded(&lifecycle);
         if supersedes {
             if accepted && self.state != ControlState::Idle {
                 self.orch.cancel_curve_without_restore();
@@ -642,6 +739,7 @@ impl ControlCore {
                 self.persist();
                 self.sensor_missing_since = None;
                 self.pending_fallback_restore = None;
+                self.restore_required = false;
                 self.failure_reason = None;
                 self.last_outcome = Some(format!(
                     "custom fan curve ended: superseded by {}",
@@ -718,7 +816,9 @@ impl ControlCore {
     }
 
     /// One scheduled evaluation. `interest` says whether a client recently looked at the state.
-    pub fn tick(&mut self, interest: bool) {
+    /// Returns whether a new view was produced; an idle tick must not refresh old timestamps.
+    pub fn tick(&mut self, interest: bool) -> bool {
+        let before = self.view_revision;
         let now = self.now();
         let wall = (self.wall_clock)();
         if let Some((prev_now, prev_wall)) = self.last_tick_clock {
@@ -739,6 +839,7 @@ impl ControlCore {
                 } else {
                     self.state = ControlState::Idle;
                 }
+                self.refresh();
             }
             ControlState::Idle => {
                 if interest {
@@ -746,6 +847,7 @@ impl ControlCore {
                 }
             }
         }
+        self.view_revision != before
     }
 
     fn tick_active(&mut self, now: Instant) {
@@ -772,8 +874,8 @@ impl ControlCore {
             {
                 self.last_outcome = Some(summary.clone());
             }
-            if let OperationLifecycle::Failed { summary, error } = &snap.lifecycle {
-                self.last_outcome = Some(format!("{summary}: {error}"));
+            if snap.lifecycle.is_error_or_rollback() {
+                self.last_outcome = Some(snap.lifecycle.detail_message());
             }
             self.view_from(&snap);
         } else {
@@ -791,22 +893,22 @@ impl ControlCore {
             return;
         }
         let target = self.orch.curve_restore_mode();
-        let mut cfg = self.settings.curve.clone();
-        cfg.enabled = false;
-        let outcome = self.orch.execute(ServiceCommand::SetFanCurve(cfg));
-        let lifecycle = outcome.snapshot.lifecycle.clone();
+        let snap = self.leave_curve();
+        let lifecycle = snap.lifecycle.clone();
         self.state = ControlState::Fallback;
-        if matches!(lifecycle, OperationLifecycle::Failed { .. }) {
-            self.pending_fallback_restore = Some(target);
+        self.restore_required = !operation_succeeded(&lifecycle);
+        let target_name = target.map_or_else(|| "unknown".to_string(), |mode| format!("`{mode}`"));
+        if self.restore_required {
+            self.pending_fallback_restore = target;
             self.failure_reason = Some(format!(
-                "{why} for {}s; restoring the `{target}` firmware profile FAILED: {} (retrying every evaluation)",
+                "{why} for {}s; restoring the {target_name} firmware profile FAILED: {}",
                 SENSOR_LOSS_DEADLINE.as_secs(),
                 lifecycle.detail_message()
             ));
         } else {
             self.pending_fallback_restore = None;
             self.failure_reason = Some(format!(
-                "{why} for {}s; control suspended and the `{target}` firmware profile restored",
+                "{why} for {}s; control suspended and the {target_name} firmware profile restored",
                 SENSOR_LOSS_DEADLINE.as_secs()
             ));
         }
@@ -820,26 +922,30 @@ impl ControlCore {
             "{}",
             self.failure_reason.as_deref().unwrap_or("")
         );
-        self.view_from(&outcome.snapshot);
+        self.view_from(&snap);
     }
 
     fn tick_fallback(&mut self, now: Instant) {
-        if let Some(target) = self.pending_fallback_restore {
-            let outcome = self.orch.execute(ServiceCommand::SetThermalMode(target));
-            if !matches!(
-                outcome.snapshot.lifecycle,
-                OperationLifecycle::Failed { .. }
-            ) {
+        if self.restore_required {
+            let snap = self.leave_curve();
+            if operation_succeeded(&snap.lifecycle) {
                 self.pending_fallback_restore = None;
-                self.failure_reason = Some(format!(
-                    "control suspended; the `{target}` firmware profile was restored on retry"
-                ));
+                self.restore_required = false;
+                self.failure_reason = Some(
+                    "control suspended; the firmware profile was restored on retry".to_string(),
+                );
+                if !self.settings.intent_active {
+                    self.state = ControlState::Idle;
+                    self.failure_reason = None;
+                }
             }
-            self.view_from(&outcome.snapshot);
+            self.last_outcome = Some(snap.lifecycle.detail_message());
+            self.view_from(&snap);
             return;
         }
         if !self.settings.intent_active {
             self.state = ControlState::Idle;
+            self.refresh();
             return;
         }
         let snap = self.orch.query_snapshot();
@@ -849,27 +955,31 @@ impl ControlCore {
         if eligible && self.try_activate_curve("resume after sensor recovery") {
             self.needs_revalidation = false;
             self.last_eval = Some(now);
+            self.refresh();
         }
     }
 
     /// Graceful stop: leave custom control through the verified path and report what happened.
     /// The saved intent and startup preference are preserved.
     pub fn shutdown(&mut self) -> String {
-        let report = if self.orch.curve_enabled() {
-            let mut cfg = self.settings.curve.clone();
-            cfg.enabled = false;
-            let outcome = self.orch.execute(ServiceCommand::SetFanCurve(cfg));
-            let lifecycle = outcome.snapshot.lifecycle;
-            match lifecycle {
-                OperationLifecycle::Failed { .. } => format!(
+        let mut final_snapshot = None;
+        let report = if self.orch.curve_enabled() || self.restore_required {
+            let snap = self.leave_curve();
+            let lifecycle = &snap.lifecycle;
+            self.restore_required = !operation_succeeded(lifecycle);
+            let report = if self.restore_required {
+                format!(
                     "shutdown: leaving custom curve control FAILED: {}",
                     lifecycle.detail_message()
-                ),
-                other => format!(
+                )
+            } else {
+                format!(
                     "shutdown: left custom curve control: {}",
-                    other.detail_message()
-                ),
-            }
+                    lifecycle.detail_message()
+                )
+            };
+            final_snapshot = Some(snap);
+            report
         } else {
             "shutdown: no custom curve was being applied".to_string()
         };
@@ -883,6 +993,9 @@ impl ControlCore {
             "{report}"
         );
         self.last_outcome = Some(report.clone());
+        if let Some(snap) = final_snapshot {
+            self.view_from(&snap);
+        }
         report
     }
 
@@ -934,6 +1047,7 @@ struct HandleInner {
     stopped: Mutex<Option<String>>,
     memory: Mutex<OperationMemory>,
     pending: Mutex<std::collections::HashSet<String>>,
+    stop_requested: AtomicBool,
 }
 
 /// What is known about a request id (reconciliation after a lost connection or timeout).
@@ -959,11 +1073,28 @@ impl ControlHandle {
         Self::spawn_with_capacity(core, REQUEST_QUEUE_CAPACITY)
     }
 
+    /// Keep exclusive hardware ownership until the worker actually exits, even if shutdown
+    /// times out or the caller cannot finish starting its socket server.
+    pub(crate) fn spawn_owned(
+        core: ControlCore,
+        ownership: Arc<DaemonLock>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with_capacity_and_owner(core, REQUEST_QUEUE_CAPACITY, Some(ownership))
+    }
+
     /// Spawn with an explicit queue bound.
     ///
     /// # Errors
     /// Returns the I/O error if the thread cannot be spawned.
-    pub fn spawn_with_capacity(mut core: ControlCore, capacity: usize) -> std::io::Result<Self> {
+    pub fn spawn_with_capacity(core: ControlCore, capacity: usize) -> std::io::Result<Self> {
+        Self::spawn_with_capacity_and_owner(core, capacity, None)
+    }
+
+    fn spawn_with_capacity_and_owner(
+        mut core: ControlCore,
+        capacity: usize,
+        ownership: Option<Arc<DaemonLock>>,
+    ) -> std::io::Result<Self> {
         let (tx, rx): (SyncSender<Envelope>, Receiver<Envelope>) = mpsc::sync_channel(capacity);
         let inner = Arc::new(HandleInner {
             tx,
@@ -973,25 +1104,36 @@ impl ControlHandle {
             stopped: Mutex::new(None),
             memory: Mutex::new(OperationMemory::default()),
             pending: Mutex::new(std::collections::HashSet::new()),
+            stop_requested: AtomicBool::new(false),
         });
         let worker_inner = Arc::clone(&inner);
         let interval = core.tick_interval();
         let handle = std::thread::Builder::new()
             .name("awcc-control".to_string())
             .spawn(move || {
+                let _ownership = ownership;
                 let first = core.refresh();
                 publish(&worker_inner, &first);
                 let mut next_tick = Instant::now() + interval;
                 loop {
+                    if worker_inner.stop_requested.load(Ordering::Acquire) {
+                        break;
+                    }
                     let wait = next_tick.saturating_duration_since(Instant::now());
                     match rx.recv_timeout(wait) {
                         Ok(env) => {
+                            if worker_inner.stop_requested.load(Ordering::Acquire) {
+                                break;
+                            }
                             if serve(&mut core, &worker_inner, env) {
                                 break;
                             }
                         }
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                    if worker_inner.stop_requested.load(Ordering::Acquire) {
+                        break;
                     }
                     let now = Instant::now();
                     if now >= next_tick {
@@ -1002,8 +1144,9 @@ impl ControlHandle {
                                 .unwrap_or_else(PoisonError::into_inner);
                             now.saturating_duration_since(*last) < CLIENT_INTEREST_WINDOW
                         };
-                        core.tick(interested);
-                        if let Some(view) = core.cached_view().cloned() {
+                        if core.tick(interested)
+                            && let Some(view) = core.cached_view().cloned()
+                        {
                             publish(&worker_inner, &view);
                         }
                         // No catch-up: schedule from now, never from the missed deadline.
@@ -1014,6 +1157,10 @@ impl ControlHandle {
                 if let Some(view) = core.cached_view().cloned() {
                     publish(&worker_inner, &view);
                 }
+                *worker_inner
+                    .stopped
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(report.clone());
                 report
             })?;
         *inner.thread.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
@@ -1051,17 +1198,26 @@ impl ControlHandle {
         request: ControlRequest,
         deadline: Duration,
     ) -> Result<Option<ControlReply>, SubmitError> {
+        if self.inner.stop_requested.load(Ordering::Acquire) {
+            return Err(SubmitError::Stopped);
+        }
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let op_id = match &request {
-            ControlRequest::Op { id, .. } => Some(id.clone()),
+            ControlRequest::Op { id, .. } | ControlRequest::RawAcpi { id, .. } => Some(id.clone()),
             _ => None,
         };
         if let Some(id) = &op_id {
-            self.inner
+            let inserted = self
+                .inner
                 .pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(id.clone());
+            if !inserted {
+                // The original operation is still queued/running. Do not enqueue another
+                // copy or remove its pending marker if the queue happens to be full.
+                return Ok(None);
+            }
         }
         match self.inner.tx.try_send(Envelope {
             request,
@@ -1120,7 +1276,14 @@ impl ControlHandle {
     /// Returns the shutdown report, or `None` if the thread did not finish in time.
     #[must_use]
     pub fn stop(&self, deadline: Duration) -> Option<String> {
-        let _ = self.request(ControlRequest::Shutdown, Duration::from_millis(1));
+        self.inner.stop_requested.store(true, Ordering::Release);
+        let (reply, _rx) = mpsc::sync_channel(1);
+        // Wake an idle worker. If the queue is full, its next iteration sees stop_requested
+        // before executing any more queued operations.
+        let _ = self.inner.tx.try_send(Envelope {
+            request: ControlRequest::Shutdown,
+            reply,
+        });
         let handle = self
             .inner
             .thread
@@ -1161,6 +1324,7 @@ fn publish(inner: &HandleInner, view: &ThermalView) {
 
 /// Serve one envelope; returns `true` when the worker should stop.
 fn serve(core: &mut ControlCore, inner: &HandleInner, env: Envelope) -> bool {
+    let before = core.view_revision;
     let (reply, stop) = match env.request {
         ControlRequest::Refresh => {
             let view = core.refresh();
@@ -1173,8 +1337,11 @@ fn serve(core: &mut ControlCore, inner: &HandleInner, env: Envelope) -> bool {
                 false,
             )
         }
-        ControlRequest::RawAcpi { request, .. } => (Some(core.raw_acpi(&request)), false),
-        ControlRequest::Op { id, op } => {
+        request @ (ControlRequest::Op { .. } | ControlRequest::RawAcpi { .. }) => {
+            let id = match &request {
+                ControlRequest::Op { id, .. } | ControlRequest::RawAcpi { id, .. } => id.clone(),
+                _ => unreachable!("only operations reach replay handling"),
+            };
             let recorded = inner
                 .memory
                 .lock()
@@ -1189,7 +1356,11 @@ fn serve(core: &mut ControlCore, inner: &HandleInner, env: Envelope) -> bool {
                     result: Err(r),
                 },
                 None => {
-                    let reply = core.handle(op);
+                    let reply = match request {
+                        ControlRequest::Op { op, .. } => core.handle(op),
+                        ControlRequest::RawAcpi { request, .. } => core.raw_acpi(&request),
+                        _ => unreachable!("only operations reach replay handling"),
+                    };
                     let stored = match &reply.result {
                         Ok(_) => StoredOutcome::Completed(Box::new(reply.clone())),
                         Err(r) => StoredOutcome::Rejected(r.clone()),
@@ -1212,7 +1383,13 @@ fn serve(core: &mut ControlCore, inner: &HandleInner, env: Envelope) -> bool {
         ControlRequest::Shutdown => (None, true),
     };
     if let Some(reply) = reply {
-        publish(inner, &reply.view);
+        if core.view_revision != before
+            && let Some(view) = core.cached_view()
+        {
+            // Replaying a historical operation result must not roll the latest published
+            // telemetry/control state backwards or make an old observation look fresh.
+            publish(inner, view);
+        }
         // One-slot channel: never blocks even if the requester gave up.
         let _ = env.reply.try_send(reply);
     }
@@ -1266,6 +1443,7 @@ mod tests {
         inner: SimBackend,
         cpu: Arc<Mutex<Option<u16>>>,
         fail_writes: Arc<Mutex<bool>>,
+        telemetry_gate: Option<(SyncSender<()>, Receiver<()>)>,
     }
 
     impl ThermalTransport for TempTransport {
@@ -1294,6 +1472,10 @@ mod tests {
             self.inner.set_game_shift_status(e)
         }
         fn query_telemetry(&mut self) -> TelemetrySnapshot {
+            if let Some((entered, release)) = self.telemetry_gate.take() {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
             let mut t = self.inner.query_telemetry();
             let cpu = *self.cpu.lock().unwrap();
             t.cpu_temp_c = cpu.map_or(
@@ -1363,6 +1545,7 @@ mod tests {
             inner: SimBackend::new_alienware_m15_r6(),
             cpu: Arc::clone(&cpu),
             fail_writes: Arc::clone(&fail_writes),
+            telemetry_gate: None,
         };
         let orch = ThermalOrchestrator::new(
             profile,
@@ -1486,6 +1669,7 @@ mod tests {
                 inner: SimBackend::new_alienware_m15_r6(),
                 cpu: Arc::clone(&cpu),
                 fail_writes: Arc::new(Mutex::new(false)),
+                telemetry_gate: None,
             }),
             Box::new(MemoryStateStorage::new(Some(ThermalMode::Balanced))),
         );
@@ -1574,6 +1758,236 @@ mod tests {
         ));
         assert_eq!(r.core.state(), ControlState::Active);
         assert!(r.core.settings().intent_active || r.core.state() == ControlState::Active);
+    }
+
+    #[test]
+    fn failed_profile_change_keeps_evaluating_the_active_curve() {
+        let mut r = rig();
+        *r.cpu.lock().unwrap() = Some(60);
+        r.core.handle(ControlOp::ConfigureCurve(curve()));
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::AcpiSetFailureRollback);
+        let reply = r.core.handle(ControlOp::SetThermalMode(ThermalMode::Quiet));
+        assert!(matches!(
+            reply.result,
+            Ok(OperationLifecycle::Failed { .. })
+        ));
+        assert_eq!(r.core.state(), ControlState::Active);
+        assert!(r.core.orchestrator_mut().curve_enabled());
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::Normal);
+        *r.cpu.lock().unwrap() = Some(80);
+        r.advance(2);
+        r.core.tick(false);
+        assert_eq!(r.boost(), Some(85));
+    }
+
+    #[test]
+    fn rolled_back_gmode_toggle_keeps_evaluating_the_active_curve() {
+        let mut r = rig();
+        r.core.handle(ControlOp::ConfigureCurve(curve()));
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::AcpiSetFailureRollback);
+        let reply = r.core.handle(ControlOp::ToggleGMode);
+        assert!(matches!(
+            reply.result,
+            Ok(OperationLifecycle::RolledBack { .. })
+        ));
+        assert_eq!(r.core.state(), ControlState::Active);
+        assert!(r.core.settings().intent_active);
+        assert!(r.core.orchestrator_mut().curve_enabled());
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::Normal);
+        *r.cpu.lock().unwrap() = Some(80);
+        r.advance(2);
+        r.core.tick(false);
+        assert_eq!(r.boost(), Some(85));
+    }
+
+    #[test]
+    fn failed_curve_activation_restores_firmware_after_entering_manual_mode() {
+        let mut r = rig();
+        *r.fail_writes.lock().unwrap() = true;
+        let reply = r.core.handle(ControlOp::ConfigureCurve(curve()));
+        assert!(matches!(
+            reply.result,
+            Ok(OperationLifecycle::Failed { .. })
+        ));
+        assert_eq!(r.core.state(), ControlState::Idle);
+        assert_eq!(
+            reply.view.thermal_mode_state.known_mode(),
+            Some(ThermalMode::Balanced)
+        );
+        assert!(!reply.view.fan_curve.enabled);
+        assert!(!reply.view.control.intent_active);
+        assert!(!r.core.restore_required);
+    }
+
+    #[test]
+    fn failed_curve_replacement_restores_firmware_then_resumes_the_saved_curve() {
+        let mut r = rig();
+        *r.cpu.lock().unwrap() = Some(60);
+        r.core.handle(ControlOp::ConfigureCurve(curve()));
+        let mut replacement = curve();
+        for point in &mut replacement.cpu_points {
+            point.boost_pct = 95;
+        }
+        *r.fail_writes.lock().unwrap() = true;
+        let reply = r.core.handle(ControlOp::ConfigureCurve(replacement));
+        assert!(matches!(
+            reply.result,
+            Ok(OperationLifecycle::Failed { .. })
+        ));
+        assert_eq!(r.core.state(), ControlState::Fallback);
+        assert_eq!(
+            reply.view.thermal_mode_state.known_mode(),
+            Some(ThermalMode::Balanced)
+        );
+        assert!(!reply.view.fan_curve.enabled);
+        assert!(reply.view.control.intent_active);
+        assert_eq!(r.core.settings().curve.cpu_points, curve().cpu_points);
+        *r.fail_writes.lock().unwrap() = false;
+        *r.cpu.lock().unwrap() = Some(80);
+        r.advance(2);
+        r.core.tick(false);
+        assert_eq!(
+            r.core.cached_view().unwrap().control.state,
+            ControlState::Active
+        );
+        assert_eq!(r.boost(), Some(85));
+    }
+
+    #[test]
+    fn failed_activation_retains_a_failed_firmware_restore_for_retry() {
+        let mut r = rig();
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::AcpiSetFailureRollback);
+        let reply = r.core.handle(ControlOp::ConfigureCurve(curve()));
+        assert!(matches!(
+            reply.result,
+            Ok(OperationLifecycle::Failed { .. })
+        ));
+        assert_eq!(r.core.state(), ControlState::Fallback);
+        assert!(r.core.restore_required);
+        assert!(!r.core.settings().intent_active);
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::Normal);
+        r.advance(2);
+        r.core.tick(false);
+        assert_eq!(
+            r.core.cached_view().unwrap().control.state,
+            ControlState::Idle
+        );
+        assert!(!r.core.restore_required);
+        assert_eq!(
+            r.core
+                .cached_view()
+                .unwrap()
+                .thermal_mode_state
+                .known_mode(),
+            Some(ThermalMode::Balanced)
+        );
+    }
+
+    fn failed_fallback(r: &mut Rig) {
+        r.core.handle(ControlOp::ConfigureCurve(curve()));
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::AcpiSetFailureRollback);
+        *r.cpu.lock().unwrap() = None;
+        r.advance(2);
+        r.core.tick(false);
+        r.advance(SENSOR_LOSS_DEADLINE.as_secs());
+        r.core.tick(false);
+        assert_eq!(r.core.state(), ControlState::Fallback);
+        assert!(r.core.restore_required);
+        assert!(!r.core.orchestrator_mut().curve_enabled());
+    }
+
+    #[test]
+    fn explicit_stop_retries_a_failed_fallback_without_reactivating_the_curve() {
+        let mut r = rig();
+        failed_fallback(&mut r);
+        let failed = r.core.handle(ControlOp::StopCurve);
+        assert!(matches!(
+            failed.result,
+            Ok(OperationLifecycle::Failed { .. })
+        ));
+        assert!(!r.core.settings().intent_active);
+        assert!(r.core.restore_required);
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::Normal);
+        r.advance(2);
+        r.core.tick(false);
+        let view = r.core.cached_view().unwrap();
+        assert_eq!(view.control.state, ControlState::Idle);
+        assert_eq!(
+            view.thermal_mode_state.known_mode(),
+            Some(ThermalMode::Balanced)
+        );
+        assert!(!view.control.intent_active);
+        assert!(!view.fan_curve.enabled);
+        assert!(view.control.failure_reason.is_none());
+    }
+
+    #[test]
+    fn shutdown_retries_pending_firmware_restoration() {
+        let mut r = rig();
+        failed_fallback(&mut r);
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::Normal);
+        let report = r.core.shutdown();
+        assert!(report.contains("left custom curve control"), "{report}");
+        assert!(!report.contains("FAILED"), "{report}");
+        assert_eq!(
+            r.core
+                .cached_view()
+                .unwrap()
+                .thermal_mode_state
+                .known_mode(),
+            Some(ThermalMode::Balanced)
+        );
+    }
+
+    #[test]
+    fn unknown_restore_target_remains_a_failure_on_repeated_stop_and_shutdown() {
+        let profile = DeviceProfile::alienware_m15_r6().unwrap();
+        let mut transport = SimBackend::new_alienware_m15_r6();
+        transport
+            .set_raw_thermal_mode(profile.code_table.set_code_for(ThermalMode::Manual))
+            .unwrap();
+        let orch = ThermalOrchestrator::new(
+            profile,
+            Box::new(transport),
+            Box::new(MemoryStateStorage::new(None)),
+        );
+        let mut core = ControlCore::new(
+            orch,
+            SettingsLoad::Missing,
+            Arc::new(NullSettingsSink),
+            DEFAULT_TICK_INTERVAL,
+        );
+        core.handle(ControlOp::ConfigureCurve(curve()));
+        let before = core.refresh().audit.len();
+        for _ in 0..2 {
+            let reply = core.handle(ControlOp::StopCurve);
+            assert!(matches!(
+                reply.result,
+                Ok(OperationLifecycle::Failed { .. })
+            ));
+            assert_eq!(reply.view.audit.len(), before, "no invented profile write");
+        }
+        let report = core.shutdown();
+        assert!(report.contains("FAILED"), "{report}");
+        assert_eq!(core.cached_view().unwrap().audit.len(), before);
     }
 
     #[test]
@@ -1678,6 +2092,7 @@ mod tests {
                 inner: SimBackend::new_alienware_m15_r6(),
                 cpu: Arc::clone(&cpu),
                 fail_writes: Arc::new(Mutex::new(false)),
+                telemetry_gate: None,
             }),
             Box::new(MemoryStateStorage::new(Some(ThermalMode::Balanced))),
         );
@@ -1737,6 +2152,222 @@ mod tests {
             handle.request(ControlRequest::Refresh, Duration::from_millis(50)),
             Err(SubmitError::Stopped)
         ));
+    }
+
+    fn gated_core() -> (ControlCore, Receiver<()>, SyncSender<()>) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let orch = ThermalOrchestrator::new(
+            DeviceProfile::alienware_m15_r6().unwrap(),
+            Box::new(TempTransport {
+                inner: SimBackend::new_alienware_m15_r6(),
+                cpu: Arc::new(Mutex::new(Some(60))),
+                fail_writes: Arc::new(Mutex::new(false)),
+                telemetry_gate: Some((entered_tx, release_rx)),
+            }),
+            Box::new(MemoryStateStorage::new(Some(ThermalMode::Balanced))),
+        );
+        (
+            ControlCore::new(
+                orch,
+                SettingsLoad::Missing,
+                Arc::new(NullSettingsSink),
+                Duration::from_millis(20),
+            ),
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    #[test]
+    fn saturated_queue_cannot_prevent_shutdown_or_lose_a_pending_request() {
+        let (core, entered, release) = gated_core();
+        let handle = ControlHandle::spawn_with_capacity(core, 1).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let request = || ControlRequest::RawAcpi {
+            id: "raw-pending".to_string(),
+            // Rejected by the raw-ACPI handler before any real kernel I/O.
+            request: DaemonRpcRequest::SetCpuTurbo { enabled: false },
+        };
+        assert!(matches!(
+            handle.request(request(), Duration::ZERO),
+            Ok(None)
+        ));
+        assert!(matches!(
+            handle.request(request(), Duration::ZERO),
+            Ok(None)
+        ));
+        assert!(matches!(
+            handle.operation_status("raw-pending"),
+            OperationStatus::Pending
+        ));
+        assert!(handle.stop(Duration::ZERO).is_none());
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while handle.stop(Duration::ZERO).is_none() {
+            assert!(
+                Instant::now() < until,
+                "full queue prevented worker shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn timed_out_worker_keeps_hardware_ownership_until_it_exits() {
+        let dir = std::env::temp_dir().join(format!("awcc_control_owner_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("awccd.lock");
+        let owner = Arc::new(DaemonLock::acquire(&path, false).unwrap());
+        let (core, entered, release) = gated_core();
+        let handle = ControlHandle::spawn_owned(core, Arc::clone(&owner)).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(handle.stop(Duration::ZERO).is_none());
+        drop(handle);
+        drop(owner);
+        assert!(DaemonLock::acquire(&path, false).is_err());
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(owner) = DaemonLock::acquire(&path, false) {
+                drop(owner);
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "worker did not release ownership after exit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn idle_ticks_do_not_make_cached_telemetry_look_fresh() {
+        let mut r = rig();
+        r.core.tick_interval = Duration::from_millis(20);
+        let handle = ControlHandle::spawn(r.core).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while handle.published().is_none() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        *handle.inner.interest.lock().unwrap() =
+            Instant::now() - CLIENT_INTEREST_WINDOW - Duration::from_secs(1);
+        // Serialize behind any tick that had already captured the previous interest time.
+        handle
+            .request(ControlRequest::Refresh, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let (before, _) = handle.published().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let (after, age) = handle.published().unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "idle tick republished old samples"
+        );
+        assert!(age >= Duration::from_millis(90));
+        assert!(handle.stop(Duration::from_secs(5)).is_some());
+    }
+
+    #[test]
+    fn replayed_result_does_not_replace_the_current_published_state() {
+        let r = rig();
+        let handle = ControlHandle::spawn(r.core).unwrap();
+        let request = |id: &str, mode| ControlRequest::Op {
+            id: id.to_string(),
+            op: ControlOp::SetThermalMode(mode),
+        };
+        for (id, mode) in [
+            ("quiet", ThermalMode::Quiet),
+            ("full", ThermalMode::FullSpeed),
+        ] {
+            handle
+                .request(request(id, mode), Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        }
+        let replay = handle
+            .request(request("quiet", ThermalMode::Quiet), Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replay.view.thermal_mode_state.known_mode(),
+            Some(ThermalMode::Quiet)
+        );
+        assert_eq!(
+            handle
+                .published()
+                .unwrap()
+                .0
+                .thermal_mode_state
+                .known_mode(),
+            Some(ThermalMode::FullSpeed)
+        );
+        let raw = ControlRequest::RawAcpi {
+            id: "raw-rejected".to_string(),
+            request: DaemonRpcRequest::SetCpuTurbo { enabled: false },
+        };
+        assert!(
+            handle
+                .request(raw, Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .result
+                .is_err()
+        );
+        assert!(matches!(
+            handle.operation_status("raw-rejected"),
+            OperationStatus::Rejected(_)
+        ));
+        assert!(handle.stop(Duration::from_secs(5)).is_some());
+    }
+
+    #[test]
+    fn dropping_a_sink_does_not_wait_for_a_blocked_filesystem_writer() {
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || release_rx.recv().unwrap());
+        let sink = AsyncSettingsSink {
+            shared: Arc::new((
+                Mutex::new(PersistState {
+                    in_flight: true,
+                    ..PersistState::default()
+                }),
+                Condvar::new(),
+            )),
+            thread: Mutex::new(Some(writer)),
+        };
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let dropper = std::thread::spawn(move || {
+            drop(sink);
+            done_tx.send(()).unwrap();
+        });
+        let dropped = done_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        dropper.join().unwrap();
+        assert!(
+            dropped.is_ok(),
+            "sink Drop exceeded the explicit flush deadline"
+        );
+    }
+
+    #[test]
+    fn settings_writer_retains_ownership_until_clean_shutdown() {
+        let dir = std::env::temp_dir().join(format!("awcc_settings_owner_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("awccd.lock");
+        let owner = Arc::new(DaemonLock::acquire(&path, false).unwrap());
+        let sink =
+            AsyncSettingsSink::spawn_owned(SettingsStore::new(&dir), None, Arc::clone(&owner))
+                .unwrap();
+        drop(owner);
+        assert!(DaemonLock::acquire(&path, false).is_err());
+        sink.submit(ServiceSettings::fresh("test", "AMWW"));
+        assert!(sink.flush(Duration::from_secs(5)));
+        drop(sink);
+        let owner = DaemonLock::acquire(&path, false).unwrap();
+        drop(owner);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

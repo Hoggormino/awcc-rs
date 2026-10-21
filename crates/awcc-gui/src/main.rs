@@ -24,7 +24,14 @@ use awcc_platform::WriteAuditEntry;
 use awcc_platform::usb_elc::{ElcDiagnosticsSummary, LightingStateSource};
 use awcc_service::{
     SendError, ServiceCommand, SystemSnapshot, ThermalOrchestrator, ThermalServiceHandle,
-    WorkerFailure, resolve_host_device_profile, resolve_simulated_m15_r6_profile,
+    WorkerFailure,
+    installer::{
+        self, ApplyOutcome, ApplyReport, InstallPaths, Ownership, Progress, ServiceAction,
+        ServiceStatusReport, SystemRunner, UnitState,
+    },
+    ipc::{DaemonClient, ServiceProbe},
+    resolve_host_device_profile, resolve_simulated_m15_r6_profile,
+    wire::ControlState,
 };
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
@@ -528,6 +535,7 @@ const fn interval_label_for_ms(ms: i32) -> &'static str {
 /// Apply an immutable `SystemSnapshot` onto the Slint `MainWindow`.
 fn sync_snapshot_to_ui(ui: &MainWindow, snap: &SystemSnapshot, sync_staged_sliders: bool) {
     ui.set_is_simulated(snap.is_simulated);
+    sync_service_control_to_ui(ui, snap);
     ui.set_scenario_index(snap.scenario.index());
     ui.set_device_name(SharedString::from(snap.profile.device_name.as_str()));
     ui.set_acpi_path(SharedString::from(snap.profile.acpi_prefix.wmax_path()));
@@ -1053,6 +1061,319 @@ enum DiagJobResult {
     },
 }
 
+#[derive(Clone)]
+struct ServiceInspection {
+    installation: ServiceStatusReport,
+    daemon: ServiceProbe,
+}
+
+/// All host access for the Settings service card runs on a background thread. Keeping this
+/// boundary injectable also lets the callbacks be tested without systemd or authorization.
+trait ServiceManagementBackend: Send + Sync {
+    fn inspect(&self) -> ServiceInspection;
+    fn apply(
+        &self,
+        action: ServiceAction,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<ApplyReport, String>;
+}
+
+struct SystemServiceManagement;
+
+impl ServiceManagementBackend for SystemServiceManagement {
+    fn inspect(&self) -> ServiceInspection {
+        ServiceInspection {
+            installation: installer::inspect(&InstallPaths::system(), &SystemRunner::new()),
+            daemon: DaemonClient::system("awcc-gui", env!("CARGO_PKG_VERSION")).probe(),
+        }
+    }
+
+    fn apply(
+        &self,
+        action: ServiceAction,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<ApplyReport, String> {
+        // Both release archives and AppImages place the CLI beside the GUI. The management
+        // helper selects the original APPIMAGE when present; it never elevates this GUI.
+        let cli = std::env::current_exe()
+            .map_err(|error| format!("Cannot locate awcc-cli: {error}"))?
+            .with_file_name("awcc-cli");
+        awcc_service::management::apply_system(action, &cli, progress)
+            .map_err(|error| error.to_string())
+    }
+}
+
+enum ServiceJobEvent {
+    Progress(String),
+    Outcome(Result<ApplyReport, String>),
+    Status(Box<ServiceInspection>),
+}
+
+fn disable_service_management_ui(ui: &MainWindow, label: &str, detail: &str) {
+    ui.set_service_state_label(label.into());
+    ui.set_service_state_detail(detail.into());
+    ui.set_service_state_is_problem(false);
+    ui.set_service_managed_by("none".into());
+    ui.set_service_can_install(false);
+    ui.set_service_can_update(false);
+    ui.set_service_can_remove(false);
+    ui.set_service_restore_available(false);
+    ui.set_service_confirming_install(false);
+    ui.set_service_confirming_remove(false);
+    ui.set_service_version_line("".into());
+    ui.set_service_curve_summary("".into());
+}
+
+fn sync_service_control_to_ui(ui: &MainWindow, snap: &SystemSnapshot) {
+    if snap.is_simulated {
+        disable_service_management_ui(
+            ui,
+            "Simulation",
+            "Simulation runs in this window. Service installation and host status checks are disabled.",
+        );
+        return;
+    }
+    ui.set_service_restore_available(
+        snap.service_control.is_some() && snap.service_error.is_none(),
+    );
+    if let Some(control) = &snap.service_control {
+        ui.set_service_restore_at_startup(control.restore_at_startup);
+        let state = match control.state {
+            ControlState::Idle => "No custom fan curve is running.",
+            ControlState::Active => "The service is applying the custom fan curve.",
+            ControlState::Fallback => "The custom fan curve is suspended in fallback.",
+            ControlState::RestoreFailed => "The saved fan curve could not be restored.",
+        };
+        let mut details = vec![state.to_string()];
+        if let Some(reason) = &control.failure_reason {
+            details.push(reason.clone());
+        }
+        if let Some(problem) = &control.settings_problem {
+            details.push(format!("Saved settings: {problem}"));
+        }
+        if let Some(error) = &control.settings_save_error {
+            details.push(format!("Settings could not be saved: {error}"));
+        } else if control.settings_save_pending {
+            details.push("Saving settings…".into());
+        }
+        if let Some(error) = &snap.service_error {
+            details.insert(0, format!("Last known state; service unavailable: {error}"));
+        }
+        ui.set_service_curve_summary(details.join(" ").into());
+    } else {
+        ui.set_service_curve_summary(snap.service_error.as_ref().map_or_else(
+            || "Waiting for the service control state.".into(),
+            |error| format!("Service control unavailable: {error}").into(),
+        ));
+    }
+}
+
+fn sync_service_inspection_to_ui(ui: &MainWindow, inspection: &ServiceInspection) {
+    let report = &inspection.installation;
+    let mut label = match report.unit_state {
+        UnitState::Missing => "Not installed",
+        UnitState::Stopped => "Stopped",
+        UnitState::Running => "Running",
+        UnitState::Activating => "Starting",
+        UnitState::Deactivating => "Stopping",
+        UnitState::Failed => "Failed",
+        UnitState::Masked => "Masked",
+        UnitState::Unknown => "Status unavailable",
+    };
+    let mut problem = matches!(
+        report.unit_state,
+        UnitState::Failed | UnitState::Masked | UnitState::Unknown
+    ) || !report.problems.is_empty();
+    let mut details = vec![match &report.ownership {
+        Ownership::None => "No service installation was found.".to_string(),
+        Ownership::AppimageInstaller { .. } => {
+            "Managed by this application's service installer.".to_string()
+        }
+        Ownership::NativePackage {
+            manager, package, ..
+        } => format!(
+            "Managed by {manager} package {package}. Use the package manager for updates and removal."
+        ),
+        Ownership::Unknown { unit_path, reason } => {
+            format!("Managed outside this application at {unit_path}: {reason}")
+        }
+    }];
+    if let Some(enabled) = report.enabled {
+        details.push(if enabled {
+            "Enabled at boot.".into()
+        } else {
+            "Disabled at boot. Enable with sudo systemctl enable --now awccd.".into()
+        });
+    }
+    let mut service_version = report.version.as_deref();
+    match &inspection.daemon {
+        ServiceProbe::Running {
+            version, status, ..
+        } => {
+            service_version = Some(version);
+            if !status.control_running {
+                label = "Control unavailable";
+                problem = true;
+                details.push("The daemon has not published its control state.".into());
+            } else if report.unit_state == UnitState::Missing {
+                label = "Running outside systemd";
+            }
+        }
+        ServiceProbe::AccessDenied { message } => {
+            label = "Access denied";
+            problem = true;
+            details.push(format!(
+                "{message}. Authorize your account with sudo awcc-cli service authorize <user>."
+            ));
+        }
+        ServiceProbe::Incompatible { message } => {
+            label = "Incompatible service";
+            problem = true;
+            details.push(message.clone());
+        }
+        ServiceProbe::NotRunning { reason } => {
+            if report.unit_state == UnitState::Running {
+                label = "Unreachable";
+                problem = true;
+            }
+            if report.unit_state != UnitState::Missing {
+                details.push(reason.clone());
+            }
+        }
+    }
+    details.extend(report.problems.iter().cloned());
+    ui.set_service_state_label(label.into());
+    ui.set_service_state_detail(details.join(" ").into());
+    ui.set_service_state_is_problem(problem);
+    ui.set_service_managed_by(report.managed_by.as_str().into());
+    ui.set_service_version_line(
+        format!(
+            "GUI {} · service {}",
+            env!("CARGO_PKG_VERSION"),
+            service_version.unwrap_or("not available")
+        )
+        .into(),
+    );
+    let installer_owned = matches!(report.ownership, Ownership::AppimageInstaller { .. });
+    let manageable = report.unit_state != UnitState::Unknown && !report.masked;
+    ui.set_service_can_install(
+        manageable
+            && matches!(report.ownership, Ownership::None)
+            && report.unit_state == UnitState::Missing
+            && report.problems.is_empty()
+            && matches!(inspection.daemon, ServiceProbe::NotRunning { .. }),
+    );
+    ui.set_service_can_update(manageable && installer_owned);
+    ui.set_service_can_remove(manageable && installer_owned);
+    if !ui.get_service_can_install() {
+        ui.set_service_confirming_install(false);
+    }
+    if !ui.get_service_can_remove() {
+        ui.set_service_confirming_remove(false);
+    }
+}
+
+fn service_apply_message(report: &ApplyReport) -> String {
+    let outcome = match report.outcome {
+        ApplyOutcome::Installed => "Background service installed.",
+        ApplyOutcome::Updated => "Background service updated.",
+        ApplyOutcome::Unchanged => "This service build is already installed.",
+        ApplyOutcome::Uninstalled => "Background service removed. Saved settings were kept.",
+        ApplyOutcome::NothingToUninstall => "No application-managed service was installed.",
+    };
+    std::iter::once(outcome)
+        .chain(report.notes.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn start_service_job(ui: &MainWindow, ops: &SharedOps, action: Option<ServiceAction>) {
+    // Guard the callbacks themselves as well as the buttons: simulation must never reach a
+    // host backend, even if a callback is invoked programmatically.
+    if ui.get_is_simulated() || ops.borrow().service_busy {
+        return;
+    }
+    if let Some(action) = action {
+        let allowed = match action {
+            ServiceAction::Install => {
+                ui.get_service_can_install() && ui.get_service_confirming_install()
+            }
+            ServiceAction::Update => ui.get_service_can_update(),
+            ServiceAction::Uninstall { .. } => {
+                ui.get_service_can_remove() && ui.get_service_confirming_remove()
+            }
+        };
+        if !allowed {
+            return;
+        }
+        ui.set_service_result("".into());
+        ui.set_service_result_is_error(false);
+        ui.set_service_confirming_install(false);
+        ui.set_service_confirming_remove(false);
+    }
+    let (backend, tx) = {
+        let mut state = ops.borrow_mut();
+        state.service_busy = true;
+        (
+            Arc::clone(&state.service_backend),
+            state.service_job_tx.clone(),
+        )
+    };
+    ui.set_service_busy(true);
+    ui.set_service_progress(
+        if action.is_some() {
+            "Waiting for administrator authorization…"
+        } else {
+            "Checking service status…"
+        }
+        .into(),
+    );
+    let spawned = std::thread::Builder::new()
+        .name("awcc-service-settings".into())
+        .spawn(move || {
+            if let Some(action) = action {
+                let result = backend.apply(action, &mut |progress| {
+                    let _ = tx.send(ServiceJobEvent::Progress(progress.message));
+                });
+                let _ = tx.send(ServiceJobEvent::Outcome(result));
+                let _ = tx.send(ServiceJobEvent::Progress("Checking service status…".into()));
+            }
+            let _ = tx.send(ServiceJobEvent::Status(Box::new(backend.inspect())));
+        });
+    if let Err(error) = spawned {
+        ops.borrow_mut().service_busy = false;
+        ui.set_service_busy(false);
+        ui.set_service_progress("".into());
+        ui.set_service_result(format!("Cannot start service task: {error}").into());
+        ui.set_service_result_is_error(true);
+    }
+}
+
+fn poll_service_jobs(ui: &MainWindow, ops: &SharedOps) {
+    loop {
+        let received = ops.borrow().service_job_rx.try_recv().ok();
+        let Some(event) = received else {
+            break;
+        };
+        match event {
+            ServiceJobEvent::Progress(message) => ui.set_service_progress(message.into()),
+            ServiceJobEvent::Outcome(result) => {
+                ui.set_service_result_is_error(result.is_err());
+                ui.set_service_result(match result {
+                    Ok(report) => service_apply_message(&report).into(),
+                    Err(error) => error.into(),
+                });
+            }
+            ServiceJobEvent::Status(inspection) => {
+                sync_service_inspection_to_ui(ui, &inspection);
+                ops.borrow_mut().service_busy = false;
+                ui.set_service_busy(false);
+                ui.set_service_progress("".into());
+            }
+        }
+    }
+}
+
 /// A user request that was queued but that the worker has not reported on yet.
 #[derive(Debug, Clone)]
 struct PendingRequest {
@@ -1071,6 +1392,10 @@ struct UiOps {
     diag_job_tx: std::sync::mpsc::Sender<DiagJobResult>,
     diag_job_rx: std::sync::mpsc::Receiver<DiagJobResult>,
     diag_job_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    service_backend: Arc<dyn ServiceManagementBackend>,
+    service_busy: bool,
+    service_job_tx: std::sync::mpsc::Sender<ServiceJobEvent>,
+    service_job_rx: std::sync::mpsc::Receiver<ServiceJobEvent>,
 }
 
 impl Default for UiOps {
@@ -1084,6 +1409,7 @@ impl Default for UiOps {
             DiagnosticsRuntime::new(cfg)
         });
         let (diag_job_tx, diag_job_rx) = std::sync::mpsc::channel();
+        let (service_job_tx, service_job_rx) = std::sync::mpsc::channel();
         Self {
             pending: None,
             worker_failure_shown: false,
@@ -1094,6 +1420,10 @@ impl Default for UiOps {
             diag_job_tx,
             diag_job_rx,
             diag_job_hook: None,
+            service_backend: Arc::new(SystemServiceManagement),
+            service_busy: false,
+            service_job_tx,
+            service_job_rx,
         }
     }
 }
@@ -1356,6 +1686,65 @@ fn wire_ui_callbacks(
                 .is_some_and(|w| submit(&w, &svc, &ops, cmd))
         })
     };
+
+    {
+        let ui_weak = ui.as_weak();
+        let ops = Rc::clone(ops);
+        ui.on_refresh_service_status(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                start_service_job(&w, &ops, None);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let ops = Rc::clone(ops);
+        ui.on_install_service(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                start_service_job(&w, &ops, Some(ServiceAction::Install));
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let ops = Rc::clone(ops);
+        ui.on_update_service(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                start_service_job(&w, &ops, Some(ServiceAction::Update));
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let ops = Rc::clone(ops);
+        ui.on_uninstall_service(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                start_service_job(&w, &ops, Some(ServiceAction::Uninstall { purge: false }));
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let svc = Rc::clone(service);
+        let submit_cmd = Rc::clone(&submit_cmd);
+        ui.on_set_restore_at_startup(move |enabled| {
+            let Some(w) = ui_weak.upgrade() else {
+                return;
+            };
+            if w.get_is_simulated() || w.get_service_busy() || !w.get_service_restore_available() {
+                return;
+            }
+            // Keep the switch at the last confirmed value until the service replies.
+            let confirmed = svc
+                .borrow()
+                .current_snapshot()
+                .service_control
+                .as_ref()
+                .is_some_and(|control| control.restore_at_startup);
+            w.set_service_restore_at_startup(confirmed);
+            submit_cmd(ServiceCommand::SetRestoreAtStartup(enabled));
+        });
+    }
 
     {
         let submit_cmd = Rc::clone(&submit_cmd);
@@ -2005,6 +2394,11 @@ fn render_headless_screenshot(
         }
     };
     let _ = snap;
+    disable_service_management_ui(
+        &ui,
+        "Screenshot preview",
+        "Service management is disabled while rendering a screenshot.",
+    );
 
     ui.show().context("failed to show headless MainWindow")?;
     sw_window.set_size(PhysicalSize::new(width, height));
@@ -2121,6 +2515,9 @@ fn run_interactive(sim_mode: bool) -> Result<()> {
     }
     let refresh_timer = Rc::new(Timer::default());
     wire_ui_callbacks(&ui, &service, &ops, &refresh_timer);
+    if !sim_mode {
+        start_service_job(&ui, &ops, None);
+    }
 
     // Start periodic auto-refresh timer (default 1000ms = 1.0s, configurable in Settings).
     restart_auto_refresh_timer(
@@ -2151,6 +2548,7 @@ fn run_interactive(sim_mode: bool) -> Result<()> {
                 sync_recording_state_to_ui(&w, &diag);
                 poll_diagnostics_jobs(&w, &ops);
             }
+            poll_service_jobs(&w, &ops);
             report_worker_failure_once(&w, &svc, &ops, &refresh_timer);
         });
     }
@@ -2645,6 +3043,365 @@ mod tests {
         sync_snapshot_to_ui(&ui, &snap, true);
         wire_ui_callbacks(&ui, service, &ops, &timer);
         (ui, ops, timer)
+    }
+
+    fn service_inspection(ownership: Ownership, state: UnitState) -> ServiceInspection {
+        ServiceInspection {
+            installation: ServiceStatusReport {
+                managed_by: ownership.managed_by().into(),
+                ownership,
+                unit_state: state,
+                enabled: (state != UnitState::Missing).then_some(true),
+                masked: state == UnitState::Masked,
+                installed_build_id: None,
+                version: None,
+                unit_path: None,
+                dropins: Vec::new(),
+                interrupted_operation: false,
+                problems: Vec::new(),
+            },
+            daemon: if state == UnitState::Running {
+                ServiceProbe::Running {
+                    daemon_protocol: 1,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    commit: "test".into(),
+                    package_format: "appimage".into(),
+                    status: awcc_service::ipc::DaemonStatus {
+                        uptime_secs: 2,
+                        device_name: "Test device".into(),
+                        acpi_prefix: "TEST".into(),
+                        control_running: true,
+                    },
+                    capabilities: Vec::new(),
+                }
+            } else {
+                ServiceProbe::NotRunning {
+                    reason: "No socket".into(),
+                }
+            },
+        }
+    }
+
+    struct FakeServiceManagement {
+        inspection: std::sync::Mutex<ServiceInspection>,
+        actions: std::sync::Mutex<Vec<ServiceAction>>,
+        inspections: std::sync::atomic::AtomicUsize,
+        failure: std::sync::Mutex<Option<String>>,
+        entered: Option<std::sync::mpsc::Sender<()>>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl Default for FakeServiceManagement {
+        fn default() -> Self {
+            Self {
+                inspection: std::sync::Mutex::new(service_inspection(
+                    Ownership::None,
+                    UnitState::Missing,
+                )),
+                actions: std::sync::Mutex::new(Vec::new()),
+                inspections: std::sync::atomic::AtomicUsize::new(0),
+                failure: std::sync::Mutex::new(None),
+                entered: None,
+                release: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    impl ServiceManagementBackend for FakeServiceManagement {
+        fn inspect(&self) -> ServiceInspection {
+            self.inspections
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inspection.lock().unwrap().clone()
+        }
+
+        fn apply(
+            &self,
+            action: ServiceAction,
+            progress: &mut dyn FnMut(Progress),
+        ) -> Result<ApplyReport, String> {
+            self.actions.lock().unwrap().push(action);
+            progress(Progress {
+                step: installer::ProgressStep::Staging,
+                message: "Staging the service".into(),
+            });
+            if let Some(entered) = &self.entered {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.release.lock().unwrap().take() {
+                release.recv().unwrap();
+            }
+            if let Some(failure) = self.failure.lock().unwrap().clone() {
+                return Err(failure);
+            }
+            let outcome = match action {
+                ServiceAction::Install => ApplyOutcome::Installed,
+                ServiceAction::Update => ApplyOutcome::Updated,
+                ServiceAction::Uninstall { .. } => ApplyOutcome::Uninstalled,
+            };
+            *self.inspection.lock().unwrap() = if matches!(action, ServiceAction::Uninstall { .. })
+            {
+                service_inspection(Ownership::None, UnitState::Missing)
+            } else {
+                service_inspection(
+                    Ownership::AppimageInstaller {
+                        build_id: "test-build".into(),
+                    },
+                    UnitState::Running,
+                )
+            };
+            Ok(ApplyReport {
+                action: action.name().into(),
+                outcome,
+                build_id: Some("test-build".into()),
+                previous_build_id: None,
+                enabled: Some(true),
+                active: Some(true),
+                recovered_interrupted: false,
+                purged: false,
+                notes: Vec::new(),
+            })
+        }
+    }
+
+    fn wait_for_service_job(ui: &MainWindow, ops: &SharedOps) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while ops.borrow().service_busy {
+            poll_service_jobs(ui, ops);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "service task timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn service_status_buttons_follow_installation_ownership_and_daemon_health() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let absent = service_inspection(Ownership::None, UnitState::Missing);
+        sync_service_inspection_to_ui(&ui, &absent);
+        assert_eq!(ui.get_service_state_label(), "Not installed");
+        assert!(ui.get_service_can_install());
+        assert!(!ui.get_service_can_update());
+        assert!(!ui.get_service_can_remove());
+
+        let native = service_inspection(
+            Ownership::NativePackage {
+                manager: "dpkg".into(),
+                package: "awcc-rs".into(),
+                unit_path: "/usr/lib/systemd/system/awccd.service".into(),
+            },
+            UnitState::Running,
+        );
+        sync_service_inspection_to_ui(&ui, &native);
+        assert_eq!(ui.get_service_managed_by(), "native-package");
+        assert!(!ui.get_service_can_install());
+        assert!(!ui.get_service_can_update());
+        assert!(!ui.get_service_can_remove());
+        assert!(ui.get_service_state_detail().contains("package manager"));
+
+        let mut ours = service_inspection(
+            Ownership::AppimageInstaller {
+                build_id: "test-build".into(),
+            },
+            UnitState::Running,
+        );
+        sync_service_inspection_to_ui(&ui, &ours);
+        assert_eq!(ui.get_service_state_label(), "Running");
+        assert!(ui.get_service_can_update());
+        assert!(ui.get_service_can_remove());
+        assert!(!ui.get_service_state_is_problem());
+
+        ours.daemon = ServiceProbe::AccessDenied {
+            message: "User is not authorized".into(),
+        };
+        sync_service_inspection_to_ui(&ui, &ours);
+        assert_eq!(ui.get_service_state_label(), "Access denied");
+        assert!(ui.get_service_state_detail().contains("service authorize"));
+        assert!(
+            ui.get_service_can_update(),
+            "ownership is independent of IPC access"
+        );
+        assert!(ui.get_service_state_is_problem());
+        ours.daemon = ServiceProbe::Incompatible {
+            message: "Upgrade the service protocol".into(),
+        };
+        sync_service_inspection_to_ui(&ui, &ours);
+        assert_eq!(ui.get_service_state_label(), "Incompatible service");
+        assert!(
+            ui.get_service_state_detail()
+                .contains("Upgrade the service protocol")
+        );
+        ours.daemon = ServiceProbe::NotRunning {
+            reason: "Connection refused".into(),
+        };
+        sync_service_inspection_to_ui(&ui, &ours);
+        assert_eq!(ui.get_service_state_label(), "Unreachable");
+
+        ours.installation.unit_state = UnitState::Unknown;
+        ours.installation.problems.push("systemctl failed".into());
+        sync_service_inspection_to_ui(&ui, &ours);
+        assert!(!ui.get_service_can_update());
+        assert!(!ui.get_service_can_remove());
+        assert!(ui.get_service_state_detail().contains("systemctl failed"));
+    }
+
+    #[test]
+    fn simulation_never_runs_service_status_installation_or_restore_callbacks() {
+        let (service, release) = gated_service(1);
+        let (ui, ops, _timer) = wired_ui(&service);
+        let backend = Arc::new(FakeServiceManagement::default());
+        ops.borrow_mut().service_backend = backend.clone();
+        assert_eq!(ui.get_service_state_label(), "Simulation");
+        // Even a stale/programmatically altered button state cannot bypass simulation mode.
+        ui.set_service_can_install(true);
+        ui.set_service_can_update(true);
+        ui.set_service_can_remove(true);
+        ui.set_service_confirming_install(true);
+        ui.set_service_confirming_remove(true);
+        ui.set_service_restore_available(true);
+        ui.invoke_refresh_service_status();
+        ui.invoke_install_service();
+        ui.invoke_update_service();
+        ui.invoke_uninstall_service();
+        ui.invoke_set_restore_at_startup(true);
+        assert!(!ops.borrow().service_busy);
+        assert!(ops.borrow().pending.is_none());
+        assert!(backend.actions.lock().unwrap().is_empty());
+        assert_eq!(
+            backend
+                .inspections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn service_lifecycle_callbacks_require_confirmation_run_async_and_surface_results() {
+        let (service, release_service) = gated_service(1);
+        let (ui, ops, _timer) = wired_ui(&service);
+        ui.set_is_simulated(false);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let backend = Arc::new(FakeServiceManagement {
+            entered: Some(entered_tx),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            failure: std::sync::Mutex::new(Some(
+                "Administrator authorization was cancelled".into(),
+            )),
+            ..Default::default()
+        });
+        ops.borrow_mut().service_backend = backend.clone();
+
+        ui.invoke_refresh_service_status();
+        wait_for_service_job(&ui, &ops);
+        assert!(ui.get_service_can_install());
+        ui.invoke_install_service();
+        assert!(
+            !ui.get_service_busy(),
+            "install requires the confirmation step"
+        );
+        assert!(backend.actions.lock().unwrap().is_empty());
+        ui.set_service_confirming_install(true);
+        ui.invoke_install_service();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(ui.get_service_busy());
+        assert!(!ui.get_service_confirming_install());
+        poll_service_jobs(&ui, &ops);
+        assert_eq!(ui.get_service_progress(), "Staging the service");
+        ui.invoke_stage_cpu_boost(77.0);
+        assert_eq!(ui.get_staged_cpu_boost(), 77.0, "the UI remains responsive");
+        ui.invoke_install_service();
+        ui.invoke_update_service();
+        ui.invoke_refresh_service_status();
+        assert_eq!(*backend.actions.lock().unwrap(), [ServiceAction::Install]);
+
+        release_tx.send(()).unwrap();
+        wait_for_service_job(&ui, &ops);
+        assert!(ui.get_service_result_is_error());
+        assert!(ui.get_service_result().contains("cancelled"));
+        assert!(ui.get_service_can_install());
+        assert!(!ui.get_service_busy());
+
+        *backend.failure.lock().unwrap() = None;
+        ui.set_service_confirming_install(true);
+        ui.invoke_install_service();
+        wait_for_service_job(&ui, &ops);
+        assert!(!ui.get_service_result_is_error());
+        assert_eq!(ui.get_service_result(), "Background service installed.");
+        assert!(ui.get_service_can_update());
+        assert!(ui.get_service_can_remove());
+        ui.invoke_update_service();
+        wait_for_service_job(&ui, &ops);
+        assert_eq!(ui.get_service_result(), "Background service updated.");
+        ui.invoke_uninstall_service();
+        assert!(
+            !ui.get_service_busy(),
+            "removal requires the confirmation step"
+        );
+        ui.set_service_confirming_remove(true);
+        ui.invoke_uninstall_service();
+        wait_for_service_job(&ui, &ops);
+        assert!(ui.get_service_result().contains("Saved settings were kept"));
+        assert_eq!(
+            *backend.actions.lock().unwrap(),
+            [
+                ServiceAction::Install,
+                ServiceAction::Install,
+                ServiceAction::Update,
+                ServiceAction::Uninstall { purge: false },
+            ]
+        );
+        assert_eq!(service.borrow().current_snapshot().command_seq, 0);
+        release_service.send(()).unwrap();
+    }
+
+    #[test]
+    fn restore_preference_waits_for_confirmation_and_surfaces_settings_save_failures() {
+        let (service, release) = gated_service(1);
+        let (ui, ops, _timer) = wired_ui(&service);
+        ui.set_is_simulated(false);
+        ui.set_service_restore_available(true);
+        ui.invoke_set_restore_at_startup(true);
+        assert!(!ui.get_service_restore_at_startup());
+        assert_eq!(ui.get_lifecycle_badge(), "REQUESTED");
+        assert!(
+            ops.borrow()
+                .pending
+                .as_ref()
+                .unwrap()
+                .label
+                .contains("startup")
+        );
+
+        let mut confirmed = healthy_snapshot();
+        confirmed.is_simulated = false;
+        confirmed.service_control = Some(awcc_service::wire::ControlStatus {
+            state: ControlState::Idle,
+            saved_curve: FanCurveConfig::default(),
+            intent_active: false,
+            restore_at_startup: true,
+            last_evaluation_age_secs: None,
+            last_outcome: None,
+            failure_reason: None,
+            tick_interval_ms: 1000,
+            uptime_secs: 1,
+            cpu_sensor_fresh: true,
+            settings_problem: None,
+            settings_save_pending: false,
+            settings_save_error: Some("Disk full".into()),
+        });
+        sync_snapshot_to_ui(&ui, &confirmed, false);
+        assert!(ui.get_service_restore_at_startup());
+        assert!(ui.get_service_restore_available());
+        assert!(ui.get_service_curve_summary().contains("Disk full"));
+        confirmed.service_error = Some("Connection lost".into());
+        sync_snapshot_to_ui(&ui, &confirmed, false);
+        assert!(!ui.get_service_restore_available());
+        assert!(ui.get_service_curve_summary().contains("Last known state"));
+        release.send(()).unwrap();
     }
 
     #[test]

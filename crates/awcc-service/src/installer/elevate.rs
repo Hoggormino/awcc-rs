@@ -119,7 +119,7 @@ fn shell_quote(text: &str) -> String {
 
 fn terminal_hint(program: &Path, appimage: bool, action: ServiceAction) -> String {
     let flag = if appimage {
-        "--service-apply"
+        "--appimage-extract-and-run --service-apply"
     } else {
         "service-apply"
     };

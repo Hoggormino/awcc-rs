@@ -67,7 +67,7 @@ fn purge_and_plain_executable_variants() {
 fn terminal_alternative_quotes_awkward_paths() {
     assert_eq!(
         target().terminal_command(ServiceAction::Install),
-        "sudo '/home/u/My Apps/AWCC 1.AppImage' --service-apply install"
+        "sudo '/home/u/My Apps/AWCC 1.AppImage' --appimage-extract-and-run --service-apply install"
     );
     let exe = LaunchTarget::Executable {
         path: "/usr/bin/awcc-cli".into(),

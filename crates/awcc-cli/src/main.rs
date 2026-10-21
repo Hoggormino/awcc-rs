@@ -29,6 +29,7 @@ use awcc_diagnostics::{
 };
 use awcc_service::{
     CommandOutcome, ServiceCommand, ThermalOrchestrator, daemon::parse_fancurve_ipc_command,
+    installer::ServiceAction,
 };
 
 /// Default output archive path for `awcc-cli diagnostics export`.
@@ -47,6 +48,24 @@ pub enum CliCommand {
         output: PathBuf,
         json: bool,
     },
+    ServiceStatus {
+        json: bool,
+    },
+    ServiceManage {
+        action: ServiceAction,
+        json: bool,
+    },
+    ServiceApply {
+        action: ServiceAction,
+    },
+    ServiceAuthorize {
+        user: String,
+        authorized: bool,
+    },
+    ServiceAuthorizedUsers {
+        json: bool,
+    },
+    ServiceRestoreAtStartup(bool),
     DaemonMode,
     GuiMode,
     QueryMode,
@@ -153,6 +172,7 @@ pub fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation> {
     let mut cli_verbose = false;
     let mut cli_trace_raw_usb = false;
     let mut positional = Vec::new();
+    let mut launcher = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -183,22 +203,14 @@ pub fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation> {
                 cli_log_level = Some(val.clone());
             }
             "-d" | "--daemon" => {
-                return Ok(CliInvocation {
-                    command: CliCommand::DaemonMode,
-                    sim_mode,
-                    cli_log_level,
-                    cli_verbose,
-                    cli_trace_raw_usb,
-                });
+                if launcher.replace(CliCommand::DaemonMode).is_some() {
+                    bail!("choose only one of --daemon or --gui");
+                }
             }
             "-g" | "--gui" => {
-                return Ok(CliInvocation {
-                    command: CliCommand::GuiMode,
-                    sim_mode,
-                    cli_log_level,
-                    cli_verbose,
-                    cli_trace_raw_usb,
-                });
+                if launcher.replace(CliCommand::GuiMode).is_some() {
+                    bail!("choose only one of --daemon or --gui");
+                }
             }
             "--volatile" => persist_boot = false,
             "--persist" => persist_boot = true,
@@ -218,6 +230,19 @@ pub fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
+    if let Some(command) = launcher {
+        if !positional.is_empty() {
+            bail!("--daemon and --gui cannot be combined with a command or extra arguments");
+        }
+        return Ok(CliInvocation {
+            command,
+            sim_mode,
+            cli_log_level,
+            cli_verbose,
+            cli_trace_raw_usb,
+        });
+    }
+
     let Some(cmd) = positional.first().map(String::as_str) else {
         return Ok(CliInvocation {
             command: CliCommand::Help,
@@ -231,6 +256,8 @@ pub fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation> {
     let command = match cmd {
         "device-info" => Ok(CliCommand::DeviceInfo),
         "diagnostics" | "diag" => parse_diagnostics_subcommand(&positional[1..]),
+        "service" => parse_service_subcommand(&positional[1..], false),
+        "service-apply" => parse_service_subcommand(&positional[1..], true),
         "qm" | "query-mode" => Ok(CliCommand::QueryMode),
         "q" | "quiet" => Ok(CliCommand::SetMode(ThermalMode::Quiet)),
         "bs" | "battery-saver" => Ok(CliCommand::SetMode(ThermalMode::BatterySaver)),
@@ -430,6 +457,62 @@ pub fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation> {
     })
 }
 
+fn parse_service_subcommand(rest: &[String], elevated: bool) -> Result<CliCommand> {
+    let Some(sub) = rest.first().map(String::as_str) else {
+        bail!(
+            "usage: awcc-cli service status|install|update|uninstall|authorize|revoke|authorized-users|restore-at-startup"
+        );
+    };
+    if !elevated && matches!(sub, "authorize" | "revoke" | "restore-at-startup") {
+        if rest.len() != 2 {
+            bail!(
+                "usage: awcc-cli service {sub} <{}>",
+                if sub == "restore-at-startup" {
+                    "on|off"
+                } else {
+                    "user-or-uid"
+                }
+            );
+        }
+        return if sub == "restore-at-startup" {
+            match rest[1].as_str() {
+                "on" => Ok(CliCommand::ServiceRestoreAtStartup(true)),
+                "off" => Ok(CliCommand::ServiceRestoreAtStartup(false)),
+                _ => bail!("restore-at-startup expects on or off"),
+            }
+        } else {
+            Ok(CliCommand::ServiceAuthorize {
+                user: rest[1].clone(),
+                authorized: sub == "authorize",
+            })
+        };
+    }
+    let mut json = false;
+    let mut purge = false;
+    for arg in &rest[1..] {
+        match arg.as_str() {
+            "--json" if !elevated && !json => json = true,
+            "--purge" if sub == "uninstall" && !purge => purge = true,
+            _ => bail!("unknown or duplicate service {sub} option `{arg}`"),
+        }
+    }
+    let action = match sub {
+        "status" if !elevated => return Ok(CliCommand::ServiceStatus { json }),
+        "authorized-users" if !elevated => {
+            return Ok(CliCommand::ServiceAuthorizedUsers { json });
+        }
+        "install" => ServiceAction::Install,
+        "update" => ServiceAction::Update,
+        "uninstall" => ServiceAction::Uninstall { purge },
+        _ => bail!("unknown service subcommand `{sub}`"),
+    };
+    Ok(if elevated {
+        CliCommand::ServiceApply { action }
+    } else {
+        CliCommand::ServiceManage { action, json }
+    })
+}
+
 fn parse_diagnostics_subcommand(rest: &[String]) -> Result<CliCommand> {
     let mut sub = "summary";
     let mut idx = 0;
@@ -513,6 +596,17 @@ pub fn format_help() -> String {
         "  diagnostics summary      Print passive redacted diagnostic summary (`--json` for report.json)",
         "  diagnostics export [--output awcc-support.zip]",
         "                           Export bounded passive support archive (.zip) without probing hardware",
+        "  service status [--json]  Show installation ownership and daemon availability without prompting",
+        "  service authorized-users [--json]  List users authorized to control the daemon",
+        "",
+        "Background Service:",
+        "  service install          Install/start the bundled service (requests administrator authorization)",
+        "  service update           Update an installer-managed service; native packages use their package manager",
+        "  service uninstall [--purge]  Remove an installer-managed service; --purge also deletes its settings",
+        "  service authorize <user-or-uid>  Allow a desktop user to control hardware (run with sudo)",
+        "  service revoke <user-or-uid>     Revoke a user's access (run with sudo)",
+        "  service restore-at-startup <on|off>  Opt into or out of restoring saved curve intent",
+        "  -d, --daemon             Run the privileged daemon (normally launched by systemd)",
         "",
         "Thermal & Fan Commands:",
         "  qm                       Query active thermal mode and telemetry",
@@ -947,6 +1041,14 @@ pub fn execute_active_cli_command(
         CliCommand::DaemonMode => {
             bail!("daemon mode is dispatched before command execution")
         }
+        CliCommand::ServiceStatus { .. }
+        | CliCommand::ServiceManage { .. }
+        | CliCommand::ServiceApply { .. }
+        | CliCommand::ServiceAuthorize { .. }
+        | CliCommand::ServiceAuthorizedUsers { .. }
+        | CliCommand::ServiceRestoreAtStartup(_) => {
+            bail!("service management is dispatched before command execution")
+        }
         CliCommand::GuiMode => {
             bail!("GUI mode (-g) is not part of awcc-cli; run `awcc-gui` instead")
         }
@@ -971,6 +1073,66 @@ fn run_privileged_daemon() -> Result<CliOutput> {
     let report = awcc_service::daemon::run_system_daemon(daemon_build_summary())
         .context("the privileged daemon could not run")?;
     Ok(CliOutput::line(format!("daemon stopped: {report}")))
+}
+
+fn service_status(json: bool) -> Result<CliOutput> {
+    use awcc_service::installer::{InstallPaths, SystemRunner};
+    use awcc_service::ipc::{DaemonClient, ServiceProbe};
+    let installation =
+        awcc_service::installer::inspect(&InstallPaths::system(), &SystemRunner::default());
+    let daemon = DaemonClient::system("awcc-cli", env!("CARGO_PKG_VERSION")).probe();
+    if json {
+        return Ok(CliOutput::line(serde_json::to_string_pretty(
+            &serde_json::json!({ "installation": installation, "daemon": daemon }),
+        )?));
+    }
+    let availability = match &daemon {
+        ServiceProbe::Running {
+            version, commit, ..
+        } => format!("available ({version}, {commit})"),
+        ServiceProbe::NotRunning { reason } => format!("not running: {reason}"),
+        ServiceProbe::AccessDenied { message } => format!("access denied: {message}"),
+        ServiceProbe::Incompatible { message } => format!("incompatible: {message}"),
+    };
+    Ok(CliOutput {
+        stdout: format!(
+            "Managed by: {}\nUnit state: {:?}\nEnabled: {}\nInstalled build: {}\nDaemon: {availability}",
+            installation.managed_by,
+            installation.unit_state,
+            installation
+                .enabled
+                .map_or("unknown", |enabled| if enabled { "yes" } else { "no" }),
+            installation.installed_build_id.as_deref().unwrap_or("none"),
+        ),
+        notes: installation.problems,
+    })
+}
+
+fn manage_service(action: ServiceAction, json: bool, err: &mut dyn Write) -> Result<CliOutput> {
+    let executable = std::env::current_exe().context("cannot resolve awcc-cli")?;
+    let report = awcc_service::management::apply_system(action, &executable, &mut |progress| {
+        let _ = writeln!(err, "{}", progress.message);
+        let _ = err.flush();
+    })?;
+    Ok(CliOutput {
+        stdout: if json {
+            serde_json::to_string_pretty(&report)?
+        } else {
+            format!("Service {}: {:?}", report.action, report.outcome)
+        },
+        notes: report.notes,
+    })
+}
+
+fn service_authorized_users(json: bool) -> Result<CliOutput> {
+    let users = awcc_service::ipc::authorized_users::list(
+        &awcc_service::installer::InstallPaths::system().authorized_users_path(),
+    )?;
+    Ok(CliOutput::line(if json {
+        serde_json::to_string_pretty(&users)?
+    } else {
+        users.into_iter().collect::<Vec<_>>().join("\n")
+    }))
 }
 
 /// Hardware/profile construction, injectable so tests can prove which paths touch a backend.
@@ -1061,6 +1223,84 @@ pub fn run_with_log_dir(
         _ => {}
     }
 
+    // Service management and status never construct a device profile or hardware backend.
+    // In particular the elevated helper must emit only the JSONL protocol on stdout.
+    let management = matches!(
+        inv.command,
+        CliCommand::ServiceStatus { .. }
+            | CliCommand::ServiceManage { .. }
+            | CliCommand::ServiceApply { .. }
+            | CliCommand::ServiceAuthorize { .. }
+            | CliCommand::ServiceAuthorizedUsers { .. }
+            | CliCommand::ServiceRestoreAtStartup(_)
+    );
+    if management && inv.sim_mode {
+        return emit(
+            out,
+            err,
+            Err(anyhow::anyhow!(
+                "service management cannot be combined with --sim"
+            )),
+        );
+    }
+    match &inv.command {
+        CliCommand::ServiceStatus { json } => return emit(out, err, service_status(*json)),
+        CliCommand::ServiceManage { action, json } => {
+            let result = manage_service(*action, *json, err);
+            return emit(out, err, result);
+        }
+        CliCommand::ServiceApply { action } => {
+            return match std::env::current_exe() {
+                Ok(executable) => {
+                    awcc_service::management::run_system_apply_command(*action, &executable, out)
+                }
+                Err(error) => {
+                    let event = awcc_service::installer::ApplyEvent::Failed {
+                        kind: "io".to_owned(),
+                        message: error.to_string(),
+                    };
+                    let _ = serde_json::to_writer(&mut *out, &event);
+                    let _ = writeln!(out);
+                    1
+                }
+            };
+        }
+        CliCommand::ServiceAuthorize { user, authorized } => {
+            let result = awcc_service::management::set_authorized_user_system(user, *authorized)
+                .map(|changed| {
+                    CliOutput::line(format!(
+                        "{} {user}: {}",
+                        if *authorized { "Authorize" } else { "Revoke" },
+                        if changed { "updated" } else { "unchanged" }
+                    ))
+                })
+                .map_err(Into::into);
+            return emit(out, err, result);
+        }
+        CliCommand::ServiceAuthorizedUsers { json } => {
+            return emit(out, err, service_authorized_users(*json));
+        }
+        CliCommand::ServiceRestoreAtStartup(enabled) => {
+            let result =
+                awcc_service::ipc::DaemonClient::system("awcc-cli", env!("CARGO_PKG_VERSION"))
+                    .execute(awcc_service::ipc::Op::SetRestoreAtStartup { enabled: *enabled })
+                    .map_err(anyhow::Error::from)
+                    .and_then(|report| report.lifecycle.into_result().map_err(Into::into))
+                    .map(|success| {
+                        let notes = success
+                            .caveat()
+                            .map(|note| vec![note.to_owned()])
+                            .unwrap_or_default();
+                        CliOutput {
+                            stdout: success.summary,
+                            notes,
+                        }
+                    });
+            return emit(out, err, result);
+        }
+        _ => {}
+    }
+
     let resolved_level = match resolve_log_level(
         inv.cli_log_level.as_deref(),
         inv.cli_verbose,
@@ -1094,6 +1334,12 @@ pub fn run_with_log_dir(
 
     let result = match inv.command.clone() {
         CliCommand::Help | CliCommand::Version => unreachable!("handled above"),
+        CliCommand::ServiceStatus { .. }
+        | CliCommand::ServiceManage { .. }
+        | CliCommand::ServiceApply { .. }
+        | CliCommand::ServiceAuthorize { .. }
+        | CliCommand::ServiceAuthorizedUsers { .. }
+        | CliCommand::ServiceRestoreAtStartup(_) => unreachable!("handled above"),
         // Passive commands must never instantiate USB or ACPI hardware!
         CliCommand::DeviceInfo => backends
             .device_profile(inv.sim_mode)
@@ -1104,8 +1350,7 @@ pub fn run_with_log_dir(
         CliCommand::DaemonMode if inv.sim_mode => Err(anyhow::anyhow!(
             "daemon mode serves real hardware only and cannot be combined with --sim"
         )),
-        // The daemon owns only the privileged kernel writes; it must not open USB or ACPI
-        // transports itself, so it is dispatched before any orchestrator is built.
+        // Daemon startup constructs its own thermal owner; don't construct a client backend.
         CliCommand::DaemonMode => run_privileged_daemon(),
         other => backends.orchestrator(inv.sim_mode).and_then(|mut orch| {
             orch.set_trace_raw_usb(trace_raw_usb);
@@ -1127,6 +1372,12 @@ fn main() -> std::process::ExitCode {
                 | CliCommand::Version
                 | CliCommand::DiagnosticsSummary { .. }
                 | CliCommand::DiagnosticsExport { .. }
+                | CliCommand::ServiceStatus { .. }
+                | CliCommand::ServiceManage { .. }
+                | CliCommand::ServiceApply { .. }
+                | CliCommand::ServiceAuthorize { .. }
+                | CliCommand::ServiceAuthorizedUsers { .. }
+                | CliCommand::ServiceRestoreAtStartup(_)
         )
         && let Ok(resolved_level) = resolve_log_level(
             inv.cli_log_level.as_deref(),
@@ -1212,6 +1463,83 @@ mod tests {
             stdout: String::from_utf8(out).unwrap(),
             stderr: String::from_utf8(err).unwrap(),
         }
+    }
+
+    #[test]
+    fn service_lifecycle_routes_parse_and_reject_unsafe_option_combinations() {
+        assert_eq!(
+            parse_cli_args(&to_args(&["service", "install"])).unwrap(),
+            CliCommand::ServiceManage {
+                action: ServiceAction::Install,
+                json: false
+            },
+        );
+        assert_eq!(
+            parse_cli_args(&to_args(&["service-apply", "uninstall", "--purge"])).unwrap(),
+            CliCommand::ServiceApply {
+                action: ServiceAction::Uninstall { purge: true }
+            },
+        );
+        assert_eq!(
+            parse_cli_args(&to_args(&["service", "status", "--json"])).unwrap(),
+            CliCommand::ServiceStatus { json: true },
+        );
+        assert_eq!(
+            parse_cli_args(&to_args(&["service", "restore-at-startup", "off"])).unwrap(),
+            CliCommand::ServiceRestoreAtStartup(false),
+        );
+        for args in [
+            &["service", "install", "--purge"][..],
+            &["service", "update", "--purge"],
+            &["service", "uninstall", "--purge", "--purge"],
+            &["service-apply", "status"],
+            &["service-apply", "install", "--json"],
+            &["service", "authorize"],
+            &["service", "revoke", "alice", "bob"],
+            &["service", "restore-at-startup", "maybe"],
+        ] {
+            assert!(parse_cli_args(&to_args(args)).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn service_commands_cannot_escape_simulation_to_manage_the_host() {
+        let mut backends = SpyBackends::default();
+        for args in [
+            &["--sim", "service", "install"][..],
+            &["--sim", "service", "update"],
+            &["--sim", "service", "uninstall", "--purge"],
+            &["--sim", "service-apply", "install"],
+            &["--sim", "service", "authorize", "1000"],
+            &["--sim", "service", "restore-at-startup", "on"],
+        ] {
+            let run = run_cli(args, &mut backends);
+            assert_eq!(run.code, 1, "{args:?}");
+            assert!(run.stdout.is_empty());
+            assert!(run.stderr.contains("cannot be combined with --sim"));
+        }
+        assert_eq!(backends.profile_calls, 0);
+        assert_eq!(backends.orchestrator_calls, 0);
+    }
+
+    #[test]
+    fn daemon_flags_validate_the_entire_invocation_before_startup() {
+        let mut backends = SpyBackends::default();
+        for args in [&["--sim", "--daemon"][..], &["--daemon", "--sim"]] {
+            let run = run_cli(args, &mut backends);
+            assert_eq!(run.code, 1);
+            assert!(run.stdout.is_empty());
+            assert!(run.stderr.contains("cannot be combined with --sim"));
+        }
+        for args in [
+            &["--daemon", "--gui"][..],
+            &["--daemon", "unexpected"],
+            &["service", "install", "--daemon"],
+        ] {
+            assert!(parse_cli_args(&to_args(args)).is_err());
+        }
+        assert_eq!(backends.profile_calls, 0);
+        assert_eq!(backends.orchestrator_calls, 0);
     }
 
     #[test]
@@ -1335,7 +1663,10 @@ mod tests {
             out_fc.notes
         );
         assert!(
-            out_fc.notes.iter().all(|n| !n.contains("background service")),
+            out_fc
+                .notes
+                .iter()
+                .all(|n| !n.contains("background service")),
             "a local curve must not claim service ownership: {:?}",
             out_fc.notes
         );

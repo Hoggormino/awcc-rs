@@ -97,6 +97,70 @@ fn update_and_uninstall_also_refuse_native_packages() {
 }
 
 #[test]
+fn installer_record_does_not_override_a_new_native_package() {
+    for keep_installer_unit in [true, false] {
+        let sb = Sandbox::new("native-after-appimage");
+        sb.install(&sb.payload("0.1.2-aaaa", true))
+            .expect("initial install");
+        if !keep_installer_unit {
+            fs::remove_file(sb.paths.unit_path()).expect("remove old installer unit");
+        }
+        vendor_unit(&sb);
+        sb.host
+            .with(|s| s.native_owner = Some((HostTool::Rpm, "awcc-rs".to_owned())));
+        let before = sb.tree();
+        let owner_before = fs::read(sb.paths.record_path()).expect("owner record");
+        let payload = sb.payload("0.1.3-bbbb", true);
+        for action in [
+            ServiceAction::Install,
+            ServiceAction::Update,
+            ServiceAction::Uninstall { purge: true },
+        ] {
+            sb.host.clear_calls();
+            let error = sb
+                .run(action, Some(&payload), &ProbeOk, Sandbox::options())
+                .expect_err("native package must retain ownership");
+            assert!(
+                matches!(error, InstallError::NativePackage { .. }),
+                "{error}"
+            );
+            assert!(sb.host.verbs().is_empty(), "{:?}", sb.host.verbs());
+            assert_eq!(sb.tree(), before);
+            assert_eq!(
+                fs::read(sb.paths.record_path()).expect("record"),
+                owner_before
+            );
+            sb.host.with(|s| {
+                assert!(s.active, "do not stop the native service");
+                assert_eq!(s.enabled, Some(true));
+            });
+        }
+    }
+}
+
+#[test]
+fn stale_installer_record_does_not_authorize_changes_to_a_manual_unit() {
+    let sb = Sandbox::new("manual-after-appimage");
+    sb.install(&sb.payload("0.1.2-aaaa", true))
+        .expect("initial install");
+    fs::remove_file(sb.paths.unit_path()).expect("remove old installer unit");
+    vendor_unit(&sb);
+    sb.host.clear_calls();
+    let before = sb.tree();
+    let error = sb
+        .run(
+            ServiceAction::Uninstall { purge: true },
+            None,
+            &ProbeOk,
+            Sandbox::options(),
+        )
+        .expect_err("manual service must be left untouched");
+    assert!(matches!(error, InstallError::UnknownUnit { .. }), "{error}");
+    assert!(sb.host.verbs().is_empty());
+    assert_eq!(sb.tree(), before);
+}
+
+#[test]
 fn unowned_vendor_path_unit_is_unknown_and_refused() {
     let sb = Sandbox::new("unknown-vendor");
     vendor_unit(&sb);

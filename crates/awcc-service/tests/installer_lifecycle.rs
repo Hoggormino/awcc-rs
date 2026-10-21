@@ -107,6 +107,32 @@ fn unit_without_private_libs_has_no_library_path() {
 }
 
 #[test]
+fn updating_or_reinstalling_does_not_reauthorize_an_existing_installation() {
+    for action in [ServiceAction::Update, ServiceAction::Install] {
+        let sb = Sandbox::new(&format!("no-reauthorize-{}", action.name()));
+        let mut options = Sandbox::options();
+        options.authorized_users_seed = Some("1000".to_owned());
+        sb.run(
+            ServiceAction::Install,
+            Some(&sb.payload("0.1.2-aaaa", true)),
+            &ProbeOk,
+            options.clone(),
+        )
+        .expect("initial installation");
+        fs::remove_file(sb.paths.authorized_users_path()).expect("administrator revoked users");
+        options.authorized_users_seed = Some("1001".to_owned());
+        sb.run(
+            action,
+            Some(&sb.payload("0.1.3-bbbb", true)),
+            &ProbeOk,
+            options,
+        )
+        .expect("upgrade without changing authorization");
+        assert!(!sb.paths.authorized_users_path().exists());
+    }
+}
+
+#[test]
 fn unit_text_matches_golden_snapshot() {
     let golden = include_str!("golden/awccd-appimage.service");
     assert_eq!(render_unit(SERVICE_ROOT, true), golden);
@@ -196,6 +222,43 @@ fn update_requires_an_existing_installation() {
         )
         .expect_err("not installed");
     assert!(matches!(error, InstallError::NotInstalled), "{error}");
+}
+
+#[test]
+fn failed_systemd_query_prevents_update_and_uninstall() {
+    let sb = Sandbox::new("show-failed");
+    sb.install(&sb.payload("0.1.2-aaaa", true))
+        .expect("initial install");
+    sb.host.with(|s| {
+        s.failing_verbs.insert("show".to_owned());
+    });
+    let before = sb.tree();
+    let owner_before = fs::read(sb.paths.record_path()).expect("owner record");
+    let payload = sb.payload("0.1.3-bbbb", true);
+    for action in [
+        ServiceAction::Update,
+        ServiceAction::Uninstall { purge: true },
+    ] {
+        sb.host.clear_calls();
+        let error = sb
+            .run(action, Some(&payload), &ProbeOk, Sandbox::options())
+            .expect_err("cannot mutate a service with unknown state");
+        assert!(
+            matches!(error, InstallError::CommandFailed { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Failed to show"));
+        assert!(sb.host.verbs().is_empty(), "{:?}", sb.host.verbs());
+        assert_eq!(sb.tree(), before);
+        assert_eq!(
+            fs::read(sb.paths.record_path()).expect("record"),
+            owner_before
+        );
+        sb.host.with(|s| assert!(s.active));
+    }
+    let status = inspect(&sb.paths, &sb.host);
+    assert_eq!(status.unit_state, UnitState::Unknown);
+    assert!(status.problems.iter().any(|p| p.contains("Failed to show")));
 }
 
 #[test]
@@ -373,6 +436,60 @@ fn recovery_alone_restores_the_previous_release() {
     assert_eq!(
         fs::read_link(sb.path("/opt/awcc-rs/service/current")).expect("link"),
         std::path::Path::new("releases/0.1.2-aaaa")
+    );
+}
+
+#[test]
+fn interrupted_recovery_waits_until_systemd_can_be_queried() {
+    let sb = Sandbox::new("recovery-show-failed");
+    sb.install(&sb.payload("0.1.2-aaaa", true))
+        .expect("initial install");
+    sb.host.with(|s| {
+        s.failing_verbs.insert("daemon-reload".to_owned());
+    });
+    let payload = sb.payload("0.1.3-bbbb", true);
+    sb.run(
+        ServiceAction::Update,
+        Some(&payload),
+        &ProbeOk,
+        Sandbox::options(),
+    )
+    .expect_err("leave an interrupted transaction");
+    let before = sb.tree();
+    let journal_before = fs::read(sb.paths.journal_path()).expect("pending journal");
+    sb.host.with(|s| {
+        s.failing_verbs.clear();
+        s.failing_verbs.insert("show".to_owned());
+    });
+    sb.host.clear_calls();
+    let error = sb
+        .run(
+            ServiceAction::Update,
+            Some(&payload),
+            &ProbeOk,
+            Sandbox::options(),
+        )
+        .expect_err("defer recovery until service state is known");
+    assert!(
+        matches!(error, InstallError::CommandFailed { .. }),
+        "{error}"
+    );
+    assert!(sb.host.verbs().is_empty(), "{:?}", sb.host.verbs());
+    assert_eq!(sb.tree(), before);
+    assert_eq!(
+        fs::read(sb.paths.journal_path()).expect("journal"),
+        journal_before
+    );
+    sb.host.with(|s| s.failing_verbs.clear());
+    assert!(
+        sb.run(
+            ServiceAction::Update,
+            Some(&payload),
+            &ProbeOk,
+            Sandbox::options(),
+        )
+        .expect("recover when systemd returns")
+        .recovered_interrupted
     );
 }
 
@@ -617,16 +734,17 @@ fn missing_systemd_is_a_typed_error() {
 fn symlinked_install_ancestor_is_refused() {
     let sb = Sandbox::new("symlink-ancestor");
     let elsewhere = sb.tmp.path().join("elsewhere");
-    fs::create_dir_all(&elsewhere).expect("mkdir");
+    let protected = elsewhere.join("awcc-rs/service/releases/.staging-unrelated/keep");
+    fs::create_dir_all(protected.parent().expect("parent")).expect("mkdir");
+    fs::write(&protected, "unrelated data").expect("outside file");
     std::os::unix::fs::symlink(&elsewhere, sb.path("/opt")).expect("symlink");
     let error = sb
         .install(&sb.payload("0.1.2-aaaa", true))
         .expect_err("unsafe");
     assert!(matches!(error, InstallError::UnsafePath { .. }), "{error}");
     assert_eq!(
-        fs::read_dir(&elsewhere).expect("dir").count(),
-        0,
-        "nothing written through it"
+        fs::read_to_string(&protected).expect("no cleanup through symlink"),
+        "unrelated data"
     );
     assert!(!sb.path("/etc/systemd/system/awccd.service").exists());
 }

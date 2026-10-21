@@ -483,7 +483,7 @@ pub struct Daemon {
     control: ControlHandle,
     server: IpcServer,
     sink: Arc<AsyncSettingsSink>,
-    _lock: DaemonLock,
+    _lock: Arc<DaemonLock>,
 }
 
 impl Daemon {
@@ -497,7 +497,10 @@ impl Daemon {
         options: DaemonOptions,
         make_orchestrator: impl FnOnce(&DaemonOptions) -> Result<ThermalOrchestrator, String>,
     ) -> Result<Self, DaemonError> {
-        let lock = DaemonLock::acquire(&options.lock_path, options.strict_owner)?;
+        let lock = Arc::new(DaemonLock::acquire(
+            &options.lock_path,
+            options.strict_owner,
+        )?);
         let orchestrator = make_orchestrator(&options).map_err(DaemonError::Device)?;
         let (device_name, acpi_prefix) = orchestrator.device_identity();
         let store = SettingsStore::new(&options.state_dir);
@@ -505,7 +508,7 @@ impl Daemon {
         let block_overwrite = matches!(load, SettingsLoad::Incompatible { .. })
             .then(|| "saved settings use a newer schema and are never overwritten".to_string());
         let sink = Arc::new(
-            AsyncSettingsSink::spawn(store, block_overwrite)
+            AsyncSettingsSink::spawn_owned(store, block_overwrite, Arc::clone(&lock))
                 .map_err(|e| DaemonError::Io(format!("cannot start settings writer: {e}")))?,
         );
         let core = ControlCore::new(
@@ -514,9 +517,9 @@ impl Daemon {
             Arc::clone(&sink) as Arc<dyn SettingsSink>,
             options.tick_interval,
         );
-        let control = ControlHandle::spawn(core)
+        let control = ControlHandle::spawn_owned(core, Arc::clone(&lock))
             .map_err(|e| DaemonError::Io(format!("cannot start control thread: {e}")))?;
-        let server = IpcServer::bind(
+        let server = match IpcServer::bind(
             ServerConfig {
                 socket_path: options.socket_path.clone(),
                 authorizer: Arc::clone(&options.authorizer),
@@ -526,7 +529,15 @@ impl Daemon {
             },
             control.clone(),
             &lock,
-        )?;
+        ) {
+            Ok(server) => server,
+            Err(error) => {
+                // Startup may already have restored a saved curve. Stop that worker even when
+                // the socket cannot be bound; its lock guard survives a shutdown timeout.
+                let _ = control.stop(Duration::from_secs(8));
+                return Err(error.into());
+            }
+        };
         tracing::info!(
             target: "awcc_service::daemon",
             category = "app",
@@ -566,6 +577,14 @@ impl Daemon {
     #[must_use]
     pub fn control(&self) -> &ControlHandle {
         &self.control
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // Also cover callers that construct a daemon without entering run(). The worker owns a
+        // lock reference until its graceful shutdown completes, so this need not block Drop.
+        let _ = self.control.stop(Duration::ZERO);
     }
 }
 

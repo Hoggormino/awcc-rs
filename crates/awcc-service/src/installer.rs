@@ -480,6 +480,23 @@ pub(crate) fn ensure_dir_chain(
     logical: &str,
     mode: u32,
 ) -> Result<PathBuf, InstallError> {
+    directory_chain(paths, logical, Some(mode))
+}
+
+/// Validate existing destination ancestors without creating absent directories. Recovery and
+/// cleanup must call this before following a previously used installation path.
+pub(crate) fn check_existing_dir_chain(
+    paths: &InstallPaths,
+    logical: &str,
+) -> Result<(), InstallError> {
+    directory_chain(paths, logical, None).map(|_| ())
+}
+
+fn directory_chain(
+    paths: &InstallPaths,
+    logical: &str,
+    create_mode: Option<u32>,
+) -> Result<PathBuf, InstallError> {
     let mut current = paths.root.clone();
     for component in logical.split('/').filter(|c| !c.is_empty()) {
         current.push(component);
@@ -500,6 +517,9 @@ pub(crate) fn ensure_dir_chain(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(mode) = create_mode else {
+                    return Ok(current);
+                };
                 DirBuilder::new()
                     .mode(mode)
                     .create(&current)
@@ -633,15 +653,22 @@ impl Systemd<'_> {
         HostCommand::new(HostTool::Systemctl, args).with_timeout(self.timeout)
     }
 
-    pub(crate) fn show(&self) -> Result<UnitProps, HostError> {
-        let output = self.runner.run(
-            &self.command(&[
-                "show",
-                UNIT_NAME,
-                "--property=LoadState,ActiveState,SubState,UnitFileState,FragmentPath",
-            ]),
-            None,
-        )?;
+    pub(crate) fn show(&self) -> Result<UnitProps, InstallError> {
+        let command = self.command(&[
+            "show",
+            UNIT_NAME,
+            "--property=LoadState,ActiveState,SubState,UnitFileState,FragmentPath",
+        ]);
+        let output = self.runner.run(&command, None)?;
+        if !output.success() {
+            return Err(InstallError::CommandFailed {
+                command: command.display(),
+                status: output
+                    .code
+                    .map_or_else(|| "killed by signal".to_owned(), |c| format!("exit {c}")),
+                stderr: output.stderr.trim().to_owned(),
+            });
+        }
         let mut props = UnitProps::default();
         for line in output.stdout.lines() {
             let Some((key, value)) = line.split_once('=') else {
@@ -656,6 +683,13 @@ impl Systemd<'_> {
                 _ => continue,
             };
             value.trim().clone_into(slot);
+        }
+        if props.load_state.is_empty() || props.active_state.is_empty() {
+            return Err(InstallError::CommandFailed {
+                command: command.display(),
+                status: "incomplete response".to_owned(),
+                stderr: "systemd did not return LoadState and ActiveState".to_owned(),
+            });
         }
         Ok(props)
     }
@@ -822,6 +856,9 @@ pub(crate) fn detect(
         }
     }
 
+    // A surviving installer record does not authorize us to stop, replace or disable a
+    // subsequently installed package/manual service with the same unit name.
+    let ours = ours && foreign.is_none();
     let ownership = if let Some(foreign) = foreign {
         foreign
     } else if ours {

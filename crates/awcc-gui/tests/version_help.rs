@@ -6,11 +6,15 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static RUN_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn run(args: &[&str]) -> Output {
     let cwd = std::env::temp_dir().join(format!(
-        "awcc_gui_hostile_{}_{}",
+        "awcc_gui_hostile_{}_{}_{}",
         std::process::id(),
+        RUN_COUNTER.fetch_add(1, Ordering::Relaxed),
         args.join("_")
             .replace(|c: char| !c.is_ascii_alphanumeric(), "")
     ));

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 // AWCC Linux — Slint Material 3 (@material 1.1.0) Desktop UI
 
-import { Palette, ListView } from "std-widgets.slint";
+import { Palette, ListView, ScrollView } from "std-widgets.slint";
 import {
     MaterialWindow,
     NavigationRail,
@@ -32,6 +32,17 @@ export struct AuditRow {
     outcome: string,
     detail: string,
     succeeded: bool,
+}
+
+component SettingsScrollView inherits ScrollView {
+    content-width: self.visible-width;
+    horizontal-scrollbar-policy: always-off;
+
+    VerticalLayout {
+        alignment: start;
+        spacing: 10px;
+        @children
+    }
 }
 
 export component MainWindow inherits MaterialWindow {
@@ -1795,10 +1806,8 @@ export component MainWindow inherits MaterialWindow {
             }
 
             // Screen 3: Application Settings & System Hardware Details
-            if root.active-nav-index == 3 : VerticalLayout {
+            if root.active-nav-index == 3 : SettingsScrollView {
                 vertical-stretch: 1;
-                alignment: start;
-                spacing: 10px;
 
                 ElevatedCard {
                     VerticalLayout {
@@ -1954,7 +1963,7 @@ export component MainWindow inherits MaterialWindow {
                             }
                             OutlineButton {
                                 text: "Check status";
-                                enabled: !root.service-busy;
+                                enabled: !root.service-busy && !root.is-simulated;
                                 clicked => { root.refresh-service-status(); }
                             }
                         }
