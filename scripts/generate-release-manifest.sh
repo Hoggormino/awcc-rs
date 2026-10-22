@@ -42,6 +42,7 @@ EXPECTED_DISTRIBUTABLES=(
     "${AWCC_ARCH_PKG_NAME}"
     "PKGBUILD"
     ".SRCINFO"
+    "${AWCC_ARCH_INSTALL_NAME}"
 )
 
 for asset in "${EXPECTED_DISTRIBUTABLES[@]}"; do
@@ -61,7 +62,7 @@ while IFS= read -r -d '' found_path; do
     base="$(basename "${found_path}")"
     case "${base}" in
         "${AWCC_TARBALL_NAME}" | "${AWCC_APPIMAGE_NAME}" | "${AWCC_DEB_NAME}" | "${AWCC_RPM_NAME}" | \
-        "${AWCC_ARCH_PKG_NAME}" | "PKGBUILD" | ".SRCINFO" | "build-manifest.json" | "SHA256SUMS")
+        "${AWCC_ARCH_PKG_NAME}" | "PKGBUILD" | ".SRCINFO" | "${AWCC_ARCH_INSTALL_NAME}" | "build-manifest.json" | "SHA256SUMS")
             ;;
         *)
             echo "ERROR: Unexpected file '${base}' present in release asset directory ${DIST_DIR}" >&2
@@ -168,7 +169,7 @@ with open(manifest_path, "w", encoding="utf-8") as f:
 PY
 touch -h -d "@${SOURCE_DATE_EPOCH}" "${MANIFEST_PATH}"
 
-# Compute SHA256SUMS over all 7 distributables + build-manifest.json
+# Compute SHA256SUMS over all distributables + build-manifest.json
 SHA256SUMS_PATH="${DIST_DIR}/SHA256SUMS"
 (
     cd "${DIST_DIR}"

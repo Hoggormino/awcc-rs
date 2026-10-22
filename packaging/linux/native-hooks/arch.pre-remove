@@ -1,0 +1,4 @@
+# pacman ignores .INSTALL pre_remove failures. The ALPM PreTransaction hook uses
+# AbortOnFail so an unsuccessful stop/lock actually prevents package removal.
+awcc_native_remove arch || exit 1
+exit 0

@@ -1,0 +1,4 @@
+# Give the active local desktop session access to supported Alienware ELC controllers.
+# This file precedes systemd's seat-late rules that apply the uaccess ACL.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="187c", ATTR{idProduct}=="0550", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="187c", ATTR{idProduct}=="0551", TAG+="uaccess"

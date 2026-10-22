@@ -460,7 +460,7 @@ pub fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation> {
 fn parse_service_subcommand(rest: &[String], elevated: bool) -> Result<CliCommand> {
     let Some(sub) = rest.first().map(String::as_str) else {
         bail!(
-            "usage: awcc-cli service status|install|update|uninstall|authorize|revoke|authorized-users|restore-at-startup"
+            "usage: awcc-cli service status|install|setup|update|uninstall|authorize|revoke|authorized-users|restore-at-startup"
         );
     };
     if !elevated && matches!(sub, "authorize" | "revoke" | "restore-at-startup") {
@@ -502,6 +502,7 @@ fn parse_service_subcommand(rest: &[String], elevated: bool) -> Result<CliComman
             return Ok(CliCommand::ServiceAuthorizedUsers { json });
         }
         "install" => ServiceAction::Install,
+        "setup" => ServiceAction::Setup,
         "update" => ServiceAction::Update,
         "uninstall" => ServiceAction::Uninstall { purge },
         _ => bail!("unknown service subcommand `{sub}`"),
@@ -601,6 +602,7 @@ pub fn format_help() -> String {
         "",
         "Background Service:",
         "  service install          Install/start the bundled service (requests administrator authorization)",
+        "  service setup            Authorize this account and enable/start an installed service",
         "  service update           Update an installer-managed service; native packages use their package manager",
         "  service uninstall [--purge]  Remove an installer-managed service; --purge also deletes its settings",
         "  service authorize <user-or-uid>  Allow a desktop user to control hardware (run with sudo)",
@@ -1485,12 +1487,27 @@ mod tests {
             CliCommand::ServiceStatus { json: true },
         );
         assert_eq!(
+            parse_cli_args(&to_args(&["service", "setup", "--json"])).unwrap(),
+            CliCommand::ServiceManage {
+                action: ServiceAction::Setup,
+                json: true
+            },
+        );
+        assert_eq!(
+            parse_cli_args(&to_args(&["service-apply", "setup"])).unwrap(),
+            CliCommand::ServiceApply {
+                action: ServiceAction::Setup
+            },
+        );
+        assert_eq!(
             parse_cli_args(&to_args(&["service", "restore-at-startup", "off"])).unwrap(),
             CliCommand::ServiceRestoreAtStartup(false),
         );
         for args in [
             &["service", "install", "--purge"][..],
             &["service", "update", "--purge"],
+            &["service", "setup", "--purge"],
+            &["service", "setup", "1000"],
             &["service", "uninstall", "--purge", "--purge"],
             &["service-apply", "status"],
             &["service-apply", "install", "--json"],
@@ -1508,6 +1525,8 @@ mod tests {
         for args in [
             &["--sim", "service", "install"][..],
             &["--sim", "service", "update"],
+            &["--sim", "service", "setup"],
+            &["--sim", "service-apply", "setup"],
             &["--sim", "service", "uninstall", "--purge"],
             &["--sim", "service-apply", "install"],
             &["--sim", "service", "authorize", "1000"],

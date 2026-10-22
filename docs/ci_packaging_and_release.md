@@ -10,9 +10,9 @@ The primary workflow [`ci-release.yml`](../.github/workflows/ci-release.yml) run
 
 | Trigger | Scope & Purpose | Publishes GitHub Release? |
 | :--- | :--- | :--- |
-| `pull_request` (`main`) | Runs all quality gates, Ubuntu 24.04 baseline build, all 5 package format builds, and clean Ubuntu 24.04 / Fedora 41 / Arch Linux container installation & smoke tests. Read-only (`contents: read`). | No |
-| `push` (`main`) | Runs the full pipeline and retains the complete downloadable bundle (`awcc-rs-dist-main-<sha>`) for 30 days. | No |
-| `workflow_dispatch` | Manual non-publishing validation run exercising the complete build, packaging, container install, and release dry-run pipeline, retaining downloadable artifacts (`awcc-rs-dist-<ref>-<sha>`). | No |
+| `pull_request` (`main`) | Runs all quality gates, Ubuntu 24.04 baseline build, all 5 package format builds, and clean Ubuntu 24.04 / Fedora 41 / Arch Linux container installation & smoke tests. Retains the standalone AppImage and complete verified bundle. Read-only (`contents: read`). | No |
+| `push` (`main`) | Runs the full pipeline and retains the complete downloadable bundle (`awcc-rs-dist-<run_number>-<sha>`) for 30 days. | No |
+| `workflow_dispatch` | Manual non-publishing validation run exercising the complete build, packaging, container install, and release dry-run pipeline, retaining the same downloadable artifacts. | No |
 | `push` (`tags: v*`) | Validates strict `^v[0-9]+\.[0-9]+\.[0-9]+$` format and `Cargo.toml` version match, runs all quality and packaging/container checks against the exact tag commit, and automatically publishes the GitHub Release via draft-then-promote. | **Yes** (`publish-release` job) |
 
 ### Required Quality Gates
@@ -37,14 +37,21 @@ Every run executes the following gates before any package is accepted:
      - `1120×720` (`--scenario normal`)
      - `880×620` (`--scenario compact`)
      - `1120×720` (`--scenario rollback`, verifying error/rollback visual state)
+10. **Native service lifecycle**: `scripts/test-native-package-lifecycle.py` exercises maintainer hooks with controlled systemd/kernel commands. Clean Ubuntu, Fedora and Arch containers install through an ordinary account's real `sudo apt-get`, `sudo dnf` or `sudo pacman` invocation and verify automatic authorization, boot enablement, service/module/udev files, and removal that preserves user policy/settings. Debian additionally tests purge after the CLI has been removed. These containers do not boot systemd; service start/stop command behavior is covered by the controlled lifecycle tests.
 
 **Build identity gates.** `scripts/stage-release-payload.sh` runs both staged executables with `--version` and fails when the embedded version, target, commit, toolchain, or dirty state disagree with the release metadata (a stale cached build); `scripts/generate-release-manifest.sh` re-checks the binaries inside the final tarball, requires `awcc-cli` and `awcc-gui` to agree, records the binary-reported toolchain/`git_dirty`/`git_commit_source` in `build-manifest.json`, and refuses a dirty build for a `vX.Y.Z` tag. Each package ships `share/awcc/package-format` (written by that format's packager, not by the shared payload) so `--version` can report the installation format without compiling it into the common binaries.
 
 ### Development Artifact Locations
 
-On successful `main`, `workflow_dispatch`, and tag runs, the `assemble-and-verify-bundle` job uploads:
-- **`awcc-rs-dist-<ref_name>-<commit_sha>`** (retained 30 days): Contains all 5 package formats, `PKGBUILD`, `.SRCINFO`, `build-manifest.json`, and `SHA256SUMS`.
-- **`smoke-screenshots-{ubuntu,deb,rpm,arch}-<commit_sha>`** (retained 14 days): Contains the rendered PNG screenshots from each clean-environment smoke test.
+Open the [Actions page](https://github.com/Hoggormino/awcc-rs/actions/workflows/ci-release.yml), select the run for the commit you want to test, and use its download links in **Summary** or its **Artifacts** list. GitHub requires sign-in to download Actions artifacts. Development builds are available for pull requests as well as `main`, manual, and tag runs.
+
+- **`awcc-rs-<version>-x86_64.AppImage`** (retained 14 days): A standalone AppImage download, uploaded as a single file without a ZIP wrapper once the Ubuntu build and smoke tests pass. Download it, run `chmod +x awcc-rs-<version>-x86_64.AppImage`, and launch it. The job summary includes a direct link and SHA-256 digest.
+- **`awcc-rs-dist-<run_number>-<commit_sha>`** (retained 30 days): A ZIP containing all 5 package formats, `PKGBUILD`, `.SRCINFO`, `awcc-rs.install`, `build-manifest.json`, and `SHA256SUMS`. It is uploaded after every package's checks pass, with a link in the assembly job summary. The numeric run number keeps artifact names valid for PR refs such as `1/merge`.
+- **`packages-ubuntu-<commit_sha>`** (retained 14 days): The tarball, AppImage and DEB used by downstream checks. On older runs without a standalone AppImage artifact, download and extract this ZIP to find the `.AppImage` file.
+- **`packages-{fedora,arch}-<commit_sha>`** (retained 14 days): The RPM or Arch package and Arch recipe files. Keep `awcc-rs.install` beside `PKGBUILD` when building the Arch package yourself.
+- **`smoke-screenshots-{ubuntu,deb,rpm,arch}-<commit_sha>`** (retained 14 days): Rendered PNG screenshots from each clean-environment smoke test.
+
+These downloadable CI artifacts do not publish a GitHub Release; only a successful version-tag run publishes release assets.
 
 ---
 
@@ -64,7 +71,7 @@ On successful `main`, `workflow_dispatch`, and tag runs, the `assemble-and-verif
 | `AppImage` | Ubuntu 24.04 LTS (`x86_64`), tested via `--appimage-extract` (no FUSE required) | Ubuntu 24.04+ or any `x86_64` distro with `glibc >= 2.39` and host `libfontconfig.so.1` |
 | `.deb` | Built on Ubuntu 24.04 LTS; installed & smoke-tested in a clean `ubuntu:24.04` container via `apt-get install` | Ubuntu 24.04 LTS (`noble`, `amd64`) |
 | `.rpm` | Built, installed (`dnf install`), and smoke-tested in a clean `fedora:41` (`x86_64`) container | Fedora Linux 41+ (`x86_64`) |
-| `.pkg.tar.zst` + `PKGBUILD` + `.SRCINFO` | Built with `makepkg`, installed (`pacman -U`), and smoke-tested in a clean `archlinux:base-devel` (`x86_64`) container | Arch Linux / CachyOS (`x86_64`) |
+| `.pkg.tar.zst` + `PKGBUILD` + `.SRCINFO` + `awcc-rs.install` | Built with `makepkg`, installed (`pacman -U`), and smoke-tested in a clean `archlinux:base-devel` (`x86_64`) container | Arch Linux / CachyOS (`x86_64`) |
 
 ### Selected Packaging Tools & Rationale
 
@@ -113,7 +120,7 @@ From the repository root:
 # 5. Build and validate the Fedora .rpm package (requires rpmbuild)
 ./scripts/package-rpm.sh
 
-# 6. Build and smoke-test the Arch Linux PKGBUILD, .SRCINFO, and .pkg.tar.zst (requires makepkg)
+# 6. Build and smoke-test the Arch package, PKGBUILD, .SRCINFO and awcc-rs.install (requires makepkg)
 ./scripts/package-arch.sh
 
 # 7. Generate build-manifest.json and SHA256SUMS (once all 5 formats are present in dist/)
@@ -182,7 +189,7 @@ sha256sum --ignore-missing -c SHA256SUMS
    ```bash
    # Install pre-built package directly:
    sudo pacman -U ./awcc-rs-<version>-1-x86_64.pkg.tar.zst
-   # Or build from the release PKGBUILD:
+   # Or download PKGBUILD and awcc-rs.install together, then build:
    makepkg -si
    ```
 
@@ -192,17 +199,60 @@ sha256sum --ignore-missing -c SHA256SUMS
 
 ### Real Hardware Prerequisites
 
-Package installation scripts (`postinst`, `%post`, `.INSTALL`) intentionally perform **no** privileged hardware mutations, kernel module loading, or service activation. To control physical Alienware / Dell G-Series hardware at runtime:
+Fresh native-package installation configures the background service: it enables and
+starts it on a running systemd host and authorizes a validated installing
+sudo/polkit account when there is no previous authorization policy. The GUI stays
+unprivileged. If installation cannot identify the desktop account, or an older
+installation needs repair, **Set up service** in the GUI completes authorization
+and startup with administrator approval. Updates retain authorization and
+intentionally disabled/stopped services; they only restart an active service.
+Debian startup respects policy-rc.d, and offline/chroot installations defer live
+startup.
+
+Hardware access still requires:
 
 1. **ACPI WMAX Thermal, Fan Boost, TCC Offset & G-Mode Control**:
    - Requires the `acpi_call` kernel module (`acpi-call-dkms` on Ubuntu/Debian, `akmod-acpi_call` on Fedora, `acpi_call` / `acpi_call-dkms` on Arch/CachyOS) exposing `/proc/acpi/call`.
-   - Requires the packaged `awccd.service` (privileged daemon listening on `/run/awcc/awcc.sock`, enabled by the user with `systemctl enable --now awccd.service`) or root access to write `\_SB.<PREFIX>.WMAX` commands to `/proc/acpi/call`. The per-call `pkexec` fallback is opt-in via `AWCC_ALLOW_PKEXEC=1`.
+   - Native packages attempt to load an already installed module and ship an app-owned module-loading entry for subsequent boots. They do not download/compile drivers or guess kernel headers during installation.
+   - Normal thermal control uses `awccd.service` through `/run/awcc/awcc.sock`. The installed daemon performs privileged operations; the GUI and development `cargo run` stay unprivileged. The old per-operation `pkexec` path is not used by the normal daemon-backed client.
 2. **Alienware USB HID ELC Lighting (`0x187c:0x0550` / `0x187c:0x0551`)**:
-   - Requires read/write access to the USB device via `libusb-1.0` (either via a udev rule granting `MODE="0660", TAG+="uaccess"` for vendor `187c` products `0550`/`0551`, or root privileges).
+   - Native packages install `70-awcc-rs.rules`, scoped to these controllers, granting `uaccess` to the active local desktop session. Rules are reloaded and matching devices refreshed during package lifecycle operations. No broad kernel-file permissions are changed.
+   - Standalone AppImages/manual installs still depend on suitable host USB permissions. Remote/SSH users do not automatically receive active-local-session USB access.
+
+### Removal and Purge
+
+All native formats stop/disable the daemon before removing its executable, reload
+systemd afterwards, and let the package manager remove its unit, module-loading
+entry, udev rules and desktop files. Ordinary removal retains service settings and
+authorization. Package upgrades do not run final-removal cleanup.
+
+Debian's `apt purge awcc-rs` additionally deletes known AWCC-generated settings,
+authorization and service logs; its `postrm` works even after the application
+binary has gone. Cleanup validates paths and preserves unrelated files. RPM and
+Arch have no separate Debian-style purge operation and retain application data
+on ordinary removal. Home-directory user data and already loaded shared kernel
+modules are left to their owners.
+
+Native hooks and explicit service setup share `/var/lib/awcc/.install.lock`.
+Purge retains this empty coordination file to prevent concurrent operations from
+locking different inodes. Arch uses a package removal `PreTransaction` hook with
+`AbortOnFail`, so a failure to stop the daemon can block removal before its files
+disappear.
+
+The USB access rule is removed and udev is refreshed. An ACL already granted to
+a connected controller may remain until reconnection or reboot: systemd only
+runs its [uaccess rule](https://github.com/systemd/systemd/blob/v255/rules.d/73-seat-late.rules.in)
+for devices that still carry that tag. Cleanup does not guess which ACL entries
+belong to an administrator or another rule and delete them.
+
+AppImage-managed service removal has an explicit GUI option to delete saved
+settings, equivalent to `--uninstall-service --purge`. Merely deleting an AppImage
+does not remove the persistent service that it installed. Native services must
+be removed with their package manager, even when controlled from an AppImage GUI.
 
 ### What Simulation-Based CI Validates vs. Physical Hardware
 
-- **Validated in CI (`--sim`)**: Binary startup and dynamic linker compatibility on clean Ubuntu 24.04, Fedora 41, and Arch Linux; `database.json` parsing and 4-tier lookup precedence; DMI/ACPI prefix selection; thermal state machine transitions, G-Mode rollback, manual fan curves, and TCC offset validation; USB HID ELC packet construction; and deterministic software-rendered GUI layout (`1120×720` normal, `880×620` compact, and `rollback` error state).
+- **Validated in CI**: Binary startup and dynamic linker compatibility on clean Ubuntu 24.04, Fedora 41, and Arch Linux; actual package-hook execution and installing-user authorization; removal/purge and offline lifecycle regression tests; database lookup and DMI/ACPI prefix selection; simulated thermal state transitions, G-Mode rollback, fan curves and TCC offset validation; USB HID ELC packet construction; and software-rendered GUI layout. Service enable/start/upgrade behavior is exercised with controlled systemd commands; the package containers do not boot a real systemd daemon.
 - **Requires Physical Hardware**: Actual BIOS `\_SB.<PREFIX>.WMAX` firmware execution over `/proc/acpi/call`, physical fan tachometer response, live `hwmon` sensor readings, interactive Wayland/X11 GPU window presentation, and physical USB LED controller transfers.
 
 ---
@@ -234,7 +284,7 @@ Version bumps and release tags are maintainer-controlled:
    ```
 5. **Monitor Automatic Publication**:
    - Pushing `vX.Y.Z` triggers `CI, Packaging & Release`.
-   - Once `quality-and-build`, `test-deb-ubuntu-24-04`, `package-and-test-rpm-fedora`, `package-and-test-arch`, and `assemble-and-verify-bundle` all pass, the `publish-release` job creates a draft GitHub Release, uploads all 9 verified assets (`.tar.gz`, `.AppImage`, `.deb`, `.rpm`, `.pkg.tar.zst`, `PKGBUILD`, `.SRCINFO`, `build-manifest.json`, `SHA256SUMS`), verifies every uploaded asset's size and SHA-256 digest against the local manifest, and automatically publishes the release.
+   - Once `quality-and-build`, `test-deb-ubuntu-24-04`, `package-and-test-rpm-fedora`, `package-and-test-arch`, and `assemble-and-verify-bundle` all pass, the `publish-release` job creates a draft GitHub Release, uploads all 10 verified assets (`.tar.gz`, `.AppImage`, `.deb`, `.rpm`, `.pkg.tar.zst`, `PKGBUILD`, `.SRCINFO`, `awcc-rs.install`, `build-manifest.json`, `SHA256SUMS`), verifies every uploaded asset's size and SHA-256 digest against the local manifest, and automatically publishes the release.
 
 ---
 
@@ -243,9 +293,9 @@ Version bumps and release tags are maintainer-controlled:
 The `publish-release` job (`scripts/publish-release.sh`) is serialized per tag (`concurrency: release-publish-vX.Y.Z`, `cancel-in-progress: false`) and designed for safe retries:
 
 - **Failure Before or During Draft Upload**:
-  - The release remains an unpublished **draft**. Re-running the failed workflow job in GitHub Actions automatically locates the existing draft for `vX.Y.Z`, replaces any partial assets (`--clobber`), re-verifies all 9 assets against `SHA256SUMS` and `build-manifest.json`, and publishes the draft once complete.
+  - The release remains an unpublished **draft**. Re-running the failed workflow job in GitHub Actions automatically locates the existing draft for `vX.Y.Z`, replaces any partial assets (`--clobber`), re-verifies all 10 assets against `SHA256SUMS` and `build-manifest.json`, and publishes the draft once complete.
 - **Re-running After Publication Succeeds**:
-  - If `vX.Y.Z` is already published, `scripts/publish-release.sh` downloads the published `build-manifest.json` and `SHA256SUMS`, verifies that the published release's `git_commit` matches `HEAD` and that all 9 assets are present with matching byte sizes and SHA-256 digests, and exits `0` without modifying or overwriting the published release.
+  - If `vX.Y.Z` is already published, `scripts/publish-release.sh` downloads the published `build-manifest.json` and `SHA256SUMS`, verifies that the published release's `git_commit` matches `HEAD` and that all 10 assets are present with matching byte sizes and SHA-256 digests, and exits `0` without modifying or overwriting the published release.
 - **Conflicting Tag or Incomplete Published Release**:
   - If a published release already exists for `vX.Y.Z` with a different commit SHA or missing/corrupted assets, the script fails closed with an explicit error message and never silently overwrites published assets or moves tags.
 

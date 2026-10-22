@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Safe, idempotent draft-then-publish GitHub Release automation for awcc-rs.
 # - Validates strict vX.Y.Z tag format, Cargo.toml version match, and exact commit identity.
-# - Verifies complete 9-file release asset set and SHA256SUMS / PKGBUILD agreement before upload.
+# - Verifies the complete release asset set and SHA256SUMS / PKGBUILD agreement before upload.
 # - Handles safe retries: if the release is already published and matches the recorded commit and
 #   asset manifest, exits 0 cleanly; if it conflicts or is incomplete, fails with an actionable error.
 # - Otherwise creates or resumes a draft release for the exact commit, uploads and verifies all
@@ -59,6 +59,7 @@ ALL_ASSETS=(
     "${AWCC_ARCH_PKG_NAME}"
     "PKGBUILD"
     ".SRCINFO"
+    "${AWCC_ARCH_INSTALL_NAME}"
     "build-manifest.json"
     "SHA256SUMS"
 )
@@ -98,7 +99,7 @@ Unofficial Alienware Command Center for Linux (\`x86_64-unknown-linux-gnu\`), pr
 - **Source Commit**: \`${AWCC_GIT_SHA}\`
 - **Rust Toolchain**: \`${AWCC_RUSTC_VERSION}\`
 - **Common Binary & AppImage Baseline**: Ubuntu 24.04 LTS (\`x86_64\`, \`glibc >= 2.39\`)
-- **Validated Package Environments**: Ubuntu 24.04 LTS (\`.deb\`), Fedora Linux 41 (\`.rpm\`), Arch Linux (\`.pkg.tar.zst\`, \`PKGBUILD\`, \`.SRCINFO\`)
+- **Validated Package Environments**: Ubuntu 24.04 LTS (\`.deb\`), Fedora Linux 41 (\`.rpm\`), Arch Linux (\`.pkg.tar.zst\`, \`PKGBUILD\`, \`.SRCINFO\`, \`awcc-rs.install\`)
 
 ---
 
@@ -138,6 +139,9 @@ sudo dnf install ./${AWCC_RPM_NAME}
 \`\`\`bash
 sudo pacman -U ./${AWCC_ARCH_PKG_NAME}
 \`\`\`
+For a makepkg build, download \`PKGBUILD\`, \`.SRCINFO\`, and \`awcc-rs.install\` into the same directory before running \`makepkg -si\`.
+
+Native packages enable/start the service on first installation and authorize the identified sudo/polkit user. If the package manager cannot identify that user, open AWCC and choose **Set up service** once. Upgrades preserve authorization and disabled/stopped service choices. Removal stops/disables the service; Debian \`purge\` additionally removes AWCC system settings and authorization. Normal removal retains settings.
 
 #### 5. Binary Archive (\`${AWCC_TARBALL_NAME}\`)
 \`\`\`bash
@@ -150,13 +154,13 @@ cd ${AWCC_TARBALL_BASENAME}
 
 ### Hardware Prerequisites (Live Hardware Mode)
 
-- **ACPI WMAX Thermal / Fan / G-Mode Control**: Requires the \`acpi_call\` kernel module (\`/proc/acpi/call\`) and the privileged \`awccd\` service (\`sudo systemctl enable --now awccd.service\`, socket \`/run/awcc/awcc.sock\`).
-- **Alienware ELC RGB Lighting (\`0x187c:0x0550\` / \`0x0551\`)**: Requires USB device read/write access via \`libusb-1.0\`.
+- **ACPI WMAX Thermal / Fan / G-Mode Control**: Requires the \`acpi_call\` module for the running kernel (\`/proc/acpi/call\`). Native packages configure module loading and service startup; they do not install or compile a missing kernel driver.
+- **Alienware ELC RGB Lighting (\`0x187c:0x0550\` / \`0x0551\`)**: Native packages install udev rules granting access to the active local desktop session.
 - **Simulation Mode (\`--sim\`)**: Runs on any Linux \`x86_64\` system without Alienware hardware, root privileges, or a GPU.
 EOF
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
-    echo "==> [DRY RUN] Validated tag ${RELEASE_TAG}, commit ${AWCC_GIT_SHA}, all 9 assets, and generated release notes:"
+    echo "==> [DRY RUN] Validated tag ${RELEASE_TAG}, commit ${AWCC_GIT_SHA}, all ${#ALL_ASSETS[@]} assets, and generated release notes:"
     cat "${NOTES_FILE}"
     exit 0
 fi

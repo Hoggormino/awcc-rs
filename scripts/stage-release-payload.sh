@@ -83,6 +83,10 @@ mkdir -p \
     "${OUT_DIR}/bin" \
     "${OUT_DIR}/share/awcc" \
     "${OUT_DIR}/share/systemd" \
+    "${OUT_DIR}/share/modules-load.d" \
+    "${OUT_DIR}/share/udev/rules.d" \
+    "${OUT_DIR}/share/libalpm/hooks" \
+    "${OUT_DIR}/share/libalpm/scripts" \
     "${OUT_DIR}/share/applications" \
     "${OUT_DIR}/share/icons/hicolor/scalable/apps" \
     "${OUT_DIR}/share/icons/hicolor/256x256/apps" \
@@ -100,6 +104,11 @@ fi
 install -m 0644 "${AWCC_REPO_ROOT}/crates/awcc-core/data/database.json" "${OUT_DIR}/share/awcc/database.json"
 install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/awcc-gui.desktop" "${OUT_DIR}/share/applications/awcc-gui.desktop"
 install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/awccd.service" "${OUT_DIR}/share/systemd/awccd.service"
+install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/awcc-rs.modules-load.conf" "${OUT_DIR}/share/modules-load.d/awcc-rs.conf"
+install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/70-awcc-rs.rules" "${OUT_DIR}/share/udev/rules.d/70-awcc-rs.rules"
+install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/05-awcc-rs-remove.hook" "${OUT_DIR}/share/libalpm/hooks/05-awcc-rs-remove.hook"
+bash "${SCRIPT_DIR}/render-native-package-hook.sh" arch.pre-remove > "${OUT_DIR}/share/libalpm/scripts/awcc-rs-pre-remove"
+chmod 0755 "${OUT_DIR}/share/libalpm/scripts/awcc-rs-pre-remove"
 install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/awcc-gui.svg" "${OUT_DIR}/share/icons/hicolor/scalable/apps/awcc-gui.svg"
 install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/awcc-gui.png" "${OUT_DIR}/share/icons/hicolor/256x256/apps/awcc-gui.png"
 install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/io.github.hoggormino.awcc_rs.metainfo.xml" "${OUT_DIR}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"

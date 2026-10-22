@@ -69,6 +69,7 @@ sed \
     -e "s/@PKGREL@/${AWCC_PKGREL}/g" \
     -e "s/@TARBALL_SHA256@/${TARBALL_SHA256}/g" \
     "${AWCC_REPO_ROOT}/packaging/linux/PKGBUILD.in" > "${WORK_TMP}/PKGBUILD"
+bash "${SCRIPT_DIR}/render-native-package-hook.sh" arch.install > "${WORK_TMP}/${AWCC_ARCH_INSTALL_NAME}"
 
 # Verify PKGBUILD never uses SKIP and points at the final versioned GitHub release asset URL
 EXPECTED_SOURCE_URL="https://github.com/Hoggormino/awcc-rs/releases/download/v${AWCC_VERSION}/${AWCC_TARBALL_NAME}"
@@ -94,6 +95,7 @@ grep -q "pkgbase = awcc-rs" "${WORK_TMP}/.SRCINFO"
 grep -q "pkgver = ${AWCC_VERSION}" "${WORK_TMP}/.SRCINFO"
 grep -q "pkgrel = ${AWCC_PKGREL}" "${WORK_TMP}/.SRCINFO"
 grep -q "arch = x86_64" "${WORK_TMP}/.SRCINFO"
+grep -Fx "$(printf '\tinstall = %s' "${AWCC_ARCH_INSTALL_NAME}")" "${WORK_TMP}/.SRCINFO" >/dev/null
 grep -F "source = ${EXPECTED_SOURCE_URL}" "${WORK_TMP}/.SRCINFO" >/dev/null
 grep -F "sha256sums = ${TARBALL_SHA256}" "${WORK_TMP}/.SRCINFO" >/dev/null
 
@@ -105,8 +107,10 @@ fi
 
 cp -f "${WORK_TMP}/PKGBUILD" "${OUT_DIR}/PKGBUILD"
 cp -f "${WORK_TMP}/.SRCINFO" "${OUT_DIR}/.SRCINFO"
+cp -f "${WORK_TMP}/${AWCC_ARCH_INSTALL_NAME}" "${OUT_DIR}/${AWCC_ARCH_INSTALL_NAME}"
 cp -f "${BUILT_PKG}" "${OUT_DIR}/${AWCC_ARCH_PKG_NAME}"
-touch -h -d "@${SOURCE_DATE_EPOCH}" "${OUT_DIR}/PKGBUILD" "${OUT_DIR}/.SRCINFO" "${OUT_DIR}/${AWCC_ARCH_PKG_NAME}"
+touch -h -d "@${SOURCE_DATE_EPOCH}" "${OUT_DIR}/PKGBUILD" "${OUT_DIR}/.SRCINFO" \
+    "${OUT_DIR}/${AWCC_ARCH_INSTALL_NAME}" "${OUT_DIR}/${AWCC_ARCH_PKG_NAME}"
 
 # Inspect .pkg.tar.zst contents and verify installed layout
 EXTRACT_PKG="${WORK_TMP}/pkg-extract"
@@ -118,8 +122,9 @@ grep -q "pkgver = ${AWCC_VERSION}-${AWCC_PKGREL}" "${EXTRACT_PKG}/.PKGINFO"
 grep -q "arch = x86_64" "${EXTRACT_PKG}/.PKGINFO"
 grep -q "depend = libusb" "${EXTRACT_PKG}/.PKGINFO"
 grep -q "depend = fontconfig" "${EXTRACT_PKG}/.PKGINFO"
+cmp "${WORK_TMP}/${AWCC_ARCH_INSTALL_NAME}" "${EXTRACT_PKG}/.INSTALL"
 
-for req_exec in "usr/bin/awcc-cli" "usr/bin/awcc-gui"; do
+for req_exec in "usr/bin/awcc-cli" "usr/bin/awcc-gui" "usr/share/libalpm/scripts/awcc-rs-pre-remove"; do
     if [[ ! -x "${EXTRACT_PKG}/${req_exec}" ]]; then
         echo "ERROR: Arch package missing executable ${req_exec}" >&2
         exit 1
@@ -131,6 +136,9 @@ for req_file in \
     "usr/share/awcc/package-format" \
     "usr/share/applications/awcc-gui.desktop" \
     "usr/lib/systemd/system/awccd.service" \
+    "usr/lib/modules-load.d/awcc-rs.conf" \
+    "usr/lib/udev/rules.d/70-awcc-rs.rules" \
+    "usr/share/libalpm/hooks/05-awcc-rs-remove.hook" \
     "usr/share/icons/hicolor/scalable/apps/awcc-gui.svg" \
     "usr/share/icons/hicolor/256x256/apps/awcc-gui.png" \
     "usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" \
@@ -157,3 +165,4 @@ echo "==> Built and verified Arch Linux artifacts:"
 echo "    - ${OUT_DIR}/${AWCC_ARCH_PKG_NAME}"
 echo "    - ${OUT_DIR}/PKGBUILD"
 echo "    - ${OUT_DIR}/.SRCINFO"
+echo "    - ${OUT_DIR}/${AWCC_ARCH_INSTALL_NAME}"

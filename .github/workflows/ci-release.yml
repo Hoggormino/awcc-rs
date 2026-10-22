@@ -53,7 +53,7 @@ jobs:
           echo "b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6  ${LINT_DIR}/shellcheck.tar.gz" | sha256sum -c -
           tar -xzf "${LINT_DIR}/shellcheck.tar.gz" --strip-components=1 -C "${LINT_DIR}" shellcheck-v0.11.0/shellcheck
 
-          "${LINT_DIR}/shellcheck" -x packaging/linux/AppRun scripts/*.sh
+          "${LINT_DIR}/shellcheck" -x packaging/linux/AppRun packaging/linux/native-service.sh scripts/*.sh
           "${LINT_DIR}/actionlint" -shellcheck "${LINT_DIR}/shellcheck"
           ./scripts/setup-github-labels.sh --dry-run >/dev/null
           node scripts/test-issue-intake.mjs
@@ -61,6 +61,9 @@ jobs:
 
       - name: Run offline release publisher regression tests
         run: python3 scripts/test-publish-release.py
+
+      - name: Run native package lifecycle regression tests
+        run: python3 scripts/test-native-package-lifecycle.py
 
       - name: Install Ubuntu 24.04 native build and packaging dependencies
         run: |
@@ -146,6 +149,32 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Upload standalone AppImage download
+        id: upload-appimage
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/ubuntu/awcc-rs-*.AppImage
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Add AppImage download to workflow summary
+        env:
+          APPIMAGE_URL: ${{ steps.upload-appimage.outputs.artifact-url }}
+          APPIMAGE_SHA256: ${{ steps.upload-appimage.outputs.artifact-digest }}
+        run: |
+          {
+            echo "### Download the AppImage"
+            echo ""
+            echo "[Download the x86_64 AppImage](${APPIMAGE_URL}) (GitHub sign-in required; retained 14 days)."
+            echo ""
+            echo "This is the AppImage file itself. After downloading, make it executable with \`chmod +x awcc-rs-*-x86_64.AppImage\` and launch it."
+            echo ""
+            echo "SHA-256: \`${APPIMAGE_SHA256}\`"
+            echo ""
+            echo "The complete bundle with all package formats and checksums is uploaded after the remaining package checks pass."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Upload Ubuntu 24.04 smoke-test screenshots
         if: always()
         uses: actions/upload-artifact@v7
@@ -170,7 +199,7 @@ jobs:
           name: packages-ubuntu-${{ github.sha }}
           path: dist/ubuntu
 
-      - name: Install .deb and run unprivileged CLI + GUI screenshot smoke tests in clean ubuntu:24.04 container
+      - name: Test sudo .deb installation, user access, unprivileged smoke tests, removal and purge in clean ubuntu:24.04 container
         run: |
           mkdir -p dist/deb-smoke-screenshots
           VERSION="$(./scripts/release-meta.sh --print-env | sed -n 's/^AWCC_VERSION=//p')"
@@ -183,7 +212,11 @@ jobs:
             bash -euxo pipefail -c '
               export DEBIAN_FRONTEND=noninteractive
               apt-get update
-              apt-get install -y --no-install-recommends python3 ca-certificates /work/dist/ubuntu/awcc-rs_*_amd64.deb
+              apt-get install -y --no-install-recommends python3 ca-certificates sudo
+              useradd -m -s /bin/bash tester
+              printf "%s\n" "tester ALL=(root) NOPASSWD: /usr/bin/apt-get" > /etc/sudoers.d/awcc-ci
+              chmod 0440 /etc/sudoers.d/awcc-ci
+              su - tester -c "sudo -n /usr/bin/apt-get install -y --no-install-recommends /work/dist/ubuntu/awcc-rs_*_amd64.deb"
               dpkg -s awcc-rs
               test -x /usr/bin/awcc-cli
               test -x /usr/bin/awcc-gui
@@ -193,7 +226,12 @@ jobs:
               test -f /usr/share/doc/awcc-rs/copyright
               test -f /usr/share/licenses/awcc-rs/LICENSE
               test -f /usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md
-              useradd -m -s /bin/bash tester
+              test -f /usr/lib/systemd/system/awccd.service
+              test -f /usr/lib/modules-load.d/awcc-rs.conf
+              test -f /usr/lib/udev/rules.d/70-awcc-rs.rules
+              test -L /etc/systemd/system/multi-user.target.wants/awccd.service
+              test -f /var/lib/awcc/native-package-initialized
+              grep -Fxq "$(id -u tester)" /etc/awcc/authorized-users
               chown -R tester:tester /screenshots
               su - tester -c "/work/scripts/smoke-test-installed.sh \
                 --cli /usr/bin/awcc-cli \
@@ -206,6 +244,22 @@ jobs:
                 --expect-target x86_64-unknown-linux-gnu \
                 --expect-dirty false \
                 --screenshot-dir /screenshots"
+              printf "%s\n" "{}" > /var/lib/awcc/settings.json
+              printf "%s\n" "administrator-owned fixture" > /var/lib/awcc/administrator-note
+              su - tester -c "sudo -n /usr/bin/apt-get remove -y awcc-rs"
+              test ! -e /usr/bin/awcc-cli
+              test ! -e /usr/lib/systemd/system/awccd.service
+              test ! -e /usr/lib/modules-load.d/awcc-rs.conf
+              test ! -e /usr/lib/udev/rules.d/70-awcc-rs.rules
+              test ! -L /etc/systemd/system/multi-user.target.wants/awccd.service
+              grep -Fxq "$(id -u tester)" /etc/awcc/authorized-users
+              test -f /var/lib/awcc/settings.json
+              test -f /var/lib/awcc/native-package-initialized
+              su - tester -c "sudo -n /usr/bin/apt-get purge -y awcc-rs"
+              test ! -e /etc/awcc/authorized-users
+              test ! -e /var/lib/awcc/settings.json
+              test ! -e /var/lib/awcc/native-package-initialized
+              test -f /var/lib/awcc/administrator-note
             '
 
       - name: Upload clean Ubuntu 24.04 .deb smoke-test screenshots
@@ -232,7 +286,7 @@ jobs:
           name: staged-payload-${{ github.sha }}
           path: dist
 
-      - name: Build, install, and smoke-test .rpm in clean fedora:41 container
+      - name: Build .rpm and test sudo installation, user access, unprivileged smoke tests and removal in clean fedora:41 container
         run: |
           mkdir -p dist/staging/payload dist/fedora dist/fedora/smoke-screenshots
           tar -xzf dist/staged-payload.tar.gz -C dist/staging/payload
@@ -245,10 +299,13 @@ jobs:
             -v "${PWD}:/work:rw" \
             fedora:41 \
             bash -euxo pipefail -c '
-              dnf install -y --setopt=install_weak_deps=False rpm-build python3 findutils shadow-utils util-linux
+              dnf install -y --setopt=install_weak_deps=False rpm-build python3 findutils shadow-utils util-linux sudo
+              useradd -m -s /bin/bash tester
+              printf "%s\n" "tester ALL=(root) NOPASSWD: /usr/bin/dnf" > /etc/sudoers.d/awcc-ci
+              chmod 0440 /etc/sudoers.d/awcc-ci
               cd /work
               ./scripts/package-rpm.sh --staged-dir /work/dist/staging/payload --out-dir /work/dist/fedora
-              dnf install -y --setopt=install_weak_deps=False /work/dist/fedora/awcc-rs-*.x86_64.rpm
+              su - tester -c "sudo -n /usr/bin/dnf install -y --setopt=install_weak_deps=False /work/dist/fedora/awcc-rs-*.x86_64.rpm"
               rpm -qi awcc-rs
               rpm -ql awcc-rs
               test -x /usr/bin/awcc-cli
@@ -258,7 +315,12 @@ jobs:
               test -f /usr/share/applications/awcc-gui.desktop
               test -f /usr/share/licenses/awcc-rs/LICENSE
               test -f /usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md
-              useradd -m -s /bin/bash tester
+              test -f /usr/lib/systemd/system/awccd.service
+              test -f /usr/lib/modules-load.d/awcc-rs.conf
+              test -f /usr/lib/udev/rules.d/70-awcc-rs.rules
+              test -L /etc/systemd/system/multi-user.target.wants/awccd.service
+              test -f /var/lib/awcc/native-package-initialized
+              grep -Fxq "$(id -u tester)" /etc/awcc/authorized-users
               chown -R tester:tester /work/dist/fedora/smoke-screenshots
               su - tester -c "/work/scripts/smoke-test-installed.sh \
                 --cli /usr/bin/awcc-cli \
@@ -271,6 +333,16 @@ jobs:
                 --expect-target x86_64-unknown-linux-gnu \
                 --expect-dirty false \
                 --screenshot-dir /work/dist/fedora/smoke-screenshots"
+              printf "%s\n" "{}" > /var/lib/awcc/settings.json
+              su - tester -c "sudo -n /usr/bin/dnf remove -y awcc-rs"
+              test ! -e /usr/bin/awcc-cli
+              test ! -e /usr/lib/systemd/system/awccd.service
+              test ! -e /usr/lib/modules-load.d/awcc-rs.conf
+              test ! -e /usr/lib/udev/rules.d/70-awcc-rs.rules
+              test ! -L /etc/systemd/system/multi-user.target.wants/awccd.service
+              grep -Fxq "$(id -u tester)" /etc/awcc/authorized-users
+              test -f /var/lib/awcc/settings.json
+              test -f /var/lib/awcc/native-package-initialized
             '
           sudo chown -R "$(id -u):$(id -g)" dist/fedora
 
@@ -306,7 +378,7 @@ jobs:
           name: packages-ubuntu-${{ github.sha }}
           path: dist/ubuntu
 
-      - name: Build PKGBUILD/.SRCINFO/.pkg.tar.zst and test pacman installation in clean archlinux:base-devel container
+      - name: Build Arch package and test sudo pacman installation, user access, unprivileged smoke tests and removal
         run: |
           mkdir -p dist/arch dist/arch/smoke-screenshots
           TARBALL_FILE="$(find dist/ubuntu -maxdepth 1 -name 'awcc-rs-*-x86_64-unknown-linux-gnu.tar.gz' | head -n 1)"
@@ -320,16 +392,21 @@ jobs:
             -e AWCC_GIT_SHA="${GITHUB_SHA}" \
             -e AWCC_VERSION="${VERSION}" \
             -e SOURCE_DATE_EPOCH="${HOST_SDE}" \
+            -e AWCC_TARBALL="/work/${TARBALL_FILE}" \
             -v "${PWD}:/work:rw" \
             archlinux:base-devel \
-            bash -euxo pipefail -c "
-              pacman -Sy --noconfirm --needed python
+            bash -euxo pipefail -c '
+              pacman -Sy --noconfirm --needed python sudo
               useradd -m -s /bin/bash builder
+              printf "%s\n" "builder ALL=(root) NOPASSWD: /usr/bin/pacman" > /etc/sudoers.d/awcc-ci
+              chmod 0440 /etc/sudoers.d/awcc-ci
               chown -R builder:builder /work/dist/arch
-              su - builder -c 'AWCC_GIT_SHA=${GITHUB_SHA} SOURCE_DATE_EPOCH=${HOST_SDE} /work/scripts/package-arch.sh --out-dir /work/dist/arch --tarball /work/${TARBALL_FILE} --skip-smoke'
-              pacman -U --noconfirm /work/dist/arch/awcc-rs-*-x86_64.pkg.tar.zst
+              su - builder -c "AWCC_GIT_SHA=${AWCC_GIT_SHA} SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} /work/scripts/package-arch.sh --out-dir /work/dist/arch --tarball ${AWCC_TARBALL} --skip-smoke"
+              su - builder -c "sudo -n /usr/bin/pacman -U --noconfirm /work/dist/arch/awcc-rs-*-x86_64.pkg.tar.zst"
               pacman -Qi awcc-rs
               pacman -Ql awcc-rs
+              test -f /usr/share/libalpm/hooks/05-awcc-rs-remove.hook
+              test -x /usr/share/libalpm/scripts/awcc-rs-pre-remove
               test -x /usr/bin/awcc-cli
               test -x /usr/bin/awcc-gui
               test -f /etc/awcc/database.json
@@ -337,21 +414,39 @@ jobs:
               test -f /usr/share/applications/awcc-gui.desktop
               test -f /usr/share/licenses/awcc-rs/LICENSE
               test -f /usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md
-              su - builder -c '/work/scripts/smoke-test-installed.sh \
+              test -f /usr/lib/systemd/system/awccd.service
+              test -f /usr/lib/modules-load.d/awcc-rs.conf
+              test -f /usr/lib/udev/rules.d/70-awcc-rs.rules
+              test -L /etc/systemd/system/multi-user.target.wants/awccd.service
+              test -f /var/lib/awcc/native-package-initialized
+              grep -Fxq "$(id -u builder)" /etc/awcc/authorized-users
+              su - builder -c "/work/scripts/smoke-test-installed.sh \
                 --cli /usr/bin/awcc-cli \
                 --gui /usr/bin/awcc-gui \
                 --database /etc/awcc/database.json \
                 --label archlinux \
                 --expect-package-format arch \
-                --expect-version ${VERSION} \
-                --expect-commit ${GITHUB_SHA} \
+                --expect-version ${AWCC_VERSION} \
+                --expect-commit ${AWCC_GIT_SHA} \
                 --expect-target x86_64-unknown-linux-gnu \
                 --expect-dirty false \
-                --screenshot-dir /work/dist/arch/smoke-screenshots'
-            "
+                --screenshot-dir /work/dist/arch/smoke-screenshots"
+              printf "%s\n" "{}" > /var/lib/awcc/settings.json
+              su - builder -c "sudo -n /usr/bin/pacman -R --noconfirm awcc-rs"
+              test ! -e /usr/share/libalpm/hooks/05-awcc-rs-remove.hook
+              test ! -e /usr/share/libalpm/scripts/awcc-rs-pre-remove
+              test ! -e /usr/bin/awcc-cli
+              test ! -e /usr/lib/systemd/system/awccd.service
+              test ! -e /usr/lib/modules-load.d/awcc-rs.conf
+              test ! -e /usr/lib/udev/rules.d/70-awcc-rs.rules
+              test ! -L /etc/systemd/system/multi-user.target.wants/awccd.service
+              grep -Fxq "$(id -u builder)" /etc/awcc/authorized-users
+              test -f /var/lib/awcc/settings.json
+              test -f /var/lib/awcc/native-package-initialized
+            '
           sudo chown -R "$(id -u):$(id -g)" dist/arch
 
-      - name: Upload Arch Linux package, PKGBUILD, and .SRCINFO
+      - name: Upload Arch Linux package, PKGBUILD, .SRCINFO and install script
         uses: actions/upload-artifact@v7
         with:
           name: packages-arch-${{ github.sha }}
@@ -359,6 +454,7 @@ jobs:
             dist/arch/awcc-rs-*-x86_64.pkg.tar.zst
             dist/arch/PKGBUILD
             dist/arch/.SRCINFO
+            dist/arch/awcc-rs.install
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
@@ -415,10 +511,34 @@ jobs:
             ./scripts/publish-release.sh --dist-dir dist/bundle --tag "v${AWCC_VERSION}" --dry-run
           fi
 
+      - name: Upload complete verified bundle artifact
+        id: upload-bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: awcc-rs-dist-${{ github.run_number }}-${{ github.sha }}
+          path: |
+            dist/bundle/awcc-rs-*.tar.gz
+            dist/bundle/awcc-rs-*.AppImage
+            dist/bundle/awcc-rs_*.deb
+            dist/bundle/awcc-rs-*.rpm
+            dist/bundle/awcc-rs-*.pkg.tar.zst
+            dist/bundle/PKGBUILD
+            dist/bundle/.SRCINFO
+            dist/bundle/awcc-rs.install
+            dist/bundle/build-manifest.json
+            dist/bundle/SHA256SUMS
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Write workflow summary
+        env:
+          BUNDLE_URL: ${{ steps.upload-bundle.outputs.artifact-url }}
         run: |
           {
             echo "### AWCC Linux (\`awcc-rs\`) Build & Packaging Summary"
+            echo ""
+            echo "[Download all verified packages and checksums](${BUNDLE_URL}) (ZIP; GitHub sign-in required; retained 30 days)."
             echo ""
             echo "- **Commit**: \`${GITHUB_SHA}\`"
             echo "- **Ref**: \`${GITHUB_REF}\`"
@@ -429,25 +549,6 @@ jobs:
             cat dist/bundle/SHA256SUMS
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
-
-      - name: Upload complete verified bundle artifact
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v7
-        with:
-          name: awcc-rs-dist-${{ github.ref_name }}-${{ github.sha }}
-          path: |
-            dist/bundle/awcc-rs-*.tar.gz
-            dist/bundle/awcc-rs-*.AppImage
-            dist/bundle/awcc-rs_*.deb
-            dist/bundle/awcc-rs-*.rpm
-            dist/bundle/awcc-rs-*.pkg.tar.zst
-            dist/bundle/PKGBUILD
-            dist/bundle/.SRCINFO
-            dist/bundle/build-manifest.json
-            dist/bundle/SHA256SUMS
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 30
 
   publish-release:
     name: Publish GitHub Release
@@ -472,7 +573,7 @@ jobs:
       - name: Download verified release bundle for this commit
         uses: actions/download-artifact@v8
         with:
-          name: awcc-rs-dist-${{ github.ref_name }}-${{ github.sha }}
+          name: awcc-rs-dist-${{ github.run_number }}-${{ github.sha }}
           path: dist/release
 
       - name: Create/resume draft release, verify uploaded assets, and publish

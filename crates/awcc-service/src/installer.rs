@@ -4,10 +4,11 @@
 //!
 //! * [`inspect`] — passive status: who owns `awccd.service`, whether it runs, whether it is
 //!   enabled, which build the installer deployed. It never writes and never prompts.
-//! * [`apply`] — the **root side**: `install`, `update`, `uninstall [--purge]`, with staged and
-//!   hash-verified releases, an atomically switched `current` symlink, a health check, and full
-//!   rollback (including enablement and active state) on any failure. Interrupted runs are
-//!   recovered from a journal on the next run.
+//! * [`apply`] — the **root side**: `install` and `update` stage hash-verified releases,
+//!   atomically switch the `current` symlink, health-check and attempt journaled rollback on
+//!   failure. `setup` authorizes the invoking user and enables an existing owned service without
+//!   deploying files. `uninstall [--purge]` removes an installer-owned deployment. Setup and
+//!   uninstall report failures but may leave earlier steps applied.
 //! * [`elevate_and_apply`] — the **user side**: relaunches the running binary under `pkexec` and
 //!   replays the child's progress events.
 //!
@@ -73,7 +74,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub enum ServiceAction {
     Install,
     Update,
-    Uninstall { purge: bool },
+    /// Authorize the invoking user and enable/start an existing known service.
+    Setup,
+    Uninstall {
+        purge: bool,
+    },
 }
 
 impl ServiceAction {
@@ -82,6 +87,7 @@ impl ServiceAction {
         match self {
             Self::Install => "install",
             Self::Update => "update",
+            Self::Setup => "setup",
             Self::Uninstall { .. } => "uninstall",
         }
     }
@@ -338,6 +344,8 @@ pub struct ApplyReport {
 pub enum ApplyOutcome {
     Installed,
     Updated,
+    /// An existing service was authorized, enabled, started and health-checked.
+    Configured,
     /// Same build already installed and intact; nothing was touched.
     Unchanged,
     Uninstalled,
@@ -399,8 +407,12 @@ pub enum InstallError {
          refusing to overwrite it. Remove or move it manually, then retry"
     )]
     UnknownUnit { unit_path: String, reason: String },
-    #[error("the AppImage service is not installed; run `service install` first")]
+    #[error(
+        "awccd.service is not installed; install a native package or run `service install` first"
+    )]
     NotInstalled,
+    #[error("service setup did not finish: {reason}")]
+    SetupFailed { reason: String },
     #[error(transparent)]
     Payload(#[from] PayloadError),
     #[error("unsafe path {path}: {reason}")]
@@ -450,6 +462,7 @@ impl InstallError {
             Self::NativePackage { .. } => "native_package",
             Self::UnknownUnit { .. } => "unknown_unit",
             Self::NotInstalled => "not_installed",
+            Self::SetupFailed { .. } => "setup_failed",
             Self::Payload(_) => "payload",
             Self::UnsafePath { .. } => "unsafe_path",
             Self::LockHeld { .. } => "lock_held",

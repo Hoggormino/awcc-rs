@@ -52,6 +52,9 @@ TOPDIR="${WORK_TMP}/rpmbuild"
 mkdir -p "${TOPDIR}"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 
 SPEC_FILE="${TOPDIR}/SPECS/awcc-rs.spec"
+for hook in post preun postun; do
+    bash "${SCRIPT_DIR}/render-native-package-hook.sh" "rpm.${hook}" > "${TOPDIR}/SOURCES/rpm.${hook}"
+done
 sed \
     -e "s/@VERSION@/${AWCC_VERSION}/g" \
     -e "s/@RELEASE@/${AWCC_PKGREL}/g" \
@@ -62,6 +65,7 @@ SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" rpmbuild \
     --target "${AWCC_ARCH}" \
     --define "_topdir ${TOPDIR}" \
     --define "staged_root ${STAGED_DIR}" \
+    --define "native_hooks_root ${TOPDIR}/SOURCES" \
     --define "dist %{nil}" \
     --define "source_date_epoch_from_changelog 0" \
     --define "clamp_mtime_to_source_date_epoch 1" \
@@ -96,8 +100,14 @@ if command -v rpm >/dev/null 2>&1; then
     grep -qx "/usr/share/awcc/package-format" <<<"${RPM_FILES}"
     grep -qx "/usr/share/applications/awcc-gui.desktop" <<<"${RPM_FILES}"
     grep -qx "/usr/lib/systemd/system/awccd.service" <<<"${RPM_FILES}"
+    grep -qx "/usr/lib/modules-load.d/awcc-rs.conf" <<<"${RPM_FILES}"
+    grep -qx "/usr/lib/udev/rules.d/70-awcc-rs.rules" <<<"${RPM_FILES}"
     grep -qx "/usr/share/licenses/awcc-rs/LICENSE" <<<"${RPM_FILES}"
     grep -qx "/usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" <<<"${RPM_FILES}"
+    for query in POSTIN PREUN POSTUN; do
+        rpm -qp --queryformat "%{${query}}" "${RPM_PATH}" > "${WORK_TMP}/${query}"
+        grep -q 'awcc_native_' "${WORK_TMP}/${query}"
+    done
 fi
 
 echo "==> Built and verified Fedora RPM package: ${RPM_PATH}"

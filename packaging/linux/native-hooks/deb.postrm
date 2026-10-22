@@ -1,0 +1,8 @@
+case "${1:-}" in
+    remove) awcc_native_after_remove removed ;;
+    purge) awcc_native_after_remove removed; awcc_native_purge || exit 1 ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        awcc_native_after_remove upgrade
+        ;;
+esac
+exit 0

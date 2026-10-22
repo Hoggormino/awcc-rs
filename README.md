@@ -98,7 +98,38 @@ Every push to `main`, pull request, manual `workflow_dispatch` run, and `vX.Y.Z`
 2. **AppImage**: `awcc-rs-<version>-x86_64.AppImage` (launches `awcc-gui` by default; pass `--cli <args>` or symlink as `awcc-cli` for CLI mode)
 3. **Debian / Ubuntu 24.04+**: `awcc-rs_<version>_amd64.deb`
 4. **Fedora 41+**: `awcc-rs-<version>-1.x86_64.rpm`
-5. **Arch Linux / CachyOS**: `awcc-rs-<version>-1-x86_64.pkg.tar.zst` + `PKGBUILD` + `.SRCINFO`
+5. **Arch Linux / CachyOS**: `awcc-rs-<version>-1-x86_64.pkg.tar.zst` + `PKGBUILD` + `awcc-rs.install` + `.SRCINFO`
+
+### Install once, then launch as your user
+
+On a normal systemd desktop, a fresh DEB, RPM or Arch package installation enables
+and starts `awccd.service`. Installation through `sudo` or polkit also authorizes
+the identified installing account when no authorization policy already exists.
+Launch `awcc-gui` as your normal user afterwards. Native packages include boot-time
+loading for an installed `acpi_call` module and USB access rules for the supported
+Alienware lighting controllers.
+
+If a software center or root shell cannot identify your desktop account, or you
+are upgrading an older installation that was never configured, choose **Set up
+service** in the GUI. One administrator prompt authorizes your account and enables
+and starts the existing service. The CLI equivalent is `awcc-cli service setup`.
+Upgrades preserve authorization and deliberately disabled/stopped services.
+
+For an AppImage, open it normally and use **Set up service** to reach the installation
+confirmation. The installed service continues running after the GUI closes. You
+can also use the AppImage with an existing native-package service; the GUI's setup
+action configures it, while updates/removal remain with its package manager.
+
+Package removal stops/disables the service and removes package-owned integration
+files. Debian `apt purge awcc-rs` also removes AWCC's generated system settings and
+authorization; ordinary removal retains them. AppImage removal offers **Also delete
+saved service settings**, equivalent to `--uninstall-service --purge`. See the
+[installation guide](packaging/linux/INSTALL.txt) for cleanup details and kernel
+driver prerequisites.
+
+For development builds, the Actions run has a separately named **`.AppImage`**
+artifact and a complete **`awcc-rs-dist-…`** bundle. Use the download links in the
+run summary; on older builds the AppImage is inside **`packages-ubuntu-…`**.
 
 `awcc-cli --version` / `awcc-gui --version` report the version, source commit (or `unknown`), dirty state, target, toolchain, and installation format; see [`docs/operation_outcomes_and_build_identity.md`](docs/operation_outcomes_and_build_identity.md) for that metadata and for how command outcomes (`Accepted` vs. `Confirmed` vs. `Failed`) and unavailable/stale state are reported. See [`docs/structured_logging_and_support_export.md`](docs/structured_logging_and_support_export.md) for log-level controls (`--log-level`, `-v`, `AWCC_LOG`), bounded session logs under `$XDG_STATE_HOME/awcc-rs/logs`, and passive redacted support bundles (`awcc-cli diagnostics export`).
 

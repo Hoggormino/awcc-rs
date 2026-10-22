@@ -1115,11 +1115,13 @@ fn disable_service_management_ui(ui: &MainWindow, label: &str, detail: &str) {
     ui.set_service_state_is_problem(false);
     ui.set_service_managed_by("none".into());
     ui.set_service_can_install(false);
+    ui.set_service_can_setup(false);
     ui.set_service_can_update(false);
     ui.set_service_can_remove(false);
     ui.set_service_restore_available(false);
     ui.set_service_confirming_install(false);
     ui.set_service_confirming_remove(false);
+    ui.set_service_remove_purge(false);
     ui.set_service_version_line("".into());
     ui.set_service_curve_summary("".into());
 }
@@ -1202,7 +1204,7 @@ fn sync_service_inspection_to_ui(ui: &MainWindow, inspection: &ServiceInspection
         details.push(if enabled {
             "Enabled at boot.".into()
         } else {
-            "Disabled at boot. Enable with sudo systemctl enable --now awccd.".into()
+            "Disabled at boot.".into()
         });
     }
     let mut service_version = report.version.as_deref();
@@ -1223,7 +1225,7 @@ fn sync_service_inspection_to_ui(ui: &MainWindow, inspection: &ServiceInspection
             label = "Access denied";
             problem = true;
             details.push(format!(
-                "{message}. Authorize your account with sudo awcc-cli service authorize <user>."
+                "{message}. Select Set up service to authorize your account with administrator approval."
             ));
         }
         ServiceProbe::Incompatible { message } => {
@@ -1256,6 +1258,16 @@ fn sync_service_inspection_to_ui(ui: &MainWindow, inspection: &ServiceInspection
     );
     let installer_owned = matches!(report.ownership, Ownership::AppimageInstaller { .. });
     let manageable = report.unit_state != UnitState::Unknown && !report.masked;
+    let supported_owner = installer_owned
+        || matches!(&report.ownership, Ownership::NativePackage { package, .. } if package == "awcc-rs");
+    let ready = matches!(&inspection.daemon, ServiceProbe::Running { status, .. } if status.control_running);
+    ui.set_service_can_setup(
+        manageable
+            && supported_owner
+            && !report.interrupted_operation
+            && !matches!(inspection.daemon, ServiceProbe::Incompatible { .. })
+            && (!ready || report.enabled == Some(false)),
+    );
     ui.set_service_can_install(
         manageable
             && matches!(report.ownership, Ownership::None)
@@ -1277,7 +1289,11 @@ fn service_apply_message(report: &ApplyReport) -> String {
     let outcome = match report.outcome {
         ApplyOutcome::Installed => "Background service installed.",
         ApplyOutcome::Updated => "Background service updated.",
+        ApplyOutcome::Configured => "Background service configured.",
         ApplyOutcome::Unchanged => "This service build is already installed.",
+        ApplyOutcome::Uninstalled if report.purged => {
+            "Background service removed. Saved service settings were deleted."
+        }
         ApplyOutcome::Uninstalled => "Background service removed. Saved settings were kept.",
         ApplyOutcome::NothingToUninstall => "No application-managed service was installed.",
     };
@@ -1299,6 +1315,7 @@ fn start_service_job(ui: &MainWindow, ops: &SharedOps, action: Option<ServiceAct
                 ui.get_service_can_install() && ui.get_service_confirming_install()
             }
             ServiceAction::Update => ui.get_service_can_update(),
+            ServiceAction::Setup => ui.get_service_can_setup(),
             ServiceAction::Uninstall { .. } => {
                 ui.get_service_can_remove() && ui.get_service_confirming_remove()
             }
@@ -1717,9 +1734,19 @@ fn wire_ui_callbacks(
     {
         let ui_weak = ui.as_weak();
         let ops = Rc::clone(ops);
+        ui.on_setup_service(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                start_service_job(&w, &ops, Some(ServiceAction::Setup));
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let ops = Rc::clone(ops);
         ui.on_uninstall_service(move || {
             if let Some(w) = ui_weak.upgrade() {
-                start_service_job(&w, &ops, Some(ServiceAction::Uninstall { purge: false }));
+                let purge = w.get_service_remove_purge();
+                start_service_job(&w, &ops, Some(ServiceAction::Uninstall { purge }));
             }
         });
     }
@@ -3136,11 +3163,21 @@ mod tests {
             let outcome = match action {
                 ServiceAction::Install => ApplyOutcome::Installed,
                 ServiceAction::Update => ApplyOutcome::Updated,
+                ServiceAction::Setup => ApplyOutcome::Configured,
                 ServiceAction::Uninstall { .. } => ApplyOutcome::Uninstalled,
             };
+            let previous_owner = self
+                .inspection
+                .lock()
+                .unwrap()
+                .installation
+                .ownership
+                .clone();
             *self.inspection.lock().unwrap() = if matches!(action, ServiceAction::Uninstall { .. })
             {
                 service_inspection(Ownership::None, UnitState::Missing)
+            } else if action == ServiceAction::Setup {
+                service_inspection(previous_owner, UnitState::Running)
             } else {
                 service_inspection(
                     Ownership::AppimageInstaller {
@@ -3157,7 +3194,7 @@ mod tests {
                 enabled: Some(true),
                 active: Some(true),
                 recovered_interrupted: false,
-                purged: false,
+                purged: matches!(action, ServiceAction::Uninstall { purge: true }),
                 notes: Vec::new(),
             })
         }
@@ -3197,6 +3234,7 @@ mod tests {
         sync_service_inspection_to_ui(&ui, &native);
         assert_eq!(ui.get_service_managed_by(), "native-package");
         assert!(!ui.get_service_can_install());
+        assert!(!ui.get_service_can_setup());
         assert!(!ui.get_service_can_update());
         assert!(!ui.get_service_can_remove());
         assert!(ui.get_service_state_detail().contains("package manager"));
@@ -3218,7 +3256,8 @@ mod tests {
         };
         sync_service_inspection_to_ui(&ui, &ours);
         assert_eq!(ui.get_service_state_label(), "Access denied");
-        assert!(ui.get_service_state_detail().contains("service authorize"));
+        assert!(ui.get_service_state_detail().contains("Set up service"));
+        assert!(ui.get_service_can_setup());
         assert!(
             ui.get_service_can_update(),
             "ownership is independent of IPC access"
@@ -3245,6 +3284,7 @@ mod tests {
         assert!(!ui.get_service_can_update());
         assert!(!ui.get_service_can_remove());
         assert!(ui.get_service_state_detail().contains("systemctl failed"));
+        assert!(!ui.get_service_can_setup());
     }
 
     #[test]
@@ -3256,6 +3296,7 @@ mod tests {
         assert_eq!(ui.get_service_state_label(), "Simulation");
         // Even a stale/programmatically altered button state cannot bypass simulation mode.
         ui.set_service_can_install(true);
+        ui.set_service_can_setup(true);
         ui.set_service_can_update(true);
         ui.set_service_can_remove(true);
         ui.set_service_confirming_install(true);
@@ -3263,6 +3304,7 @@ mod tests {
         ui.set_service_restore_available(true);
         ui.invoke_refresh_service_status();
         ui.invoke_install_service();
+        ui.invoke_setup_service();
         ui.invoke_update_service();
         ui.invoke_uninstall_service();
         ui.invoke_set_restore_at_startup(true);
@@ -3355,6 +3397,124 @@ mod tests {
             ]
         );
         assert_eq!(service.borrow().current_snapshot().command_seq, 0);
+        release_service.send(()).unwrap();
+    }
+
+    #[test]
+    fn native_service_setup_is_available_without_terminal_commands_and_preserves_ownership() {
+        let (service, release_service) = gated_service(1);
+        let (ui, ops, _timer) = wired_ui(&service);
+        ui.set_is_simulated(false);
+        let native_owner = Ownership::NativePackage {
+            manager: "pacman".into(),
+            package: "awcc-rs".into(),
+            unit_path: "/usr/lib/systemd/system/awccd.service".into(),
+        };
+        let mut inspection = service_inspection(native_owner.clone(), UnitState::Stopped);
+        inspection.installation.enabled = Some(false);
+        let backend = Arc::new(FakeServiceManagement {
+            inspection: std::sync::Mutex::new(inspection),
+            failure: std::sync::Mutex::new(Some(
+                "Administrator authorization was cancelled".into(),
+            )),
+            ..Default::default()
+        });
+        ops.borrow_mut().service_backend = backend.clone();
+        ui.invoke_refresh_service_status();
+        wait_for_service_job(&ui, &ops);
+        assert!(ui.get_service_can_setup());
+        assert!(!ui.get_service_can_install());
+        assert!(!ui.get_service_can_update());
+        assert!(!ui.get_service_can_remove());
+
+        ui.invoke_setup_service();
+        wait_for_service_job(&ui, &ops);
+        assert!(ui.get_service_result_is_error());
+        assert!(ui.get_service_result().contains("cancelled"));
+        assert!(
+            ui.get_service_can_setup(),
+            "cancelled setup remains retryable"
+        );
+
+        *backend.failure.lock().unwrap() = None;
+        ui.invoke_setup_service();
+        wait_for_service_job(&ui, &ops);
+        assert_eq!(ui.get_service_result(), "Background service configured.");
+        assert_eq!(ui.get_service_state_label(), "Running");
+        assert!(!ui.get_service_can_setup());
+        assert_eq!(ui.get_service_managed_by(), "native-package");
+        assert_eq!(
+            backend.inspection.lock().unwrap().installation.ownership,
+            native_owner
+        );
+        assert!(!ui.get_service_can_update());
+        assert!(!ui.get_service_can_remove());
+        ui.invoke_setup_service();
+        assert_eq!(
+            *backend.actions.lock().unwrap(),
+            [ServiceAction::Setup, ServiceAction::Setup]
+        );
+        release_service.send(()).unwrap();
+    }
+
+    #[test]
+    fn service_setup_never_offers_to_override_a_mask_or_unrecognized_installation() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let mut inspection = service_inspection(
+            Ownership::AppimageInstaller {
+                build_id: "test-build".into(),
+            },
+            UnitState::Masked,
+        );
+        sync_service_inspection_to_ui(&ui, &inspection);
+        assert!(!ui.get_service_can_setup());
+        inspection.installation.masked = false;
+        inspection.installation.unit_state = UnitState::Stopped;
+        inspection.installation.interrupted_operation = true;
+        sync_service_inspection_to_ui(&ui, &inspection);
+        assert!(!ui.get_service_can_setup());
+        inspection.installation.interrupted_operation = false;
+        inspection.installation.ownership = Ownership::Unknown {
+            unit_path: "/etc/systemd/system/awccd.service".into(),
+            reason: "manually installed".into(),
+        };
+        sync_service_inspection_to_ui(&ui, &inspection);
+        assert!(!ui.get_service_can_setup());
+    }
+
+    #[test]
+    fn service_removal_purges_settings_only_when_selected_and_confirmed() {
+        let (service, release_service) = gated_service(1);
+        let (ui, ops, _timer) = wired_ui(&service);
+        ui.set_is_simulated(false);
+        let backend = Arc::new(FakeServiceManagement {
+            inspection: std::sync::Mutex::new(service_inspection(
+                Ownership::AppimageInstaller {
+                    build_id: "test-build".into(),
+                },
+                UnitState::Running,
+            )),
+            ..Default::default()
+        });
+        ops.borrow_mut().service_backend = backend.clone();
+        ui.invoke_refresh_service_status();
+        wait_for_service_job(&ui, &ops);
+        assert!(!ui.get_service_remove_purge());
+        ui.set_service_remove_purge(true);
+        ui.invoke_uninstall_service();
+        assert!(
+            backend.actions.lock().unwrap().is_empty(),
+            "purge still needs removal confirmation"
+        );
+        ui.set_service_confirming_remove(true);
+        ui.invoke_uninstall_service();
+        wait_for_service_job(&ui, &ops);
+        assert_eq!(
+            *backend.actions.lock().unwrap(),
+            [ServiceAction::Uninstall { purge: true }]
+        );
+        assert!(ui.get_service_result().contains("settings were deleted"));
         release_service.send(()).unwrap();
     }
 

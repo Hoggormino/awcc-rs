@@ -11,6 +11,13 @@ ExclusiveArch:  x86_64
 
 Requires:       hicolor-icon-theme
 Requires:       dejavu-sans-fonts
+Requires(post): systemd
+Requires(preun): systemd
+Requires(postun): systemd
+Requires(post): util-linux
+Requires(preun): util-linux
+Requires(postun): util-linux
+Recommends:     polkit
 Recommends:     libxkbcommon
 Recommends:     libxkbcommon-x11
 Recommends:     libX11
@@ -42,6 +49,8 @@ mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_sysconfdir}/awcc
 mkdir -p %{buildroot}%{_datadir}/awcc
 mkdir -p %{buildroot}/usr/lib/systemd/system
+mkdir -p %{buildroot}/usr/lib/modules-load.d
+mkdir -p %{buildroot}/usr/lib/udev/rules.d
 mkdir -p %{buildroot}%{_datadir}/applications
 mkdir -p %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
 mkdir -p %{buildroot}%{_datadir}/icons/hicolor/256x256/apps
@@ -57,6 +66,8 @@ printf 'rpm\n' > "%{buildroot}%{_datadir}/awcc/package-format"
 chmod 0644 "%{buildroot}%{_datadir}/awcc/package-format"
 install -m 0644 "%{staged_root}/share/applications/awcc-gui.desktop" "%{buildroot}%{_datadir}/applications/awcc-gui.desktop"
 install -m 0644 "%{staged_root}/share/systemd/awccd.service" "%{buildroot}/usr/lib/systemd/system/awccd.service"
+install -m 0644 "%{staged_root}/share/modules-load.d/awcc-rs.conf" "%{buildroot}/usr/lib/modules-load.d/awcc-rs.conf"
+install -m 0644 "%{staged_root}/share/udev/rules.d/70-awcc-rs.rules" "%{buildroot}/usr/lib/udev/rules.d/70-awcc-rs.rules"
 install -m 0644 "%{staged_root}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "%{buildroot}%{_datadir}/icons/hicolor/scalable/apps/awcc-gui.svg"
 install -m 0644 "%{staged_root}/share/icons/hicolor/256x256/apps/awcc-gui.png" "%{buildroot}%{_datadir}/icons/hicolor/256x256/apps/awcc-gui.png"
 install -m 0644 "%{staged_root}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "%{buildroot}%{_datadir}/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"
@@ -64,6 +75,12 @@ install -m 0644 "%{staged_root}/share/licenses/awcc-rs/LICENSE" "%{buildroot}%{_
 install -m 0644 "%{staged_root}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "%{buildroot}%{_licensedir}/%{name}/THIRD_PARTY_NOTICES.md"
 install -m 0644 "%{staged_root}/share/doc/awcc-rs/README.md" "%{buildroot}%{_docdir}/%{name}/README.md"
 install -m 0644 "%{staged_root}/share/doc/awcc-rs/INSTALL.txt" "%{buildroot}%{_docdir}/%{name}/INSTALL.txt"
+
+%post -f %{native_hooks_root}/rpm.post
+
+%preun -f %{native_hooks_root}/rpm.preun
+
+%postun -f %{native_hooks_root}/rpm.postun
 
 %files
 %{_bindir}/awcc-cli
@@ -75,6 +92,8 @@ install -m 0644 "%{staged_root}/share/doc/awcc-rs/INSTALL.txt" "%{buildroot}%{_d
 %{_datadir}/awcc/package-format
 %{_datadir}/applications/awcc-gui.desktop
 /usr/lib/systemd/system/awccd.service
+/usr/lib/modules-load.d/awcc-rs.conf
+/usr/lib/udev/rules.d/70-awcc-rs.rules
 %{_datadir}/icons/hicolor/scalable/apps/awcc-gui.svg
 %{_datadir}/icons/hicolor/256x256/apps/awcc-gui.png
 %{_datadir}/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml

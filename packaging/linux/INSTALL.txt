@@ -15,6 +15,8 @@ Included Resources
 - share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml : AppStream metadata
 - share/awcc/service-payload/ : Verified service executable, database and private runtime libraries for AppImage installation
 - share/systemd/awccd.service : System service unit for native/manual installations
+- share/modules-load.d/awcc-rs.conf : Native-package boot loading for an installed acpi_call module
+- share/udev/rules.d/70-awcc-rs.rules : Native-package active-session USB lighting access
 - share/licenses/awcc-rs/LICENSE : BSD-2-Clause project license
 - share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md : Third-party notices
 
@@ -24,6 +26,52 @@ Quick Start (Simulation Mode — No Hardware or Root Required)
   AWCC_DATABASE_PATH=./share/awcc/database.json ./bin/awcc-cli --sim device-info
   AWCC_DATABASE_PATH=./share/awcc/database.json ./bin/awcc-cli --sim query-mode
   AWCC_DATABASE_PATH=./share/awcc/database.json ./bin/awcc-gui --sim
+
+Native Packages (Arch/CachyOS, Debian/Ubuntu, Fedora)
+----------------------------------------------------
+Install the package with your usual package manager and launch awcc-gui as your
+normal user. On a systemd desktop, a fresh installation enables and starts
+awccd.service. When sudo/polkit identifies the installing account, the package
+authorizes that account automatically if no prior authorization policy exists.
+There is no need to edit groups, log out, or run the GUI as root.
+
+Some software centers and direct root shells do not forward a desktop identity.
+In that case, or for an older package that was never set up, choose Set up service
+in the GUI. One administrator prompt authorizes your account and enables/starts
+the installed daemon. The equivalent terminal command is:
+  awcc-cli service setup
+
+Upgrades preserve authorization, including explicit revocations, and do not enable
+an intentionally disabled or start an intentionally stopped service. Active
+services are restarted to use the updated executable. A masked service remains
+masked. Chroots, offline installations and Debian policy-rc.d can defer startup;
+package installation does not fail merely because systemd is not running there.
+
+Native packages also arrange loading of acpi_call at boot and refresh narrow
+USB access rules for the supported lighting controllers. The kernel module must
+be installed for the running kernel; the package does not build or download a
+kernel driver during installation. See Hardware Access Prerequisites below.
+
+Removal and Purge
+-----------------
+Normal package removal stops and disables the daemon before removing its binary,
+then reloads systemd. Package-owned units, module-loading configuration, udev rules
+and desktop integration are removed by the package manager. Service settings and
+authorization are retained so a later reinstall can reuse them.
+
+Debian/Ubuntu provides a separate purge operation:
+  sudo apt purge awcc-rs
+Purge additionally removes AWCC-generated system settings, authorization and
+service logs. It preserves unrelated files and refuses unsafe/symlinked paths.
+The empty /var/lib/awcc/.install.lock coordination file remains so concurrent
+service setup and package operations cannot acquire different lock files.
+Arch and RPM do not provide Debian-style purge; their normal removal retains
+application data and uses the package manager's configuration-file handling.
+Personal GUI settings/logs in users' home directories are not deleted by a system
+package operation. An already loaded acpi_call module is not forcibly unloaded.
+The USB access rule is removed, but access already granted to a connected
+controller may remain until it is reconnected or the computer is restarted.
+Existing administrator device permissions are preserved.
 
 AppImage Background Service
 ----------------------------
@@ -49,7 +97,11 @@ Updates preserve the service's enabled/disabled and running/stopped state.
 
 The initial fresh installation through polkit or sudo authorizes the invoking
 desktop user. Updates preserve the existing authorization policy. A direct root
-installation does not guess which desktop account to allow.
+installation does not guess which desktop account to allow; open the GUI as your
+desktop user and choose Set up service to complete authorization and startup.
+Set up service also repairs a stopped or unauthorized native-package installation
+without replacing its unit or binaries. Its AppImage CLI equivalent is:
+  ./AWCC-linux-x86_64.AppImage --cli service setup
 To manage access explicitly, use an installed awcc-cli or the AppImage:
   sudo awcc-cli service authorize "$USER"
   sudo awcc-cli service revoke <user-or-uid>
@@ -62,8 +114,11 @@ root being able to read the user's FUSE mount. If desktop authorization is not
 available, follow the terminal command printed by the installer; for example:
   sudo ./AWCC-linux-x86_64.AppImage --appimage-extract-and-run --service-apply install
 
-Removing the service keeps saved settings. To explicitly remove the service and
-its saved settings, use --uninstall-service --purge. The AppImage installer refuses
+Removing the service keeps saved settings. Select Also delete saved service
+settings in the GUI's removal confirmation, or use --uninstall-service --purge,
+to remove those settings and authorization created by this installer. Remove the
+service before deleting your final AppImage if you no longer want it installed.
+The AppImage installer refuses
 to replace or remove a native-package or manually managed awccd.service; use that
 installation's package manager or administrator procedure instead.
 
@@ -101,12 +156,10 @@ Runtime Shared Library Requirements (x86_64 Linux, glibc >= 2.39 / Ubuntu 24.04+
 Hardware Access Prerequisites (Live Hardware Mode Only)
 -------------------------------------------------------
 1. ACPI WMAX Thermal / Fan / G-Mode Control:
-   - Requires the `acpi_call` kernel module (`acpi_call-dkms` on Ubuntu/Debian/Arch, `akmod-acpi_call` on Fedora) providing `/proc/acpi/call`.
-   - Requires the privileged `awccd` service listening on `/run/awcc/awcc.sock`. The .deb, .rpm and Arch packages install it as `awccd.service`; it is not started automatically. Authorize your desktop account, then enable it with:
-       sudo awcc-cli service authorize "$USER"
-       sudo systemctl daemon-reload
-       sudo systemctl enable --now awccd
+   - Requires the `acpi_call` kernel module (`acpi-call-dkms` on Ubuntu/Debian, `acpi_call` or `acpi_call-dkms` on Arch/CachyOS, `akmod-acpi_call` on Fedora) providing `/proc/acpi/call`. Availability depends on your repositories and kernel. Native packages attempt to load an installed module and configure boot-time loading; they cannot supply a missing kernel-specific driver.
+   - Requires the privileged `awccd` service listening on `/run/awcc/awcc.sock`. Native packages configure it on first installation. Use the GUI's Set up service action to complete or repair account access and startup.
    - Authorization is stored in root-managed /etc/awcc/authorized-users, one local username or numeric UID per line; blank lines and # comments are accepted. Root is always authorized. The file and its containing directories must be root-owned and not writable by group or others. Authorization changes apply to subsequent requests without restarting the daemon.
    - Without the service, the GUI and CLI report "privileged service unavailable" without prompting on each refresh. Install/start the service and authorize your desktop account; normal thermal commands use the service even when the client runs as root. On a host without systemd, an administrator can run `sudo awcc-cli -d` manually or supervise it with the host's service manager; the AppImage installer requires systemd.
 2. Alienware USB HID ELC RGB Lighting (`0x187c:0x0550` / `0x187c:0x0551`):
-   - Requires read/write access to the USB HID device (via udev rule granting `MODE="0660", TAG+="uaccess"` for `idVendor=="187c", idProduct=="0550"` and `"0551"`).
+   - Native packages install narrow udev rules granting `TAG+="uaccess"` to the active local desktop session for vendor `187c`, products `0550` and `0551`. Remote/SSH sessions do not automatically receive those USB permissions.
+   - Standalone AppImage/manual installations still require suitable host USB permissions. The archive includes share/udev/rules.d/70-awcc-rs.rules for administrator-managed installation. Do not run the whole GUI as root to work around missing device permissions.

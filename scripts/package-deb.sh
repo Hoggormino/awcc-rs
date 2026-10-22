@@ -50,6 +50,8 @@ mkdir -p \
     "${PKG_ROOT}/usr/bin" \
     "${PKG_ROOT}/usr/share/awcc" \
     "${PKG_ROOT}/usr/lib/systemd/system" \
+    "${PKG_ROOT}/usr/lib/modules-load.d" \
+    "${PKG_ROOT}/usr/lib/udev/rules.d" \
     "${PKG_ROOT}/usr/share/applications" \
     "${PKG_ROOT}/usr/share/icons/hicolor/scalable/apps" \
     "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps" \
@@ -65,6 +67,8 @@ printf 'deb\n' > "${PKG_ROOT}/usr/share/awcc/package-format"
 chmod 0644 "${PKG_ROOT}/usr/share/awcc/package-format"
 install -m 0644 "${STAGED_DIR}/share/applications/awcc-gui.desktop" "${PKG_ROOT}/usr/share/applications/awcc-gui.desktop"
 install -m 0644 "${STAGED_DIR}/share/systemd/awccd.service" "${PKG_ROOT}/usr/lib/systemd/system/awccd.service"
+install -m 0644 "${STAGED_DIR}/share/modules-load.d/awcc-rs.conf" "${PKG_ROOT}/usr/lib/modules-load.d/awcc-rs.conf"
+install -m 0644 "${STAGED_DIR}/share/udev/rules.d/70-awcc-rs.rules" "${PKG_ROOT}/usr/lib/udev/rules.d/70-awcc-rs.rules"
 install -m 0644 "${STAGED_DIR}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "${PKG_ROOT}/usr/share/icons/hicolor/scalable/apps/awcc-gui.svg"
 install -m 0644 "${STAGED_DIR}/share/icons/hicolor/256x256/apps/awcc-gui.png" "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps/awcc-gui.png"
 install -m 0644 "${STAGED_DIR}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "${PKG_ROOT}/usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"
@@ -79,6 +83,11 @@ cat > "${PKG_ROOT}/DEBIAN/conffiles" <<'EOF'
 /etc/awcc/database.json
 EOF
 chmod 0644 "${PKG_ROOT}/DEBIAN/conffiles"
+
+for hook in postinst prerm postrm; do
+    bash "${SCRIPT_DIR}/render-native-package-hook.sh" "deb.${hook}" > "${PKG_ROOT}/DEBIAN/${hook}"
+    chmod 0755 "${PKG_ROOT}/DEBIAN/${hook}"
+done
 
 # Compute shared library dependencies dynamically with dpkg-shlibdeps when on Debian/Ubuntu,
 # or use verified Ubuntu 24.04 shlibs baseline when building on a non-Debian host.
@@ -115,7 +124,7 @@ Section: utils
 Priority: optional
 Architecture: ${AWCC_DEB_ARCH}
 Installed-Size: ${INSTALLED_SIZE}
-Depends: ${SHLIB_DEPENDS}
+Depends: ${SHLIB_DEPENDS}, init-system-helpers (>= 1.54~), util-linux
 Recommends: libxkbcommon0, libxkbcommon-x11-0, libx11-6, libxcursor1, libxi6, libxrender1, libwayland-client0, libwayland-egl1, libegl1, libgl1, policykit-1 | pkexec
 Suggests: acpi-call-dkms
 Maintainer: AWCC Linux Contributors <https://github.com/Hoggormino/awcc-rs>
@@ -165,6 +174,12 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     grep -q "./etc/awcc/database.json" <<<"${DEB_CONTENTS}"
     grep -q "./usr/share/awcc/package-format" <<<"${DEB_CONTENTS}"
     grep -q "./usr/lib/systemd/system/awccd.service" <<<"${DEB_CONTENTS}"
+    grep -q "./usr/lib/modules-load.d/awcc-rs.conf" <<<"${DEB_CONTENTS}"
+    grep -q "./usr/lib/udev/rules.d/70-awcc-rs.rules" <<<"${DEB_CONTENTS}"
+    for hook in postinst prerm postrm; do
+        dpkg-deb --ctrl-tarfile "${DEB_PATH}" | tar -xOf - "./${hook}" > "${WORK_TMP}/${hook}"
+        cmp "${WORK_TMP}/${hook}" "${PKG_ROOT}/DEBIAN/${hook}"
+    done
 else
     ar t "${DEB_PATH}" | grep -qx "debian-binary"
     ar t "${DEB_PATH}" | grep -qx "control.tar.gz"

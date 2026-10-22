@@ -6,7 +6,7 @@ pkgdesc="Unofficial Alienware Command Center for Linux (Rust + Slint Material 3 
 arch=('x86_64')
 url="https://github.com/Hoggormino/awcc-rs"
 license=('BSD-2-Clause' 'MIT')
-depends=('glibc' 'gcc-libs' 'libusb' 'fontconfig' 'ttf-dejavu' 'hicolor-icon-theme')
+depends=('glibc' 'gcc-libs' 'libusb' 'fontconfig' 'ttf-dejavu' 'hicolor-icon-theme' 'systemd' 'util-linux')
 optdepends=(
   'libxkbcommon: Wayland and X11 keyboard handling for awcc-gui'
   'libxkbcommon-x11: X11 keyboard handling for awcc-gui'
@@ -17,10 +17,11 @@ optdepends=(
   'libxrender: X11 rendering support for awcc-gui'
   'mesa: OpenGL/EGL hardware acceleration for awcc-gui'
   'acpi_call: /proc/acpi/call kernel interface for live WMAX thermal control'
-  'polkit: pkexec privilege elevation for live WMAX thermal writes'
+  'polkit: one-time service setup when the installing user cannot be identified'
 )
 backup=('etc/awcc/database.json')
 options=('!strip' '!debug')
+install=awcc-rs.install
 source=("https://github.com/Hoggormino/awcc-rs/releases/download/v${pkgver}/awcc-rs-${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
 sha256sums=('@TARBALL_SHA256@')
 
@@ -35,6 +36,10 @@ package() {
   printf 'arch\n' | install -Dm644 /dev/stdin "${pkgdir}/usr/share/awcc/package-format"
   install -Dm644 "${_root}/share/applications/awcc-gui.desktop" "${pkgdir}/usr/share/applications/awcc-gui.desktop"
   install -Dm644 "${_root}/share/systemd/awccd.service" "${pkgdir}/usr/lib/systemd/system/awccd.service"
+  install -Dm644 "${_root}/share/modules-load.d/awcc-rs.conf" "${pkgdir}/usr/lib/modules-load.d/awcc-rs.conf"
+  install -Dm644 "${_root}/share/udev/rules.d/70-awcc-rs.rules" "${pkgdir}/usr/lib/udev/rules.d/70-awcc-rs.rules"
+  install -Dm644 "${_root}/share/libalpm/hooks/05-awcc-rs-remove.hook" "${pkgdir}/usr/share/libalpm/hooks/05-awcc-rs-remove.hook"
+  install -Dm755 "${_root}/share/libalpm/scripts/awcc-rs-pre-remove" "${pkgdir}/usr/share/libalpm/scripts/awcc-rs-pre-remove"
   install -Dm644 "${_root}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/awcc-gui.svg"
   install -Dm644 "${_root}/share/icons/hicolor/256x256/apps/awcc-gui.png" "${pkgdir}/usr/share/icons/hicolor/256x256/apps/awcc-gui.png"
   install -Dm644 "${_root}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "${pkgdir}/usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"

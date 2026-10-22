@@ -1,0 +1,11 @@
+post_install() {
+    awcc_native_configure arch fresh
+}
+
+post_upgrade() {
+    awcc_native_configure arch upgrade
+}
+
+post_remove() {
+    awcc_native_after_remove removed
+}

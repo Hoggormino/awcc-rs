@@ -164,6 +164,7 @@ export component MainWindow inherits MaterialWindow {
     in property <string> service-version-line: "";
     in property <bool> service-state-is-problem: false;
     in property <bool> service-can-install: false;
+    in property <bool> service-can-setup: false;
     in property <bool> service-can-update: false;
     in property <bool> service-can-remove: false;
     in property <bool> service-busy: false;
@@ -174,6 +175,7 @@ export component MainWindow inherits MaterialWindow {
     in-out property <bool> service-restore-at-startup: false;
     in-out property <bool> service-confirming-install: false;
     in-out property <bool> service-confirming-remove: false;
+    in-out property <bool> service-remove-purge: false;
 
     // Callbacks to Rust service controller
     callback request-refresh();
@@ -204,6 +206,7 @@ export component MainWindow inherits MaterialWindow {
     callback copy-selected-audit-row();
     callback refresh-service-status();
     callback install-service();
+    callback setup-service();
     callback update-service();
     callback uninstall-service();
     callback set-restore-at-startup(bool);
@@ -397,6 +400,20 @@ export component MainWindow inherits MaterialWindow {
                             style: MaterialTypography.body_small;
                             color: root.lifecycle-is-error ? MaterialPalette.on_error_container : MaterialPalette.on_secondary_container;
                             overflow: elide;
+                        }
+                    }
+                }
+                if !root.is-simulated && (root.service-can-install || root.service-can-setup) : FilledButton {
+                    text: "Set up service";
+                    enabled: !root.service-busy;
+                    tooltip: "Enable background hardware control for your account with administrator approval";
+                    clicked => {
+                        root.active-nav-index = 3;
+                        if root.service-can-setup {
+                            root.setup-service();
+                        } else {
+                            root.service-confirming-install = true;
+                            root.service-confirming-remove = false;
                         }
                     }
                 }
@@ -1909,10 +1926,27 @@ export component MainWindow inherits MaterialWindow {
                         if root.service-confirming-remove : VerticalLayout {
                             spacing: 6px;
                             MaterialText {
-                                text: "This stops and removes the background service installed by this application. Saved settings are kept.";
+                                text: root.service-remove-purge
+                                    ? "This stops and removes the background service, deletes its saved settings and removes authorization created by this installer."
+                                    : "This stops and removes the background service installed by this application. Saved settings are kept.";
                                 style: MaterialTypography.body_small;
                                 color: MaterialPalette.on_surface;
                                 wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                alignment: start;
+                                spacing: 10px;
+                                Switch {
+                                    enabled: !root.service-busy;
+                                    checked: root.service-remove-purge;
+                                    checked_state_changed(purge) => { root.service-remove-purge = purge; }
+                                }
+                                MaterialText {
+                                    text: "Also delete saved service settings";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface;
+                                    vertical-alignment: center;
+                                }
                             }
                             HorizontalLayout {
                                 spacing: 8px;
@@ -1925,7 +1959,7 @@ export component MainWindow inherits MaterialWindow {
                                 OutlineButton {
                                     text: "Cancel";
                                     enabled: !root.service-busy;
-                                    clicked => { root.service-confirming-remove = false; }
+                                    clicked => { root.service-confirming-remove = false; root.service-remove-purge = false; }
                                 }
                             }
                         }
@@ -1946,6 +1980,12 @@ export component MainWindow inherits MaterialWindow {
                         HorizontalLayout {
                             spacing: 8px;
                             alignment: start;
+                            if root.service-can-setup : FilledButton {
+                                text: "Set up service";
+                                enabled: !root.service-busy;
+                                tooltip: "Authorize your account, start the service and enable it at boot";
+                                clicked => { root.setup-service(); }
+                            }
                             if root.service-can-install && !root.service-confirming-install : FilledButton {
                                 text: "Install background service";
                                 enabled: !root.service-busy;
@@ -1959,7 +1999,7 @@ export component MainWindow inherits MaterialWindow {
                             if root.service-can-remove && !root.service-confirming-remove : OutlineButton {
                                 text: "Remove service";
                                 enabled: !root.service-busy;
-                                clicked => { root.service-confirming-remove = true; root.service-confirming-install = false; }
+                                clicked => { root.service-confirming-remove = true; root.service-confirming-install = false; root.service-remove-purge = false; }
                             }
                             OutlineButton {
                                 text: "Check status";

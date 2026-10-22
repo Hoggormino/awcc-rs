@@ -85,21 +85,28 @@ fn seed_for_invoker(
         .then(|| format!("# User who authorized the initial AWCC service installation.\n{uid}\n")))
 }
 
-fn health_check() -> Result<(), String> {
-    match DaemonClient::system("awcc-installer", env!("CARGO_PKG_VERSION")).probe() {
+fn validate_health(probe: ServiceProbe, action: ServiceAction) -> Result<(), String> {
+    // DaemonClient::probe has already negotiated the IPC protocol. Setup manages an existing
+    // installation, which can legitimately have a different application version from this UI.
+    // Deploying a payload still requires the daemon to report that exact payload's version.
+    match probe {
         ServiceProbe::Running {
             version, status, ..
-        } if version == env!("CARGO_PKG_VERSION") => {
+        } => {
+            if matches!(action, ServiceAction::Install | ServiceAction::Update)
+                && version != env!("CARGO_PKG_VERSION")
+            {
+                return Err(format!(
+                    "service version {version} differs from installer version {}",
+                    env!("CARGO_PKG_VERSION")
+                ));
+            }
             if status.control_running {
                 Ok(())
             } else {
                 Err("service control is not ready".to_owned())
             }
         }
-        ServiceProbe::Running { version, .. } => Err(format!(
-            "service version {version} differs from installer version {}",
-            env!("CARGO_PKG_VERSION")
-        )),
         ServiceProbe::NotRunning { reason } => Err(reason),
         ServiceProbe::AccessDenied { message } | ServiceProbe::Incompatible { message } => {
             Err(message)
@@ -121,7 +128,7 @@ fn apply_as_root(
         ServiceAction::Install | ServiceAction::Update => {
             Some(PayloadSource::for_executable(&executable)?)
         }
-        ServiceAction::Uninstall { .. } => None,
+        ServiceAction::Setup | ServiceAction::Uninstall { .. } => None,
     };
     let seed = if matches!(action, ServiceAction::Uninstall { .. }) {
         None
@@ -135,12 +142,18 @@ fn apply_as_root(
         authorized_users_seed: seed,
         ..ApplyOptions::default()
     };
+    let probe = || {
+        validate_health(
+            DaemonClient::system("awcc-installer", env!("CARGO_PKG_VERSION")).probe(),
+            action,
+        )
+    };
     let mut report = installer::apply(
         action,
         &ApplyContext {
             paths: &paths,
             runner: &SystemRunner::default(),
-            probe: &health_check,
+            probe: &probe,
             payload: payload.as_ref(),
             options,
         },
@@ -219,6 +232,43 @@ pub fn run_system_apply_command(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn running(version: &str, control_running: bool) -> ServiceProbe {
+        ServiceProbe::Running {
+            daemon_protocol: crate::ipc::PROTOCOL_VERSION,
+            version: version.into(),
+            commit: "test".into(),
+            package_format: "deb".into(),
+            status: crate::ipc::DaemonStatus {
+                uptime_secs: 0,
+                device_name: "test".into(),
+                acpi_prefix: "test".into(),
+                control_running,
+            },
+            capabilities: vec![],
+        }
+    }
+
+    #[test]
+    fn setup_accepts_compatible_installed_versions_but_deployment_requires_exact_version() {
+        assert!(validate_health(running("0.1.2", true), ServiceAction::Setup).is_ok());
+        assert!(validate_health(running("0.2.0", true), ServiceAction::Setup).is_ok());
+        assert!(validate_health(running("0.1.2", false), ServiceAction::Setup).is_err());
+        assert!(
+            validate_health(
+                ServiceProbe::Incompatible {
+                    message: "unsupported IPC protocol".into()
+                },
+                ServiceAction::Setup,
+            )
+            .is_err()
+        );
+        for action in [ServiceAction::Install, ServiceAction::Update] {
+            assert!(validate_health(running("0.1.2", true), action).is_err());
+            assert!(validate_health(running(env!("CARGO_PKG_VERSION"), true), action).is_ok());
+            assert!(validate_health(running(env!("CARGO_PKG_VERSION"), false), action).is_err());
+        }
+    }
 
     #[test]
     fn first_install_authorizes_only_the_identified_invoker() {

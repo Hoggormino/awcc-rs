@@ -24,6 +24,7 @@ ASSET_NAMES = [
     f"awcc-rs-{VERSION}-1-x86_64.pkg.tar.zst",
     "PKGBUILD",
     ".SRCINFO",
+    "awcc-rs.install",
     "build-manifest.json",
     "SHA256SUMS",
 ]

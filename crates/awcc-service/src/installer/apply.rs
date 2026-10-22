@@ -3,7 +3,7 @@
 use std::fmt::Display;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,8 +51,8 @@ pub struct ApplyOptions {
     /// Time limit for `systemctl` calls (covers a graceful stop; the unit uses
     /// `TimeoutStopSec=15`).
     pub command_timeout: Duration,
-    /// When set and `/etc/awcc/authorized-users` does not exist, create it with this content
-    /// (removed again by `--purge`, and by a rollback of the same operation).
+    /// Fresh install creates a missing allowlist with this content. Explicit setup instead
+    /// requires exactly one numeric UID (comments allowed) and adds it to the existing policy.
     pub authorized_users_seed: Option<String>,
 }
 
@@ -72,7 +72,7 @@ pub struct ApplyContext<'a> {
     pub paths: &'a InstallPaths,
     pub runner: &'a dyn HostRunner,
     pub probe: &'a dyn HealthProbe,
-    /// Required for install/update; ignored for uninstall.
+    /// Required for install/update; ignored for setup/uninstall.
     pub payload: Option<&'a PayloadSource>,
     pub options: ApplyOptions,
 }
@@ -288,8 +288,8 @@ fn has_lib(verified: &VerifiedPayload) -> bool {
 /// `progress` is called when each step starts, so a UI can show truthful progress.
 ///
 /// # Errors
-/// [`InstallError`]. Failures after the first system change roll everything back and say so in
-/// the error ([`RollbackSummary`]).
+/// [`InstallError`]. Install/update failures after deployment starts attempt rollback and report
+/// its result. Setup/uninstall failures report the problem and may leave earlier steps applied.
 pub fn apply(
     action: ServiceAction,
     ctx: &ApplyContext<'_>,
@@ -327,6 +327,12 @@ pub fn apply(
     ensure_dir_chain(paths, "/var/lib/awcc", 0o755)?;
     let _lock = acquire_lock(paths)?;
 
+    // Setup must never run deployment recovery or staging cleanup: a package-owned service
+    // may now occupy the same unit name as an interrupted AppImage installation.
+    if matches!(action, ServiceAction::Setup) {
+        return setup(&mut run);
+    }
+
     // Recovery and stale staging cleanup run before deploy creates its directories. Validate
     // those paths first so cleanup cannot follow an administrator's symlink elsewhere.
     for logical in [
@@ -345,7 +351,225 @@ pub fn apply(
     match action {
         ServiceAction::Install | ServiceAction::Update => deploy(&mut run, action, &det, recovered),
         ServiceAction::Uninstall { purge } => uninstall(&mut run, &det, purge, recovered),
+        ServiceAction::Setup => unreachable!("setup returns before deployment recovery"),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Explicit setup of an existing native/package-managed service.
+// ---------------------------------------------------------------------------------------------
+
+fn setup_failed(reason: impl Into<String>) -> InstallError {
+    InstallError::SetupFailed {
+        reason: reason.into(),
+    }
+}
+
+fn setup_invoker(seed: Option<&str>) -> Result<String, InstallError> {
+    let mut entries = seed.unwrap_or_default().lines().filter_map(|line| {
+        let entry = line.split('#').next().unwrap_or_default().trim();
+        (!entry.is_empty()).then_some(entry)
+    });
+    let entry = entries.next().ok_or_else(|| {
+        setup_failed(
+            "no invoking desktop user was identified; run `awcc-cli service setup` from your \
+             desktop account (with polkit or sudo)",
+        )
+    })?;
+    let uid = entry
+        .parse::<u32>()
+        .ok()
+        .filter(|uid| *uid != 0 && *uid != u32::MAX)
+        .filter(|_| entry.bytes().all(|b| b.is_ascii_digit()));
+    if entries.next().is_some() || uid.is_none() {
+        return Err(setup_failed(
+            "setup requires exactly one valid invoking desktop UID",
+        ));
+    }
+    Ok(entry.to_owned())
+}
+
+fn validate_setup_unit(paths: &InstallPaths, det: &Detection) -> Result<(), InstallError> {
+    if det.masked {
+        return Err(InstallError::Masked {
+            path: paths.logical(&paths.unit_path()),
+        });
+    }
+    let logical = match &det.ownership {
+        Ownership::AppimageInstaller { .. } if det.ours && det.unit_exists => {
+            paths.logical(&paths.unit_path())
+        }
+        Ownership::NativePackage {
+            package, unit_path, ..
+        } if package == "awcc-rs" => unit_path.clone(),
+        Ownership::None | Ownership::AppimageInstaller { .. } => {
+            return Err(InstallError::NotInstalled);
+        }
+        Ownership::Unknown { unit_path, reason } => {
+            return Err(InstallError::UnknownUnit {
+                unit_path: unit_path.clone(),
+                reason: reason.clone(),
+            });
+        }
+        Ownership::NativePackage { package, .. } => {
+            return Err(setup_failed(format!(
+                "the service belongs to package `{package}`, not the AWCC package"
+            )));
+        }
+    };
+    let props = det.props.as_ref().ok_or_else(|| {
+        setup_failed(format!(
+            "cannot establish the service state: {}",
+            det.problems.join("; ")
+        ))
+    })?;
+    if props.load_state != "loaded" || props.fragment_path.is_empty() {
+        return Err(setup_failed(
+            "systemd has not loaded the owned service unit",
+        ));
+    }
+    let expected = fs::canonicalize(paths.join(&logical))
+        .map_err(io_context("resolving the owned service unit"))?;
+    let root =
+        fs::canonicalize(paths.join("/")).map_err(io_context("resolving the installation root"))?;
+    if !expected.starts_with(&root) {
+        return Err(setup_failed(
+            "the owned unit resolves outside the installation root",
+        ));
+    }
+    let parent = expected
+        .parent()
+        .ok_or_else(|| setup_failed("unit has no parent"))?;
+    check_existing_dir_chain(paths, &paths.logical(parent))?;
+    let metadata =
+        fs::symlink_metadata(&expected).map_err(io_context("checking the service unit"))?;
+    if !metadata.is_file()
+        || paths.is_privileged() && (metadata.uid() != 0 || metadata.mode() & 0o022 != 0)
+    {
+        return Err(setup_failed(
+            "the service unit has unsafe ownership or permissions",
+        ));
+    }
+    let selected = fs::canonicalize(paths.join(&props.fragment_path))
+        .map_err(io_context("resolving the loaded service unit"))?;
+    if selected != expected {
+        return Err(setup_failed(
+            "systemd loaded a different service unit than its recorded owner",
+        ));
+    }
+    // Reload must not activate an unrecognized local/runtime override that was written since
+    // systemd last loaded the package unit. A link to the same unit remains harmless.
+    for override_path in [paths.unit_path(), paths.runtime_unit_path()] {
+        if fs::symlink_metadata(&override_path).is_ok()
+            && fs::canonicalize(&override_path).ok().as_ref() != Some(&expected)
+        {
+            return Err(setup_failed(format!(
+                "{} overrides the owned service unit; review that file before setup",
+                override_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn setup_start_error(paths: &InstallPaths, error: impl Display) -> InstallError {
+    let mut reason = format!(
+        "{error}. Authorization or enablement may already have been applied; fix the reported \
+         problem and retry setup"
+    );
+    if paths.is_privileged() && !paths.join("/proc/acpi/call").exists() {
+        reason.push_str(
+            ". The acpi_call driver is unavailable (/proc/acpi/call is missing); install the \
+             acpi_call package for your running kernel and load its module before retrying",
+        );
+    }
+    setup_failed(reason)
+}
+
+fn setup(run: &mut Run<'_, '_>) -> Result<ApplyReport, InstallError> {
+    let paths = run.ctx.paths;
+    let invoker = setup_invoker(run.ctx.options.authorized_users_seed.as_deref())?;
+    check_existing_dir_chain(paths, "/etc/awcc")?;
+    if fs::symlink_metadata(paths.journal_path()).is_ok() {
+        return Err(setup_failed(
+            "an interrupted AppImage deployment must be resolved before setup; no recovery or \
+             service-file replacement was attempted",
+        ));
+    }
+    let det = detect(paths, run.ctx.runner, run.ctx.options.command_timeout);
+    validate_setup_unit(paths, &det)?;
+    let existing_users = fs::symlink_metadata(paths.authorized_users_path()).is_ok();
+    // Record ownership before creating an allowlist so AppImage purge also cleans up a policy
+    // first created by this explicit setup action.
+    if !existing_users
+        && let Some(mut record) = det.record.clone().filter(|_| det.ours)
+        && !record.created_authorized_users
+    {
+        record.created_authorized_users = true;
+        let json = serde_json::to_vec_pretty(&record)
+            .map_err(|error| setup_failed(format!("cannot update ownership record: {error}")))?;
+        write_atomic(&paths.record_path(), &json, 0o644)?;
+    }
+    ensure_dir_chain(paths, "/etc/awcc", 0o755)?;
+    crate::ipc::authorized_users::add(&paths.authorized_users_path(), &invoker)
+        .map_err(io_context("authorizing the invoking user"))?;
+
+    run.emit(
+        ProgressStep::ReloadingSystemd,
+        "loading the installed service unit",
+    );
+    run.systemd
+        .act("daemon-reload", false)
+        .map_err(|error| setup_start_error(paths, error))?;
+    // Inspect again after reload before any start: the loaded unit must still match ownership.
+    let reloaded = detect(paths, run.ctx.runner, run.ctx.options.command_timeout);
+    validate_setup_unit(paths, &reloaded)?;
+    run.emit(
+        ProgressStep::StartingService,
+        "enabling and starting the installed service",
+    );
+    run.systemd
+        .act("enable", true)
+        .map_err(|error| setup_start_error(paths, error))?;
+    run.systemd
+        .act("start", true)
+        .map_err(|error| setup_start_error(paths, error))?;
+    run.emit(
+        ProgressStep::HealthCheck,
+        "checking that the service is ready",
+    );
+    health_check(run).map_err(|error| setup_start_error(paths, error))?;
+    let after = run
+        .systemd
+        .show()
+        .map_err(|error| setup_start_error(paths, error))?;
+    if after.enabled() != Some(true) || !after.active() {
+        return Err(setup_start_error(
+            paths,
+            "the service is not enabled and running",
+        ));
+    }
+    run.emit(
+        ProgressStep::Done,
+        "the service is configured for this account",
+    );
+    Ok(ApplyReport {
+        action: ServiceAction::Setup.name().to_owned(),
+        outcome: ApplyOutcome::Configured,
+        build_id: det
+            .record
+            .as_ref()
+            .filter(|_| det.ours)
+            .map(|r| r.build_id.clone()),
+        previous_build_id: None,
+        enabled: after.enabled(),
+        active: Some(after.active()),
+        recovered_interrupted: false,
+        purged: false,
+        notes: vec![format!(
+            "Authorized desktop UID {invoker}; the service is enabled at boot."
+        )],
+    })
 }
 
 fn uninstall_gate_nothing(
