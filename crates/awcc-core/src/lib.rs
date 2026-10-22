@@ -477,7 +477,7 @@ impl ThermalMode {
         Self::Manual,
     ];
 
-    /// Bit index in `database.json` `thermalModes` bitmask (matches `include/database.h` `ThermalModeSet`).
+    /// Bit index in the `database.json` `thermalModes` capability bitmask.
     #[must_use]
     pub const fn bitmask_bit(self) -> Option<u8> {
         match self {
