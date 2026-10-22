@@ -1,7 +1,7 @@
 //! Service-owned persistent settings (`/var/lib/awcc/settings.json`).
 //!
-//! The file records *desired* configuration only: curve parameters, whether the curve should be
-//! running (the user's intent) and whether it is restored when the daemon starts. What the
+//! The file records *desired* configuration only: the selected firmware preset, curve parameters,
+//! whether the curve should be running and whether it is restored when the daemon starts. What the
 //! hardware is actually doing is reported separately and is never read back from this file.
 //!
 //! Writes are atomic (temporary file in the same directory, `fsync`, `rename`, directory
@@ -12,14 +12,14 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use awcc_core::FanCurveConfig;
+use awcc_core::{FanCurveConfig, ThermalMode};
 use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::DaemonRpcRequest;
 
 /// Current settings schema version.
-pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
 /// Persistent service state directory.
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/awcc";
 /// File name of the settings document inside the state directory.
@@ -36,6 +36,10 @@ pub struct ServiceSettings {
     pub device_name: String,
     /// ACPI prefix the settings were saved for.
     pub acpi_prefix: String,
+    /// Last accepted explicit firmware preset, restored at daemon startup. Transient Manual and
+    /// G-Mode selections are not restored. Absent on fresh installs and schema 1 settings.
+    #[serde(default)]
+    pub thermal_preset: Option<ThermalMode>,
     /// Saved curve parameters (`enabled` is always stored as `false`; see `intent_active`).
     pub curve: FanCurveConfig,
     /// The user's intent: run the curve.
@@ -52,11 +56,25 @@ impl ServiceSettings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             device_name: device_name.to_string(),
             acpi_prefix: acpi_prefix.to_string(),
+            thermal_preset: None,
             curve: FanCurveConfig::default(),
             intent_active: false,
             restore_at_startup: false,
         }
     }
+}
+
+/// Presets that can be restored without saved manual fan parameters or a G-Mode session.
+pub(crate) const fn is_firmware_preset(mode: ThermalMode) -> bool {
+    matches!(
+        mode,
+        ThermalMode::Quiet
+            | ThermalMode::Cool
+            | ThermalMode::Balanced
+            | ThermalMode::Performance
+            | ThermalMode::FullSpeed
+            | ThermalMode::BatterySaver
+    )
 }
 
 /// Validate curve parameters with the same domain rules as the live configure operation.
@@ -164,7 +182,7 @@ impl SettingsStore {
                 found_version: u32::try_from(version).unwrap_or(u32::MAX),
             };
         }
-        let settings: ServiceSettings = match serde_json::from_str(&text) {
+        let mut settings: ServiceSettings = match serde_json::from_str(&text) {
             Ok(s) => s,
             Err(e) => {
                 return SettingsLoad::Invalid {
@@ -172,7 +190,7 @@ impl SettingsStore {
                 };
             }
         };
-        if settings.schema_version != SETTINGS_SCHEMA_VERSION {
+        if !matches!(settings.schema_version, 1 | SETTINGS_SCHEMA_VERSION) {
             return SettingsLoad::Invalid {
                 reason: format!("unsupported schema version {}", settings.schema_version),
             };
@@ -188,6 +206,17 @@ impl SettingsStore {
         if let Err(reason) = validate_curve(&settings.curve) {
             return SettingsLoad::Invalid { reason };
         }
+        if settings
+            .thermal_preset
+            .is_some_and(|mode| !is_firmware_preset(mode))
+        {
+            return SettingsLoad::Invalid {
+                reason: "saved thermal preset must not be Manual or G-Mode".to_string(),
+            };
+        }
+        // Migrate in memory. Reading old settings never creates new user intent or rewrites the
+        // file; a later explicit settings change persists the current schema atomically.
+        settings.schema_version = SETTINGS_SCHEMA_VERSION;
         SettingsLoad::Loaded(settings)
     }
 
@@ -263,6 +292,7 @@ mod tests {
         let store = SettingsStore::new(&d);
         assert_eq!(store.load("M15", "AMWW"), SettingsLoad::Missing);
         let mut s = ServiceSettings::fresh("M15", "AMWW");
+        s.thermal_preset = Some(ThermalMode::Cool);
         s.intent_active = true;
         s.restore_at_startup = true;
         store.save(&s).unwrap();
@@ -282,6 +312,40 @@ mod tests {
         assert!(!s.intent_active);
         assert!(!s.restore_at_startup);
         assert!(!s.curve.enabled);
+        assert_eq!(s.thermal_preset, None);
+    }
+
+    #[test]
+    fn schema_one_settings_migrate_without_inventing_a_preset_or_rewriting_the_file() {
+        let d = dir("schema_one");
+        let store = SettingsStore::new(&d);
+        let mut settings = ServiceSettings::fresh("M15", "AMWW");
+        settings.intent_active = true;
+        settings.restore_at_startup = true;
+        let mut old = serde_json::to_value(&settings).unwrap();
+        old["schema_version"] = 1.into();
+        old.as_object_mut().unwrap().remove("thermal_preset");
+        let bytes = serde_json::to_vec(&old).unwrap();
+        fs::write(store.path(), &bytes).unwrap();
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(store.load("M15", "AMWW"), SettingsLoad::Loaded(settings));
+        assert_eq!(fs::read(store.path()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn transient_or_unknown_saved_presets_are_rejected() {
+        for mode in ["Manual", "GMode", "UnknownPreset"] {
+            let d = dir(mode);
+            let store = SettingsStore::new(&d);
+            let mut value = serde_json::to_value(ServiceSettings::fresh("M15", "AMWW")).unwrap();
+            value["thermal_preset"] = mode.into();
+            fs::write(store.path(), serde_json::to_vec(&value).unwrap()).unwrap();
+            fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(matches!(
+                store.load("M15", "AMWW"),
+                SettingsLoad::Invalid { .. }
+            ));
+        }
     }
 
     #[test]

@@ -52,6 +52,29 @@ USB access rules for the supported lighting controllers. The kernel module must
 be installed for the running kernel; the package does not build or download a
 kernel driver during installation. See Hardware Access Prerequisites below.
 
+Saved Thermal Preset and Desktop Power Management
+--------------------------------------------------
+An accepted firmware preset selection (for example Cool or Quiet) is saved by the
+service in /var/lib/awcc/settings.json and restored when the service starts. The
+GUI does not have to be running. A failed request preserves the previous choice.
+Fresh installations and upgrades from settings schema 1 have no saved preset;
+select your preference once after upgrading. Manual boost and G-Mode are
+transient and clear preset restoration. Saved custom-curve auto-restore takes
+precedence when enabled; its startup preference is separate from presets.
+Save failures and startup restore failures are reported in GUI service details.
+
+The desktop's power manager can also change the firmware profile. For example,
+Power Profiles Daemon's platform_profile driver can replace AWCC's restored
+preset at login or on AC/battery transitions. AWCC restores saved intent once;
+it does not repeatedly overwrite another controller's changes.
+
+If AWCC should own firmware thermal profiles while the desktop retains CPU power
+management, an administrator can configure Power Profiles Daemon to start with
+--block-driver=platform_profile, when supported by the installed version. Check
+its --help-all output and existing systemd ExecStart before creating a service
+override; executable paths and existing arguments vary by distribution. This is
+an administrator choice, and installing AWCC does not change other services.
+
 Removal and Purge
 -----------------
 Normal package removal stops and disables the daemon before removing its binary,

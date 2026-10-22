@@ -44,7 +44,8 @@ use awcc_core::{FanCurveConfig, OperationLifecycle, SensorReading, ThermalMode, 
 use crate::daemon::{DaemonRpcRequest, try_direct_rpc_kernel_io};
 use crate::ipc::DaemonLock;
 use crate::settings::{
-    SETTINGS_SCHEMA_VERSION, ServiceSettings, SettingsLoad, SettingsStore, validate_curve,
+    SETTINGS_SCHEMA_VERSION, ServiceSettings, SettingsLoad, SettingsStore, is_firmware_preset,
+    validate_curve,
 };
 use crate::wire::{
     ControlState, ControlStatus, MAX_VIEW_AUDIT_ENTRIES, ThermalView, WireObservation, WireSensor,
@@ -343,7 +344,8 @@ impl ControlCore {
     ///
     /// `load` is what the persisted settings looked like; the device identity is revalidated by the
     /// caller when loading. A curve is restored only when the saved preference asks for it **and**
-    /// the device currently reports a fresh CPU temperature and a known thermal mode.
+    /// the device currently reports a fresh CPU temperature and a known thermal mode. Otherwise,
+    /// the last explicitly selected firmware preset is restored, if one was saved.
     #[must_use]
     pub fn new(
         orch: ThermalOrchestrator,
@@ -424,6 +426,29 @@ impl ControlCore {
     fn startup_restore(&mut self) {
         if self.settings.restore_at_startup && self.settings.intent_active {
             self.try_activate_curve("startup restore");
+        } else if let Some(mode) = self.settings.thermal_preset {
+            let snap = self
+                .orch
+                .execute(ServiceCommand::SetThermalMode(mode))
+                .snapshot;
+            let detail = snap.lifecycle.detail_message();
+            if operation_succeeded(&snap.lifecycle) {
+                self.last_outcome = Some(format!("startup preset restore: {detail}"));
+            } else {
+                self.failure_reason = Some(format!(
+                    "saved {} preset could not be restored: {detail}",
+                    mode.display_name()
+                ));
+                self.last_outcome = self.failure_reason.clone();
+                tracing::warn!(
+                    target: "awcc_service::control",
+                    category = "app", action = "restore_preset", outcome = "failed",
+                    code = "preset_restore_failed", "{detail}"
+                );
+            }
+            // This is a single restoration of saved user intent, not a policy loop that fights
+            // other power managers. Keep the actual readback and operation lifecycle visible.
+            self.view_from(&snap);
         }
         tracing::info!(
             target: "awcc_service::control",
@@ -709,6 +734,10 @@ impl ControlCore {
 
     fn run_thermal_op(&mut self, op: ControlOp) -> ControlReply {
         let supersedes = op.supersedes_curve();
+        let preset = match op {
+            ControlOp::SetThermalMode(mode) if is_firmware_preset(mode) => Some(mode),
+            _ => None,
+        };
         let command = match op {
             ControlOp::SetThermalMode(m) => ServiceCommand::SetThermalMode(m),
             ControlOp::ToggleGMode => ServiceCommand::ToggleGMode,
@@ -732,6 +761,11 @@ impl ControlCore {
         let mut snap = outcome.snapshot;
         let accepted = operation_succeeded(&lifecycle);
         if supersedes {
+            if accepted {
+                self.settings.thermal_preset = preset;
+                self.failure_reason = None;
+                self.last_outcome = Some(lifecycle.detail_message());
+            }
             if accepted && self.state != ControlState::Idle {
                 self.orch.cancel_curve_without_restore();
                 self.state = ControlState::Idle;
@@ -1537,12 +1571,20 @@ mod tests {
     }
 
     fn rig_with(load: impl FnOnce(&str, &str) -> SettingsLoad, sink: Arc<dyn SettingsSink>) -> Rig {
+        rig_with_backend(load, sink, SimBackend::new_alienware_m15_r6())
+    }
+
+    fn rig_with_backend(
+        load: impl FnOnce(&str, &str) -> SettingsLoad,
+        sink: Arc<dyn SettingsSink>,
+        backend: SimBackend,
+    ) -> Rig {
         let cpu = Arc::new(Mutex::new(Some(40_u16)));
         let fail_writes = Arc::new(Mutex::new(false));
         let profile = DeviceProfile::alienware_m15_r6().unwrap();
         let (name, prefix) = (profile.device_name.clone(), profile.acpi_prefix.to_string());
         let transport = TempTransport {
-            inner: SimBackend::new_alienware_m15_r6(),
+            inner: backend,
             cpu: Arc::clone(&cpu),
             fail_writes: Arc::clone(&fail_writes),
             telemetry_gate: None,
@@ -1632,6 +1674,157 @@ mod tests {
         assert_eq!(r.core.state(), ControlState::Idle);
         assert!(!r.core.settings().intent_active);
         assert!(!r.core.settings().restore_at_startup);
+        assert!(r.core.refresh().audit.is_empty());
+    }
+
+    #[test]
+    fn selected_preset_survives_saved_settings_and_restart_from_full_speed() {
+        for mode in [ThermalMode::Cool, ThermalMode::Quiet] {
+            let sink = Arc::new(RecordingSink::default());
+            let mut r = rig_with(|_, _| SettingsLoad::Missing, sink.clone());
+            let reply = r.core.handle(ControlOp::SetThermalMode(mode));
+            assert!(operation_succeeded(&reply.result.unwrap()));
+            let saved = sink.saved.lock().unwrap().last().cloned().unwrap();
+            let dir = std::env::temp_dir().join(format!(
+                "awcc_preset_restart_{}_{}",
+                std::process::id(),
+                mode.cli_code()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = SettingsStore::new(&dir);
+            store.save(&saved).unwrap();
+            let profile = DeviceProfile::alienware_m15_r6().unwrap();
+            let mut backend = SimBackend::new_alienware_m15_r6();
+            backend
+                .set_raw_thermal_mode(profile.code_table.set_code_for(ThermalMode::FullSpeed))
+                .unwrap();
+            let mut restarted =
+                rig_with_backend(|n, p| store.load(n, p), Arc::new(NullSettingsSink), backend);
+            assert_eq!(
+                restarted.core.refresh().thermal_mode_state,
+                ThermalModeState::Known(mode)
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_preset_request_preserves_the_saved_choice() {
+        let sink = Arc::new(RecordingSink::default());
+        let mut r = rig_with(|_, _| SettingsLoad::Missing, sink.clone());
+        r.core.handle(ControlOp::SetThermalMode(ThermalMode::Quiet));
+        let writes = sink.saved.lock().unwrap().len();
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::AcpiSetFailureRollback);
+        let reply = r.core.handle(ControlOp::SetThermalMode(ThermalMode::Cool));
+        assert!(reply.result.unwrap().is_error_or_rollback());
+        assert_eq!(r.core.settings().thermal_preset, Some(ThermalMode::Quiet));
+        assert_eq!(sink.saved.lock().unwrap().len(), writes);
+    }
+
+    #[test]
+    fn manual_and_gmode_commands_do_not_restore_an_old_preset_on_restart() {
+        for op in [
+            ControlOp::ApplyManualBoost {
+                cpu_boost_pct: 30,
+                gpu_boost_pct: 30,
+            },
+            ControlOp::SetThermalMode(ThermalMode::Manual),
+            ControlOp::SetThermalMode(ThermalMode::GMode),
+            ControlOp::ToggleGMode,
+        ] {
+            let mut r = rig();
+            r.core.handle(ControlOp::SetThermalMode(ThermalMode::Cool));
+            let reply = r.core.handle(op);
+            assert!(operation_succeeded(&reply.result.unwrap()));
+            assert_eq!(r.core.settings().thermal_preset, None);
+        }
+    }
+
+    #[test]
+    fn startup_preset_failure_is_visible_and_does_not_loop_or_lose_the_saved_choice() {
+        let mut backend = SimBackend::new_alienware_m15_r6();
+        backend.set_scenario(SimScenario::AcpiSetFailureRollback);
+        let mut r = rig_with_backend(
+            |n, p| {
+                let mut s = ServiceSettings::fresh(n, p);
+                s.thermal_preset = Some(ThermalMode::Quiet);
+                SettingsLoad::Loaded(s)
+            },
+            Arc::new(NullSettingsSink),
+            backend,
+        );
+        let view = r.core.refresh();
+        assert!(view.lifecycle.is_error_or_rollback());
+        assert!(
+            view.control
+                .failure_reason
+                .unwrap()
+                .contains("Quiet preset could not be restored")
+        );
+        let writes = view.audit.len();
+        r.core.tick(true);
+        assert_eq!(r.core.refresh().audit.len(), writes);
+        assert_eq!(r.core.settings().thermal_preset, Some(ThermalMode::Quiet));
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::Normal);
+        let reply = r.core.handle(ControlOp::SetThermalMode(ThermalMode::Cool));
+        assert!(operation_succeeded(&reply.result.unwrap()));
+        assert!(reply.view.control.failure_reason.is_none());
+        assert!(reply.view.control.last_outcome.unwrap().contains("Cool"));
+    }
+
+    #[test]
+    fn preset_restore_preserves_accepted_when_readback_is_unavailable() {
+        let mut backend = SimBackend::new_alienware_m15_r6();
+        backend.set_sim_faults(SimFaults {
+            thermal_mode_query_unavailable: true,
+            ..SimFaults::default()
+        });
+        let mut r = rig_with_backend(
+            |n, p| {
+                let mut s = ServiceSettings::fresh(n, p);
+                s.thermal_preset = Some(ThermalMode::Cool);
+                SettingsLoad::Loaded(s)
+            },
+            Arc::new(NullSettingsSink),
+            backend,
+        );
+        let view = r.core.refresh();
+        assert!(matches!(
+            view.lifecycle,
+            OperationLifecycle::Accepted { .. }
+        ));
+        assert!(matches!(
+            view.thermal_mode_state,
+            ThermalModeState::Unknown { .. }
+        ));
+        assert!(view.control.failure_reason.is_none());
+    }
+
+    #[test]
+    fn saved_curve_restore_takes_precedence_over_the_saved_preset() {
+        let mut r = rig_with(
+            |n, p| {
+                let mut s = ServiceSettings::fresh(n, p);
+                s.thermal_preset = Some(ThermalMode::Quiet);
+                s.intent_active = true;
+                s.restore_at_startup = true;
+                SettingsLoad::Loaded(s)
+            },
+            Arc::new(NullSettingsSink),
+        );
+        assert_eq!(r.core.state(), ControlState::Active);
+        assert_eq!(
+            r.core.refresh().thermal_mode_state,
+            ThermalModeState::Known(ThermalMode::Manual)
+        );
+        assert_eq!(
+            r.core.orchestrator_mut().curve_restore_mode(),
+            Some(ThermalMode::Balanced)
+        );
     }
 
     #[test]
@@ -1709,6 +1902,7 @@ mod tests {
             let status = r.core.refresh().control;
             assert!(status.settings_problem.is_some());
             assert!(!status.intent_active);
+            assert!(r.core.refresh().audit.is_empty());
         }
     }
 

@@ -128,6 +128,22 @@ saved service settings**, equivalent to `--uninstall-service --purge`. See the
 [installation guide](packaging/linux/INSTALL.txt) for cleanup details and kernel
 driver prerequisites.
 
+### Saved thermal preset
+
+Selecting a firmware preset such as Cool or Quiet saves the accepted choice in
+the background service. The service restores it when it starts, before the GUI
+opens. Failed requests preserve the previous choice. Manual fan control and
+G-Mode are transient and clear automatic preset restoration; custom fan curves
+have their own startup preference and take precedence when enabled.
+
+A fresh installation makes no preset change until you select one. After upgrading
+from a version that did not save presets, select your preferred preset once.
+Settings save failures appear in the GUI's service details.
+
+Desktop power managers can also select firmware profiles and overwrite AWCC's
+restored choice at login or when power sources change. Configure one owner of
+firmware thermal profiles; see [power management integration](packaging/linux/INSTALL.txt).
+
 For development builds, the Actions run has a separately named **`.AppImage`**
 artifact and a complete **`awcc-rs-dist-…`** bundle. Use the download links in the
 run summary; on older builds the AppImage is inside **`packages-ubuntu-…`**.

@@ -1523,6 +1523,7 @@ mod tests {
     use super::*;
     use crate::ThermalOrchestrator;
     use crate::daemon::{Daemon, DaemonError, DaemonOptions};
+    use awcc_core::ThermalModeState;
     use std::sync::Mutex;
     use std::thread::JoinHandle;
 
@@ -2167,6 +2168,47 @@ mod tests {
         );
         let _ = bad;
         d.finish();
+    }
+
+    #[test]
+    fn selected_preset_is_saved_by_the_daemon_and_restored_before_a_client_connects() {
+        for mode in [ThermalMode::Cool, ThermalMode::Quiet] {
+            let dir = base_dir(&format!("persist-preset-{}", mode.cli_code()));
+            for restart in [false, true] {
+                let opts = options(&dir, Arc::new(AllowAll));
+                let socket = opts.socket_path.clone();
+                let daemon = Daemon::start(opts, |opts| {
+                    let mut orch = sim(opts)?;
+                    if restart {
+                        orch.execute(crate::ServiceCommand::SetThermalMode(
+                            ThermalMode::FullSpeed,
+                        ));
+                    }
+                    Ok(orch)
+                })
+                .unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let s2 = Arc::clone(&stop);
+                let join = std::thread::spawn(move || daemon.run(&s2));
+                let client = DaemonClient::new(&socket, "preset-test", "1");
+                if restart {
+                    let view = client.snapshot(Duration::from_secs(1)).unwrap();
+                    assert_eq!(view.thermal_mode_state, ThermalModeState::Known(mode));
+                    assert!(matches!(
+                        view.lifecycle,
+                        OperationLifecycle::Confirmed { .. }
+                    ));
+                    assert!(view.control.failure_reason.is_none());
+                } else {
+                    client.execute(Op::SetThermalMode { mode }).unwrap();
+                }
+                drop(client);
+                stop.store(true, Ordering::SeqCst);
+                let report = join.join().unwrap();
+                assert!(report.contains("settings saved"), "{report}");
+            }
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
