@@ -1,0 +1,27 @@
+[package]
+name = "awcc-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "awcc-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+awcc-build-info.workspace = true
+awcc-core.workspace = true
+awcc-diagnostics.workspace = true
+awcc-platform.workspace = true
+awcc-service.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

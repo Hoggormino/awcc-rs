@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Support & Diagnostic Guide (SUPPORT.md)
+    url: https://github.com/Hoggormino/awcc-rs/blob/main/SUPPORT.md
+    about: Supported platforms, installation formats, passive support-report export (awcc-cli diagnostics export), and launch-failure troubleshooting.
+  - name: Security Policy & Private Vulnerability Reporting (SECURITY.md)
+    url: https://github.com/Hoggormino/awcc-rs/blob/main/SECURITY.md
+    about: Please do not report security vulnerabilities in public issues. Follow SECURITY.md for private reporting instructions.

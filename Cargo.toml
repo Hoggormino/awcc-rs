@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/awcc-build-info",
+    "crates/awcc-core",
+    "crates/awcc-diagnostics",
+    "crates/awcc-platform",
+    "crates/awcc-service",
+    "crates/awcc-gui",
+    "crates/awcc-cli",
+]
+
+[workspace.package]
+version = "0.1.5"
+edition = "2024"
+rust-version = "1.92"
+license = "BSD-2-Clause"
+authors = ["AWCC Linux Contributors"]
+repository = "https://github.com/Hoggormino/awcc-rs"
+description = "Unofficial Alienware Command Center for Linux (Rust + Slint Material 3)"
+
+[workspace.dependencies]
+awcc-build-info = { path = "crates/awcc-build-info" }
+awcc-core = { path = "crates/awcc-core" }
+awcc-diagnostics = { path = "crates/awcc-diagnostics" }
+awcc-platform = { path = "crates/awcc-platform" }
+awcc-service = { path = "crates/awcc-service" }
+anyhow = "1.0"
+png = "0.17"
+rusb = "0.9.4"
+rustix = { version = "1", default-features = false, features = ["std", "fs", "net", "process", "thread"] }
+signal-hook = { version = "0.3", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+slint = { version = "1.18.1", default-features = true, features = ["renderer-software"] }
+slint-build = "1.18.1"
+i-slint-backend-testing = "1.18.1"
+thiserror = "2.0"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry", "smallvec"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"

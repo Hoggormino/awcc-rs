@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Remove
+Type = Package
+Target = awcc-rs
+
+[Action]
+Description = Stopping the AWCC service before removing its files...
+When = PreTransaction
+Exec = /usr/share/libalpm/scripts/awcc-rs-pre-remove
+AbortOnFail

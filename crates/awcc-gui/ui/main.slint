@@ -1,0 +1,2176 @@
+// SPDX-License-Identifier: BSD-2-Clause
+// AWCC Linux — Slint Material 3 (@material 1.1.0) Desktop UI
+
+import { Palette, ListView, ScrollView } from "std-widgets.slint";
+import {
+    MaterialWindow,
+    NavigationRail,
+    NavigationItem,
+    ElevatedCard,
+    FilledCard,
+    OutlinedCard,
+    InputChip,
+    SegmentedButton,
+    Switch,
+    Slider,
+    FilledButton,
+    TonalButton,
+    OutlineButton,
+    LinearProgressIndicator,
+    HorizontalDivider,
+    MaterialText,
+    MaterialPalette,
+    MaterialTypography,
+    MaterialStyleMetrics
+} from "@material";
+import { FanCurveEditor } from "fan-curve.slint";
+
+export struct AuditRow {
+    seq_num: int,
+    seq_text: string,
+    command: string,
+    outcome: string,
+    detail: string,
+    succeeded: bool,
+}
+
+component SettingsScrollView inherits ScrollView {
+    content-width: self.visible-width;
+    horizontal-scrollbar-policy: always-off;
+
+    VerticalLayout {
+        alignment: start;
+        spacing: 10px;
+        @children
+    }
+}
+
+export component MainWindow inherits MaterialWindow {
+    title: "Alienware Command Center — Linux";
+    preferred-width: 1120px;
+    preferred-height: 720px;
+    min-width: 880px;
+    min-height: 620px;
+
+    // Navigation & simulation properties
+    in-out property <int> active-nav-index: 0;
+    in-out property <int> scenario-index: 0;
+    in property <bool> is-simulated: false;
+    in property <string> device-name: "Alienware m15 R6";
+    in property <string> acpi-path: "\\_SB.AMWW.WMAX";
+    in property <string> smbios-id: "0x0A86";
+    in property <string> db-source: "compiled-in DEFAULT_DATABASE_JSON";
+    in property <int> write-count: 0;
+
+    // Auto-refresh & Settings properties
+    in-out property <bool> auto-refresh-enabled: true;
+    in-out property <int> refresh-interval-ms: 1000;
+    in property <string> refresh-interval-label: "1.0s";
+
+    // Lifecycle feedback banner
+    in property <string> lifecycle-badge: "READY";
+    in property <string> lifecycle-message: "Passive observation active — 0 unsolicited hardware writes.";
+    in property <bool> lifecycle-is-error: false;
+
+    // Active thermal mode & G-Mode state
+    in property <string> active-mode-label: "Balanced";
+    in property <string> active-mode-code-label: "USTT 0xA0";
+    in property <bool> mode-is-unknown: false;
+    in property <string> selected-mode-key: "Balanced";
+    in-out property <bool> gmode-active: false;
+    in property <string> pre-gmode-restore-label: "Balanced";
+
+    // Telemetry properties
+    in property <string> cpu-temp-text: "--";
+    in property <string> gpu-temp-text: "--";
+    in property <string> cpu-rpm-text: "--";
+    in property <string> gpu-rpm-text: "--";
+    in property <string> cpu-boost-text: "--";
+    in property <string> gpu-boost-text: "--";
+    in property <float> cpu-boost-progress: 0;
+    in property <float> gpu-boost-progress: 0;
+    in property <bool> sensors-available: false;
+    in-out property <bool> cpu-turbo-enabled: false;
+    // `false` until a turbo query succeeded: the switch is disabled and `cpu-turbo-note` says why.
+    in property <bool> cpu-turbo-known: false;
+    in property <string> cpu-turbo-note: "state not yet observed";
+
+    // CPU TCC Offset (0..15°C reduction from TjMax)
+    in property <string> tcc-offset-text: "--";
+    in-out property <float> staged-tcc-offset: 0;
+    in-out property <bool> tcc-dirty: false;
+
+    // Staged Manual Fan Boost (zero hardware writes until Apply is clicked)
+    in-out property <float> staged-cpu-boost: 28;
+    in-out property <float> staged-gpu-boost: 24;
+    in-out property <bool> boost-dirty: false;
+
+    // Custom 4-Point Fan Curve Editor (45°C, 60°C, 75°C, 85°C)
+    in property <bool> fan-curve-active: false;
+    in-out property <int> staged-curve-p1: 0;
+    in-out property <int> staged-curve-p2: 35;
+    in-out property <int> staged-curve-p3: 70;
+    in-out property <int> staged-curve-p4: 100;
+    in-out property <float> staged-curve-hysteresis: 3;
+    in-out property <bool> curve-dirty: false;
+
+    // 7-Zone AlienFX Lighting properties
+    in-out property <int> staged-zone-group-index: 0; // 0=All, 1=Keyboard, 2=Logo, 3=Tron, 4=Power
+    in-out property <int> staged-effect-index: 0;     // 0=Static, 1=Breathe, 2=Spectrum, 3=Wave, 4=Rainbow, 5=BackAndForth, 6=DefaultBlue
+    in-out property <int> staged-color-preset-index: 0;
+    in-out property <float> staged-lighting-duration-ms: 600;
+    in-out property <float> staged-lighting-brightness: 100;
+    in-out property <bool> staged-lighting-persist-boot: true;
+    in-out property <bool> lighting-stealth-enabled: false;
+    in property <string> active-lighting-summary: "Lighting state not yet reported";
+    in property <color> zone-logo-color: #00f0ff;
+    in property <color> zone-tron-color: #00f0ff;
+    in property <color> zone-kbd-color: #00f0ff;
+    in property <color> zone-power-color: #00f0ff;
+    in property <string> zone-logo-provenance: "Assumed default";
+    in property <string> zone-tron-provenance: "Assumed default";
+    in property <string> zone-kbd-provenance: "Assumed default";
+    in property <string> zone-power-provenance: "Assumed default";
+    in property <string> elc-firmware-summary: "ELC controller diagnostics: not yet observed";
+    // Why any telemetry value is unavailable or stale (empty when every reading is current).
+    in property <string> telemetry-notice: "";
+    in property <string> build-summary: "";
+
+    // Hardware Command Log & Diagnostics (sequence-aware, bounded retention)
+    in property <[AuditRow]> audit-rows: [];
+    in property <int> audit-latest-seq: 0;
+    in property <int> audit-retained-count: 0;
+    in property <int> audit-evicted-count: 0;
+    in property <int> audit-cleared-count: 0;
+    in property <string> audit-counter-summary: "Zero unsolicited writes since startup";
+    in property <string> audit-eviction-notice: "";
+    in-out property <int> selected-audit-seq: 0;
+    in-out property <string> selected-audit-detail: "";
+    in-out property <bool> diagnostic-recording-active: false;
+    in-out property <string> diagnostic-recording-label: "Start DEBUG Recording";
+    in-out property <string> diagnostics-status-text: "";
+    in-out property <string> last-copied-text: "";
+    in-out property <string> last-export-path: "";
+    in-out property <bool> diagnostics-busy: false;
+    in-out property <bool> clipboard-fallback-visible: false;
+    in-out property <bool> trace-raw-usb: false;
+
+    // Background service (installation, ownership, status). All values are reported facts:
+    // nothing here claims installed/running/active before the operation completed.
+    in property <string> service-state-label: "Checking…";
+    in property <string> service-state-detail: "";
+    in property <string> service-managed-by: "";
+    in property <string> service-curve-summary: "";
+    in property <string> service-version-line: "";
+    in property <bool> service-state-is-problem: false;
+    in property <bool> service-can-install: false;
+    in property <bool> service-can-setup: false;
+    in property <bool> service-can-update: false;
+    in property <bool> service-can-remove: false;
+    in property <bool> service-busy: false;
+    in property <string> service-progress: "";
+    in property <string> service-result: "";
+    in property <bool> service-result-is-error: false;
+    in property <bool> service-restore-available: false;
+    in-out property <bool> service-restore-at-startup: false;
+    in-out property <bool> service-confirming-install: false;
+    in-out property <bool> service-confirming-remove: false;
+    in-out property <bool> service-remove-purge: false;
+
+    // Callbacks to Rust service controller
+    callback request-refresh();
+    callback select-thermal-mode(string);
+    callback request-toggle-gmode();
+    callback stage-cpu-boost(float);
+    callback stage-gpu-boost(float);
+    callback apply-staged-boost();
+    callback reset-staged-boost();
+    callback toggle-cpu-turbo(bool);
+    callback stage-tcc-offset(float);
+    callback apply-staged-tcc();
+    callback stage-fan-curve(int, int, int, int);
+    callback apply-fan-curve();
+    callback stop-fan-curve();
+    callback apply-staged-lighting();
+    callback apply-staged-brightness();
+    callback toggle-stealth-mode(bool);
+    callback program-power-led-states();
+    callback select-sim-scenario(int);
+    callback toggle-auto-refresh(bool);
+    callback select-refresh-interval(int);
+    callback copy-diagnostic-summary();
+    callback export-support-report();
+    callback toggle-diagnostic-recording();
+    callback clear-audit-history();
+    callback select-audit-row(int);
+    callback copy-selected-audit-row();
+    callback refresh-service-status();
+    callback install-service();
+    callback setup-service();
+    callback update-service();
+    callback uninstall-service();
+    callback set-restore-at-startup(bool);
+
+    init => {
+        Palette.color-scheme = ColorScheme.dark;
+    }
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        // Left Material 3 NavigationRail
+        NavigationRail {
+            current_index <=> root.active-nav-index;
+            alignment: start;
+            items: [
+                {
+                    icon: @image-url("icons/thermals.svg"),
+                    selected_icon: @image-url("icons/thermals.svg"),
+                    text: "Thermals",
+                    show_badge: root.lifecycle-is-error,
+                    badge: root.lifecycle-is-error ? "!" : ""
+                },
+                {
+                    icon: @image-url("icons/lighting.svg"),
+                    selected_icon: @image-url("icons/lighting.svg"),
+                    text: "Lighting",
+                    show_badge: root.lighting-stealth-enabled,
+                    badge: root.lighting-stealth-enabled ? "OFF" : ""
+                },
+                {
+                    icon: @image-url("icons/diagnostics.svg"),
+                    selected_icon: @image-url("icons/diagnostics.svg"),
+                    text: "Log",
+                    show_badge: root.write-count > 0,
+                    badge: root.write-count > 0 ? "\{root.write-count}" : ""
+                },
+                {
+                    icon: @image-url("icons/settings.svg"),
+                    selected_icon: @image-url("icons/settings.svg"),
+                    text: "Settings",
+                    show_badge: false,
+                    badge: ""
+                },
+            ];
+        }
+
+        // Subtle vertical divider between rail and workspace (2px so 80+2=82px keeps 2-column splits even)
+        Rectangle {
+            width: 2px;
+            background: MaterialPalette.outline_variant;
+        }
+
+        // Main Content Column
+        VerticalLayout {
+            horizontal-stretch: 1;
+            padding: 14px;
+            spacing: 10px;
+
+            // 1. Persistent Top Hardware Header Banner
+            Rectangle {
+                z: 100;
+                height: 50px;
+                border-radius: 12px;
+                background: MaterialPalette.surface_container_high;
+                border-width: 1px;
+                border-color: MaterialPalette.outline_variant;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 10px;
+                    alignment: space-between;
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        alignment: start;
+
+                        // Prominent Hardware / Simulation Badge
+                        Rectangle {
+                            height: 26px;
+                            width: 132px;
+                            y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                            border-radius: 6px;
+                            background: root.is-simulated ? MaterialPalette.tertiary_container : MaterialPalette.primary_container;
+
+                            MaterialText {
+                                width: 100%;
+                                height: 100%;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                text: root.is-simulated ? "SIMULATED HW" : "LIVE BACKEND";
+                                style: MaterialTypography.label_medium_prominent;
+                                color: root.is-simulated ? MaterialPalette.on_tertiary_container : MaterialPalette.on_primary_container;
+                            }
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+
+                            MaterialText {
+                                text: root.device-name;
+                                style: MaterialTypography.title_small;
+                                color: MaterialPalette.on_surface;
+                            }
+
+                            MaterialText {
+                                text: root.auto-refresh-enabled
+                                    ? "Active Profile: \{root.active-mode-label}  ·  Auto-Refresh: \{root.refresh-interval-label}  ·  Logged Commands: \{root.write-count}"
+                                    : "Active Profile: \{root.active-mode-label}  ·  Auto-Refresh: Paused  ·  Logged Commands: \{root.write-count}";
+                                style: MaterialTypography.body_small;
+                                color: MaterialPalette.on_surface_variant;
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+
+                        TonalButton {
+                            height: 36px;
+                            y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                            icon: @image-url("icons/refresh.svg");
+                            text: "Refresh";
+                            tooltip: "Passively query thermal mode and telemetry (0 hardware writes)";
+                            clicked => {
+                                root.request-refresh();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Operation Lifecycle Status (+ Simulator Fault-Injection Bar when --sim is active)
+            HorizontalLayout {
+                z: 80;
+                spacing: 10px;
+                height: 38px;
+
+                if root.is-simulated : SegmentedButton {
+                    horizontal-stretch: 0;
+                    current_index <=> root.scenario-index;
+                    items: [
+                        { icon: @image-url(""), text: "Normal" },
+                        { icon: @image-url(""), text: "Rollback" },
+                        { icon: @image-url(""), text: "Unmapped" },
+                        { icon: @image-url(""), text: "No Sensors" },
+                    ];
+                    index_changed(idx) => {
+                        root.select-sim-scenario(idx);
+                    }
+                }
+
+                // Lifecycle status pill
+                Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: 10px;
+                    background: root.lifecycle-is-error ? MaterialPalette.error_container : MaterialPalette.secondary_container;
+                    border-width: 1px;
+                    border-color: root.lifecycle-is-error ? MaterialPalette.error : MaterialPalette.outline_variant;
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 8px;
+
+                        Rectangle {
+                            width: 84px;
+                            height: 22px;
+                            y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                            border-radius: 4px;
+                            background: root.lifecycle-is-error ? MaterialPalette.error : MaterialPalette.primary;
+
+                            MaterialText {
+                                width: 100%;
+                                height: 100%;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                text: root.lifecycle-badge;
+                                style: MaterialTypography.label_small;
+                                color: root.lifecycle-is-error ? MaterialPalette.on_error : MaterialPalette.on_primary;
+                            }
+                        }
+
+                        MaterialText {
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                            text: root.lifecycle-message;
+                            style: MaterialTypography.body_small;
+                            color: root.lifecycle-is-error ? MaterialPalette.on_error_container : MaterialPalette.on_secondary_container;
+                            overflow: elide;
+                        }
+                    }
+                }
+                if !root.is-simulated && (root.service-can-install || root.service-can-setup) : FilledButton {
+                    text: "Set up service";
+                    enabled: !root.service-busy;
+                    tooltip: "Enable background hardware control for your account with administrator approval";
+                    clicked => {
+                        root.active-nav-index = 3;
+                        if root.service-can-setup {
+                            root.setup-service();
+                        } else {
+                            root.service-confirming-install = true;
+                            root.service-confirming-remove = false;
+                        }
+                    }
+                }
+            }
+
+            // 3. Screen Body (Thermals = 0, Lighting = 1, Log = 2, Settings = 3)
+            if root.active-nav-index == 0 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 8px;
+
+                // Section A: Thermal Profile & G-Mode (GameShift) Control Card
+                FilledCard {
+                    z: 50;
+                    VerticalLayout {
+                        alignment: start;
+                        padding: 10px;
+                        spacing: 8px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
+                            spacing: 10px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+
+                                    MaterialText {
+                                        text: "Thermal Profile & G-Mode";
+                                        style: MaterialTypography.title_medium;
+                                        color: MaterialPalette.on_surface;
+                                    }
+
+                                    Rectangle {
+                                        height: 22px;
+                                        width: 124px;
+                                        border-radius: 6px;
+                                        background: root.mode-is-unknown ? MaterialPalette.error_container : (root.gmode-active ? MaterialPalette.primary : MaterialPalette.primary_container);
+
+                                        MaterialText {
+                                            width: 100%;
+                                            height: 100%;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            text: root.active-mode-label;
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: root.mode-is-unknown ? MaterialPalette.on_error_container : (root.gmode-active ? MaterialPalette.on_primary : MaterialPalette.on_primary_container);
+                                        }
+                                    }
+                                }
+
+                                MaterialText {
+                                    text: root.mode-is-unknown
+                                        ? "Unrecognized thermal profile reported by firmware — distinct from Manual mode."
+                                        : "G-Mode engages maximum fan speed and power limits; exiting restores \{root.pre-gmode-restore-label}.";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                    overflow: elide;
+                                }
+                            }
+
+                            // G-Mode Quick Action (explicitly sized Switch + TonalButton)
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: end;
+
+                                Switch {
+                                    width: 52px;
+                                    height: 32px;
+                                    y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                    checked <=> root.gmode-active;
+                                    tooltip: "Toggle G-Mode (GameShift)";
+                                    checked_state_changed(_) => {
+                                        root.request-toggle-gmode();
+                                    }
+                                }
+
+                                TonalButton {
+                                    height: 36px;
+                                    y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                    icon: @image-url("icons/bolt.svg");
+                                    text: root.gmode-active ? "Exit G-Mode" : "Engage G-Mode";
+                                    clicked => {
+                                        root.request-toggle-gmode();
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalDivider {}
+
+                        // Supported Thermal Profile InputChips (fixed 32px height row)
+                        HorizontalLayout {
+                            height: 32px;
+                            spacing: 8px;
+                            alignment: start;
+
+                            InputChip {
+                                enabled: true;
+                                text: "Quiet";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "Quiet";
+                                clicked => { root.select-thermal-mode("Quiet"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "Cool";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "Cool";
+                                clicked => { root.select-thermal-mode("Cool"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "Balanced";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "Balanced";
+                                clicked => { root.select-thermal-mode("Balanced"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "Performance";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "Performance";
+                                clicked => { root.select-thermal-mode("Performance"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "Full Speed";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "FullSpeed";
+                                clicked => { root.select-thermal-mode("FullSpeed"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "Manual";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "Manual";
+                                clicked => { root.select-thermal-mode("Manual"); }
+                            }
+                            InputChip {
+                                enabled: true;
+                                text: "G-Mode";
+                                checked: !root.mode-is-unknown && root.selected-mode-key == "GMode";
+                                clicked => { root.select-thermal-mode("GMode"); }
+                            }
+                        }
+                    }
+                }
+
+                // Section B: 2-Column Live CPU & GPU Telemetry Cards
+                HorizontalLayout {
+                    spacing: 10px;
+
+                    // CPU Telemetry & Turbo Card
+                    ElevatedCard {
+                        horizontal-stretch: 1;
+
+                        VerticalLayout {
+                            alignment: start;
+                            padding: 10px;
+                            spacing: 6px;
+
+                            HorizontalLayout {
+                                alignment: space-between;
+
+                                MaterialText {
+                                    text: "CPU Telemetry & Turbo Boost";
+                                    style: MaterialTypography.title_small;
+                                    color: MaterialPalette.on_surface;
+                                }
+
+                                Rectangle {
+                                    height: 20px;
+                                    width: 92px;
+                                    border-radius: 4px;
+                                    background: root.sensors-available ? MaterialPalette.secondary_container : MaterialPalette.error_container;
+
+                                    MaterialText {
+                                        width: 100%;
+                                        height: 100%;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        text: root.sensors-available ? "SENSOR LIVE" : "UNAVAILABLE";
+                                        style: MaterialTypography.label_small;
+                                        color: root.sensors-available ? MaterialPalette.on_secondary_container : MaterialPalette.on_error_container;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    MaterialText {
+                                        text: "Core Temp";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.cpu-temp-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    MaterialText {
+                                        text: "Fan Speed";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.cpu-rpm-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    MaterialText {
+                                        text: "Boost";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.cpu-boost-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.primary;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    MaterialText {
+                                        text: "TCC Offset";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.tcc-offset-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.tertiary;
+                                    }
+                                }
+                            }
+
+                            LinearProgressIndicator {
+                                progress: root.cpu-boost-progress;
+                                indeterminate: false;
+                            }
+
+                            HorizontalLayout {
+                                height: 34px;
+                                alignment: space-between;
+
+                                MaterialText {
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                    text: root.cpu-turbo-note == "" ? "CPU Turbo Boost" : "CPU Turbo Boost — \{root.cpu-turbo-note}";
+                                    style: MaterialTypography.body_small;
+                                    color: root.cpu-turbo-known ? MaterialPalette.on_surface_variant : MaterialPalette.error;
+                                    overflow: elide;
+                                }
+
+                                Switch {
+                                    width: 52px;
+                                    height: 32px;
+                                    y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                    enabled: root.cpu-turbo-known;
+                                    checked <=> root.cpu-turbo-enabled;
+                                    checked_state_changed(enabled) => {
+                                        root.toggle-cpu-turbo(enabled);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // GPU Telemetry + CPU TCC Offset Staged Control Card
+                    ElevatedCard {
+                        horizontal-stretch: 1;
+
+                        VerticalLayout {
+                            alignment: start;
+                            padding: 10px;
+                            spacing: 6px;
+
+                            HorizontalLayout {
+                                alignment: space-between;
+
+                                MaterialText {
+                                    text: "GPU Telemetry & CPU Temp Limit";
+                                    style: MaterialTypography.title_small;
+                                    color: MaterialPalette.on_surface;
+                                }
+
+                                Rectangle {
+                                    height: 20px;
+                                    width: 92px;
+                                    border-radius: 4px;
+                                    background: root.sensors-available ? MaterialPalette.secondary_container : MaterialPalette.error_container;
+
+                                    MaterialText {
+                                        width: 100%;
+                                        height: 100%;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        text: root.sensors-available ? "SENSOR LIVE" : "UNAVAILABLE";
+                                        style: MaterialTypography.label_small;
+                                        color: root.sensors-available ? MaterialPalette.on_secondary_container : MaterialPalette.on_error_container;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    MaterialText {
+                                        text: "Core Temp";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.gpu-temp-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    MaterialText {
+                                        text: "Fan Speed";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.gpu-rpm-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    MaterialText {
+                                        text: "Boost";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                    MaterialText {
+                                        text: root.gpu-boost-text;
+                                        style: MaterialTypography.title_large;
+                                        color: MaterialPalette.primary;
+                                    }
+                                }
+                            }
+
+                            LinearProgressIndicator {
+                                progress: root.gpu-boost-progress;
+                                indeterminate: false;
+                            }
+
+                            // Staged CPU TCC Offset (0..15°C) slider + Apply button
+                            HorizontalLayout {
+                                height: 34px;
+                                spacing: 8px;
+
+                                MaterialText {
+                                    vertical-alignment: center;
+                                    text: "TCC Limit: \{100 - round(root.staged-tcc-offset)}°C (-\{round(root.staged-tcc-offset)}°C)";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+
+                                Slider {
+                                    horizontal-stretch: 1;
+                                    min-width: 90px;
+                                    height: 28px;
+                                    y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                    enabled: true;
+                                    minimum: 0;
+                                    maximum: 15;
+                                    value <=> root.staged-tcc-offset;
+                                    value_changed(v) => {
+                                        root.stage-tcc-offset(v);
+                                    }
+                                }
+
+                                TonalButton {
+                                    height: 34px;
+                                    text: "Set Limit";
+                                    clicked => {
+                                        root.apply-staged-tcc();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Section C & D: 2-Column Side-by-Side Manual Fan Boost & Custom Fan Curve Cards
+                HorizontalLayout {
+                    vertical-stretch: 1;
+                    spacing: 10px;
+
+                    // Left Column: Staged Manual Fan Boost Override Card
+                    OutlinedCard {
+                        horizontal-stretch: 1;
+
+                        VerticalLayout {
+                            alignment: space-between;
+                            padding: 10px;
+                            spacing: 4px;
+
+                            HorizontalLayout {
+                                alignment: space-between;
+                                spacing: 8px;
+
+                                MaterialText {
+                                    vertical-alignment: center;
+                                    text: "Staged Manual Fan Boost";
+                                    style: MaterialTypography.title_small;
+                                    color: MaterialPalette.on_surface;
+                                }
+
+                                Rectangle {
+                                    height: 20px;
+                                    width: 122px;
+                                    border-radius: 4px;
+                                    background: root.boost-dirty ? MaterialPalette.tertiary_container : MaterialPalette.surface_container_highest;
+
+                                    MaterialText {
+                                        width: 100%;
+                                        height: 100%;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        text: root.boost-dirty ? "UNSAVED CHANGES" : "IN SYNC WITH HW";
+                                        style: MaterialTypography.label_small;
+                                        color: root.boost-dirty ? MaterialPalette.on_tertiary_container : MaterialPalette.on_surface_variant;
+                                    }
+                                }
+                            }
+
+                            MaterialText {
+                                text: "Adjust sliders to stage fan speed; click Apply Boost to activate Manual mode.";
+                                style: MaterialTypography.body_small;
+                                color: MaterialPalette.on_surface_variant;
+                                overflow: elide;
+                            }
+
+                            VerticalLayout {
+                                spacing: 2px;
+
+                                HorizontalLayout {
+                                    alignment: space-between;
+                                    MaterialText {
+                                        text: "CPU Fan Boost";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                    MaterialText {
+                                        text: "\{round(root.staged-cpu-boost)}% (Current: \{root.cpu-boost-text})";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.primary;
+                                    }
+                                }
+
+                                Slider {
+                                    height: 24px;
+                                    enabled: true;
+                                    minimum: 0;
+                                    maximum: 100;
+                                    value <=> root.staged-cpu-boost;
+                                    value_changed(v) => {
+                                        root.stage-cpu-boost(v);
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                spacing: 2px;
+
+                                HorizontalLayout {
+                                    alignment: space-between;
+                                    MaterialText {
+                                        text: "GPU Fan Boost";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                    MaterialText {
+                                        text: "\{round(root.staged-gpu-boost)}% (Current: \{root.gpu-boost-text})";
+                                        style: MaterialTypography.label_medium;
+                                        color: MaterialPalette.primary;
+                                    }
+                                }
+
+                                Slider {
+                                    height: 24px;
+                                    enabled: true;
+                                    minimum: 0;
+                                    maximum: 100;
+                                    value <=> root.staged-gpu-boost;
+                                    value_changed(v) => {
+                                        root.stage-gpu-boost(v);
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                height: 36px;
+                                spacing: 8px;
+                                alignment: end;
+
+                                OutlineButton {
+                                    height: 36px;
+                                    text: "Reset";
+                                    enabled: root.boost-dirty;
+                                    clicked => {
+                                        root.reset-staged-boost();
+                                    }
+                                }
+
+                                FilledButton {
+                                    height: 36px;
+                                    text: "Apply Boost";
+                                    enabled: true;
+                                    clicked => {
+                                        root.apply-staged-boost();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Right Column: Custom 4-Point Temperature-to-Fan-Boost Curve Editor
+                    OutlinedCard {
+                        horizontal-stretch: 1;
+
+                        VerticalLayout {
+                            alignment: space-between;
+                            padding: 10px;
+                            spacing: 4px;
+
+                            HorizontalLayout {
+                                alignment: space-between;
+                                spacing: 8px;
+
+                                MaterialText {
+                                    vertical-alignment: center;
+                                    text: "Custom Fan Curve";
+                                    style: MaterialTypography.title_small;
+                                    color: MaterialPalette.on_surface;
+                                }
+
+                                Rectangle {
+                                    height: 20px;
+                                    width: 112px;
+                                    border-radius: 4px;
+                                    background: root.fan-curve-active ? MaterialPalette.primary_container : MaterialPalette.surface_container_highest;
+
+                                    MaterialText {
+                                        width: 100%;
+                                        height: 100%;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        text: root.fan-curve-active ? "CURVE ACTIVE" : "CURVE STOPPED";
+                                        style: MaterialTypography.label_small;
+                                        color: root.fan-curve-active ? MaterialPalette.on_primary_container : MaterialPalette.on_surface_variant;
+                                    }
+                                }
+                            }
+
+                            MaterialText {
+                                text: "4-point linear (45–85°C, \{round(root.staged-curve-hysteresis)}°C hyst.) · Drag points vertically";
+                                style: MaterialTypography.body_small;
+                                color: MaterialPalette.on_surface_variant;
+                                overflow: elide;
+                            }
+
+                            FanCurveEditor {
+                                horizontal-stretch: 1;
+                                vertical-stretch: 1;
+                                p45 <=> root.staged-curve-p1;
+                                p60 <=> root.staged-curve-p2;
+                                p75 <=> root.staged-curve-p3;
+                                p85 <=> root.staged-curve-p4;
+                                accent: MaterialPalette.primary;
+                                surface: MaterialPalette.surface;
+                                secondary-text: MaterialPalette.on_surface_variant;
+                                grid-color: MaterialPalette.outline_variant;
+
+                                edit-finished => {
+                                    root.stage-fan-curve(
+                                        self.p45,
+                                        self.p60,
+                                        self.p75,
+                                        self.p85
+                                    );
+                                }
+                            }
+
+                            HorizontalLayout {
+                                height: 36px;
+                                spacing: 8px;
+                                alignment: end;
+
+                                OutlineButton {
+                                    height: 36px;
+                                    text: "Stop Curve";
+                                    enabled: root.fan-curve-active;
+                                    clicked => {
+                                        root.stop-fan-curve();
+                                    }
+                                }
+
+                                FilledButton {
+                                    height: 36px;
+                                    text: "Apply Curve";
+                                    clicked => {
+                                        root.apply-fan-curve();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Screen 1: Interactive AlienFX Lighting & Chassis Map
+            if root.active-nav-index == 1 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 10px;
+
+                // Section A: Interactive Chassis & 4-Zone Keyboard Map
+                FilledCard {
+                    VerticalLayout {
+                        alignment: start;
+                        padding: 12px;
+                        spacing: 10px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
+                            spacing: 10px;
+
+                            VerticalLayout {
+                                spacing: 2px;
+                                MaterialText {
+                                    text: "AlienFX Chassis & 4-Zone Keyboard Lighting";
+                                    style: MaterialTypography.title_medium;
+                                    color: MaterialPalette.on_surface;
+                                }
+                                MaterialText {
+                                    text: root.active-lighting-summary;
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+                            }
+
+                            Rectangle {
+                                height: 24px;
+                                width: 136px;
+                                border-radius: 6px;
+                                background: root.lighting-stealth-enabled ? MaterialPalette.error_container : MaterialPalette.primary_container;
+
+                                MaterialText {
+                                    width: 100%;
+                                    height: 100%;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    text: root.lighting-stealth-enabled ? "STEALTH (DARK)" : "LIGHTS ACTIVE";
+                                    style: MaterialTypography.label_medium_prominent;
+                                    color: root.lighting-stealth-enabled ? MaterialPalette.on_error_container : MaterialPalette.on_primary_container;
+                                }
+                            }
+                        }
+
+                        // Visual Chassis Zone Map: Top Row (Stadium Top, Alienhead Logo, Stadium Bottom, Power Button)
+                        HorizontalLayout {
+                            spacing: 8px;
+                            height: 48px;
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: MaterialPalette.surface_container_highest;
+                                border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 3 ? 2px : 1px;
+                                border-color: root.zone-tron-color;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 14px;
+                                        height: 14px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        border-radius: 7px;
+                                        background: root.zone-tron-color;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 1px;
+                                        MaterialText {
+                                            text: "Stadium Top";
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: MaterialPalette.on_surface;
+                                            overflow: elide;
+                                        }
+                                        MaterialText {
+                                            text: root.zone-tron-provenance;
+                                            style: MaterialTypography.label_small;
+                                            color: MaterialPalette.on_surface_variant;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: MaterialPalette.surface_container_highest;
+                                border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 2 ? 2px : 1px;
+                                border-color: root.zone-logo-color;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 14px;
+                                        height: 14px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        border-radius: 7px;
+                                        background: root.zone-logo-color;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 1px;
+                                        MaterialText {
+                                            text: "Alienhead Logo";
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: MaterialPalette.on_surface;
+                                            overflow: elide;
+                                        }
+                                        MaterialText {
+                                            text: root.zone-logo-provenance;
+                                            style: MaterialTypography.label_small;
+                                            color: MaterialPalette.on_surface_variant;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: MaterialPalette.surface_container_highest;
+                                border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 3 ? 2px : 1px;
+                                border-color: root.zone-tron-color;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 14px;
+                                        height: 14px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        border-radius: 7px;
+                                        background: root.zone-tron-color;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 1px;
+                                        MaterialText {
+                                            text: "Stadium Bottom";
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: MaterialPalette.on_surface;
+                                            overflow: elide;
+                                        }
+                                        MaterialText {
+                                            text: root.zone-tron-provenance;
+                                            style: MaterialTypography.label_small;
+                                            color: MaterialPalette.on_surface_variant;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: MaterialPalette.surface_container_highest;
+                                border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 4 ? 2px : 1px;
+                                border-color: root.zone-power-color;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 14px;
+                                        height: 14px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        border-radius: 7px;
+                                        background: root.zone-power-color;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 1px;
+                                        MaterialText {
+                                            text: "Power Button";
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: MaterialPalette.on_surface;
+                                            overflow: elide;
+                                        }
+                                        MaterialText {
+                                            text: root.zone-power-provenance;
+                                            style: MaterialTypography.label_small;
+                                            color: MaterialPalette.on_surface_variant;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Visual 4-Zone Keyboard Map
+                        HorizontalLayout {
+                            spacing: 8px;
+                            height: 52px;
+
+                            for zone_label in [
+                                "Keyboard Left",
+                                "Keyboard Center-L",
+                                "Keyboard Center-R",
+                                "Keyboard Right"
+                            ] : Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: MaterialPalette.surface_container_high;
+                                border-width: root.staged-zone-group-index == 0 || root.staged-zone-group-index == 1 ? 2px : 1px;
+                                border-color: root.zone-kbd-color;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 12px;
+                                        height: 24px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        border-radius: 4px;
+                                        background: root.zone-kbd-color;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 1px;
+                                        MaterialText {
+                                            text: zone_label;
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: MaterialPalette.on_surface;
+                                            overflow: elide;
+                                        }
+                                        MaterialText {
+                                            text: root.zone-kbd-provenance;
+                                            style: MaterialTypography.label_small;
+                                            color: MaterialPalette.on_surface_variant;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Section B: Zone Group, Effect Mode, Color Swatch, Speed & Brightness Controls
+                ElevatedCard {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        alignment: space-between;
+                        padding: 12px;
+                        spacing: 10px;
+
+                        // Row 1: Target Zone Group
+                        HorizontalLayout {
+                            spacing: 6px;
+                            height: 32px;
+                            alignment: start;
+
+                            MaterialText {
+                                width: 98px;
+                                vertical-alignment: center;
+                                text: "Target Zones:";
+                                style: MaterialTypography.label_large;
+                                color: MaterialPalette.on_surface;
+                            }
+
+                            InputChip {
+                                text: "All Zones";
+                                checked: root.staged-zone-group-index == 0;
+                                clicked => { root.staged-zone-group-index = 0; }
+                            }
+                            InputChip {
+                                text: "Keyboard";
+                                checked: root.staged-zone-group-index == 1;
+                                clicked => { root.staged-zone-group-index = 1; }
+                            }
+                            InputChip {
+                                text: "Alienhead Logo";
+                                checked: root.staged-zone-group-index == 2;
+                                clicked => { root.staged-zone-group-index = 2; }
+                            }
+                            InputChip {
+                                text: "Stadium Lights";
+                                checked: root.staged-zone-group-index == 3;
+                                clicked => { root.staged-zone-group-index = 3; }
+                            }
+                            InputChip {
+                                text: "Power Button";
+                                checked: root.staged-zone-group-index == 4;
+                                clicked => { root.staged-zone-group-index = 4; }
+                            }
+                        }
+
+                        // Row 2: Effect Mode
+                        HorizontalLayout {
+                            spacing: 6px;
+                            height: 32px;
+                            alignment: start;
+
+                            MaterialText {
+                                width: 98px;
+                                vertical-alignment: center;
+                                text: "Effect Mode:";
+                                style: MaterialTypography.label_large;
+                                color: MaterialPalette.on_surface;
+                            }
+
+                            InputChip {
+                                text: "Static";
+                                checked: root.staged-effect-index == 0;
+                                clicked => { root.staged-effect-index = 0; }
+                            }
+                            InputChip {
+                                text: "Breathe";
+                                checked: root.staged-effect-index == 1;
+                                clicked => { root.staged-effect-index = 1; }
+                            }
+                            InputChip {
+                                text: "Spectrum";
+                                checked: root.staged-effect-index == 2;
+                                clicked => { root.staged-effect-index = 2; }
+                            }
+                            InputChip {
+                                text: "Wave";
+                                checked: root.staged-effect-index == 3;
+                                clicked => { root.staged-effect-index = 3; }
+                            }
+                            InputChip {
+                                text: "Rainbow";
+                                checked: root.staged-effect-index == 4;
+                                clicked => { root.staged-effect-index = 4; }
+                            }
+                            InputChip {
+                                text: "Back & Forth";
+                                checked: root.staged-effect-index == 5;
+                                clicked => { root.staged-effect-index = 5; }
+                            }
+                            InputChip {
+                                text: "Default Blue";
+                                checked: root.staged-effect-index == 6;
+                                clicked => { root.staged-effect-index = 6; }
+                            }
+                        }
+
+                        // Row 3: Color Presets
+                        HorizontalLayout {
+                            spacing: 6px;
+                            height: 32px;
+                            alignment: start;
+
+                            MaterialText {
+                                width: 98px;
+                                vertical-alignment: center;
+                                text: "Color Swatch:";
+                                style: MaterialTypography.label_large;
+                                color: MaterialPalette.on_surface;
+                            }
+
+                            InputChip {
+                                text: "Alien Cyan";
+                                checked: root.staged-color-preset-index == 0;
+                                clicked => { root.staged-color-preset-index = 0; }
+                            }
+                            InputChip {
+                                text: "Nebula Purple";
+                                checked: root.staged-color-preset-index == 1;
+                                clicked => { root.staged-color-preset-index = 1; }
+                            }
+                            InputChip {
+                                text: "Plasma Green";
+                                checked: root.staged-color-preset-index == 2;
+                                clicked => { root.staged-color-preset-index = 2; }
+                            }
+                            InputChip {
+                                text: "Solar Amber";
+                                checked: root.staged-color-preset-index == 3;
+                                clicked => { root.staged-color-preset-index = 3; }
+                            }
+                            InputChip {
+                                text: "Crimson Red";
+                                checked: root.staged-color-preset-index == 4;
+                                clicked => { root.staged-color-preset-index = 4; }
+                            }
+                            InputChip {
+                                text: "Pure White";
+                                checked: root.staged-color-preset-index == 5;
+                                clicked => { root.staged-color-preset-index = 5; }
+                            }
+                        }
+
+                        HorizontalDivider {}
+
+                        // Row 4: Effect Speed + Hardware Brightness
+                        HorizontalLayout {
+                            spacing: 16px;
+
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 4px;
+
+                                HorizontalLayout {
+                                    alignment: space-between;
+                                    MaterialText {
+                                        text: "Animation Speed / Duration";
+                                        style: MaterialTypography.label_large;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                    MaterialText {
+                                        text: "\{round(root.staged-lighting-duration-ms)} ms";
+                                        style: MaterialTypography.label_large;
+                                        color: MaterialPalette.primary;
+                                    }
+                                }
+
+                                Slider {
+                                    height: 30px;
+                                    enabled: true;
+                                    minimum: 100;
+                                    maximum: 3000;
+                                    value <=> root.staged-lighting-duration-ms;
+                                }
+                            }
+
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 4px;
+
+                                HorizontalLayout {
+                                    alignment: space-between;
+                                    MaterialText {
+                                        text: "Hardware Brightness";
+                                        style: MaterialTypography.label_large;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                    MaterialText {
+                                        text: "\{round(root.staged-lighting-brightness)}%";
+                                        style: MaterialTypography.label_large;
+                                        color: MaterialPalette.primary;
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Slider {
+                                        horizontal-stretch: 1;
+                                        min-width: 100px;
+                                        height: 30px;
+                                        enabled: true;
+                                        minimum: 0;
+                                        maximum: 100;
+                                        value <=> root.staged-lighting-brightness;
+                                    }
+                                    TonalButton {
+                                        height: 32px;
+                                        text: "Set Dim";
+                                        clicked => {
+                                            root.apply-staged-brightness();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalDivider {}
+
+                        // Row 5: Stealth Toggle, Boot Default Persistence, Power Button & Apply Button
+                        HorizontalLayout {
+                            height: 36px;
+                            alignment: space-between;
+                            spacing: 12px;
+
+                            HorizontalLayout {
+                                spacing: 14px;
+                                alignment: start;
+
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Switch {
+                                        width: 52px;
+                                        height: 32px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        checked <=> root.lighting-stealth-enabled;
+                                        checked_state_changed(v) => {
+                                            root.toggle-stealth-mode(v);
+                                        }
+                                    }
+                                    MaterialText {
+                                        vertical-alignment: center;
+                                        text: "Stealth (Lights Off)";
+                                        style: MaterialTypography.body_small;
+                                        color: MaterialPalette.on_surface;
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Switch {
+                                        width: 52px;
+                                        height: 32px;
+                                        y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                        checked <=> root.staged-lighting-persist-boot;
+                                    }
+                                    MaterialText {
+                                        vertical-alignment: center;
+                                        text: root.staged-lighting-persist-boot
+                                            ? "Save as Boot Default"
+                                            : "Session Only (Temporary)";
+                                        style: MaterialTypography.body_small;
+                                        color: MaterialPalette.on_surface_variant;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: end;
+
+                                OutlineButton {
+                                    height: 36px;
+                                    text: "Program Power LED";
+                                    clicked => {
+                                        root.program-power-led-states();
+                                    }
+                                }
+
+                                FilledButton {
+                                    height: 36px;
+                                    text: "Apply Lighting";
+                                    clicked => {
+                                        root.apply-staged-lighting();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Screen 2: Virtualized Hardware Command Log (Action Meaning + Hex Payload)
+            if root.active-nav-index == 2 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 10px;
+
+                OutlinedCard {
+                    vertical-stretch: 1;
+
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
+
+                            VerticalLayout {
+                                spacing: 2px;
+                                MaterialText {
+                                    text: "Hardware Command Log (\{root.write-count} Commands — Newest First)";
+                                    style: MaterialTypography.title_medium;
+                                    color: MaterialPalette.on_surface;
+                                }
+                                MaterialText {
+                                    text: "Shows each command's human-readable meaning and underlying ACPI WMAX / USB HID hex payload.";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+                            }
+
+                            MaterialText {
+                                vertical-alignment: center;
+                                text: root.audit-counter-summary;
+                                style: MaterialTypography.label_medium_prominent;
+                                color: MaterialPalette.primary;
+                            }
+                        }
+
+                        // Diagnostics & Support Export Toolbar (100% passive — zero hardware writes)
+                        HorizontalLayout {
+                            // Preserve the Material buttons' intrinsic text and padding height.
+                            vertical-stretch: 0;
+                            alignment: space-between;
+                            spacing: 8px;
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+
+                                TonalButton {
+                                    text: root.diagnostic-recording-label;
+                                    clicked => {
+                                        root.toggle-diagnostic-recording();
+                                    }
+                                }
+
+                                OutlineButton {
+                                    enabled: !root.diagnostics-busy;
+                                    text: "Copy Summary";
+                                    clicked => {
+                                        root.copy-diagnostic-summary();
+                                    }
+                                }
+
+                                FilledButton {
+                                    enabled: !root.diagnostics-busy;
+                                    text: "Export Support Report";
+                                    clicked => {
+                                        root.export-support-report();
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: end;
+
+                                OutlineButton {
+                                    enabled: root.selected-audit-detail != "";
+                                    text: "Copy Row";
+                                    clicked => {
+                                        root.copy-selected-audit-row();
+                                    }
+                                }
+
+                                OutlineButton {
+                                    enabled: root.audit-rows.length > 0;
+                                    text: "Clear Visible";
+                                    clicked => {
+                                        root.clear-audit-history();
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.audit-eviction-notice != "" : MaterialText {
+                            text: root.audit-eviction-notice;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.tertiary;
+                        }
+
+                        if root.diagnostics-status-text != "" : MaterialText {
+                            text: root.diagnostics-status-text;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.primary;
+                            overflow: elide;
+                        }
+
+                        if root.clipboard-fallback-visible && root.last-copied-text != "" : Rectangle {
+                            height: 34px;
+                            border-radius: 6px;
+                            background: MaterialPalette.surface_container_high;
+                            border-width: 1px;
+                            border-color: MaterialPalette.outline_variant;
+
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 8px;
+
+                                MaterialText {
+                                    vertical-alignment: center;
+                                    text: "Manual Copy Fallback:";
+                                    style: MaterialTypography.label_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+
+                                TextInput {
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                    read-only: true;
+                                    single-line: true;
+                                    text: root.last-copied-text;
+                                    font-size: 12px;
+                                    color: MaterialPalette.on_surface;
+                                }
+                            }
+                        }
+
+                        HorizontalDivider {}
+
+                        if root.audit-rows.length == 0 : MaterialText {
+                            text: root.write-count == 0
+                                ? "No hardware write commands have been issued in this session."
+                                : "Visible command log cleared (\{root.write-count} lifetime commands recorded).";
+                            style: MaterialTypography.body_medium;
+                            color: MaterialPalette.on_surface_variant;
+                        }
+
+                        ListView {
+                            vertical-stretch: 1;
+
+                            for row in root.audit-rows : Rectangle {
+                                height: 38px;
+
+                                Rectangle {
+                                    x: 0px;
+                                    y: 2px;
+                                    width: parent.width;
+                                    height: 34px;
+                                    border-radius: 6px;
+                                    border-width: root.selected-audit-seq == row.seq_num ? 2px : 0px;
+                                    border-color: MaterialPalette.primary;
+                                    background: row.succeeded ? MaterialPalette.surface_container : MaterialPalette.error_container;
+
+                                    TouchArea {
+                                        clicked => {
+                                            root.select-audit-row(row.seq_num);
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+                                        spacing: 10px;
+
+                                        MaterialText {
+                                            width: 44px;
+                                            vertical-alignment: center;
+                                            text: row.seq_text;
+                                            style: MaterialTypography.label_medium_prominent;
+                                            color: row.succeeded ? MaterialPalette.primary : MaterialPalette.on_error_container;
+                                        }
+
+                                        MaterialText {
+                                            horizontal-stretch: 1;
+                                            vertical-alignment: center;
+                                            text: row.command;
+                                            style: MaterialTypography.body_small;
+                                            color: row.succeeded ? MaterialPalette.on_surface : MaterialPalette.on_error_container;
+                                            overflow: elide;
+                                        }
+
+                                        MaterialText {
+                                            width: 170px;
+                                            horizontal-alignment: right;
+                                            vertical-alignment: center;
+                                            text: row.outcome;
+                                            style: MaterialTypography.label_small;
+                                            color: row.succeeded ? MaterialPalette.on_surface_variant : MaterialPalette.on_error_container;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.selected-audit-detail != "" : Rectangle {
+                            height: 44px;
+                            border-radius: 6px;
+                            background: MaterialPalette.surface_container_high;
+
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                MaterialText {
+                                    vertical-alignment: center;
+                                    text: root.selected-audit-detail;
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Screen 3: Application Settings & System Hardware Details
+            if root.active-nav-index == 3 : SettingsScrollView {
+                vertical-stretch: 1;
+
+                ElevatedCard {
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 8px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
+                            MaterialText {
+                                text: "Background Service";
+                                style: MaterialTypography.title_medium;
+                                color: MaterialPalette.on_surface;
+                            }
+                            MaterialText {
+                                text: root.service-state-label;
+                                style: MaterialTypography.label_large;
+                                color: root.service-state-is-problem ? MaterialPalette.error : MaterialPalette.primary;
+                            }
+                        }
+
+                        MaterialText {
+                            text: "A privileged service keeps your fan curve running after this window closes. The GUI itself never needs administrator rights.";
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.on_surface_variant;
+                            wrap: word-wrap;
+                        }
+
+                        if root.service-state-detail != "" : MaterialText {
+                            text: root.service-state-detail;
+                            style: MaterialTypography.body_small;
+                            color: root.service-state-is-problem ? MaterialPalette.error : MaterialPalette.on_surface_variant;
+                            wrap: word-wrap;
+                        }
+                        if root.service-version-line != "" : MaterialText {
+                            text: root.service-version-line;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.on_surface_variant;
+                            wrap: word-wrap;
+                        }
+                        if root.service-curve-summary != "" : MaterialText {
+                            text: root.service-curve-summary;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.on_surface_variant;
+                            wrap: word-wrap;
+                        }
+
+                        if root.service-restore-available : HorizontalLayout {
+                            height: 34px;
+                            alignment: space-between;
+                            VerticalLayout {
+                                alignment: center;
+                                MaterialText {
+                                    text: "Restore fan curve at startup";
+                                    style: MaterialTypography.body_medium;
+                                    color: MaterialPalette.on_surface;
+                                }
+                                MaterialText {
+                                    text: "Off by default. When on, the saved curve resumes at boot once sensors and thermal mode check out.";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+                            }
+                            Switch {
+                                width: 52px;
+                                height: 32px;
+                                y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                enabled: !root.service-busy;
+                                checked: root.service-restore-at-startup;
+                                checked_state_changed(enabled) => {
+                                    root.set-restore-at-startup(enabled);
+                                }
+                            }
+                        }
+
+                        if root.service-confirming-install : VerticalLayout {
+                            spacing: 6px;
+                            MaterialText {
+                                text: "This installs a persistent system service and enables it at boot. You will be asked for administrator authorization. Nothing is installed until you confirm.";
+                                style: MaterialTypography.body_small;
+                                color: MaterialPalette.on_surface;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                FilledButton {
+                                    text: "Confirm install";
+                                    enabled: !root.service-busy;
+                                    clicked => { root.install-service(); }
+                                }
+                                OutlineButton {
+                                    text: "Cancel";
+                                    enabled: !root.service-busy;
+                                    clicked => { root.service-confirming-install = false; }
+                                }
+                            }
+                        }
+
+                        if root.service-confirming-remove : VerticalLayout {
+                            spacing: 6px;
+                            MaterialText {
+                                text: root.service-remove-purge
+                                    ? "This stops and removes the background service, deletes its saved settings and removes authorization created by this installer."
+                                    : "This stops and removes the background service installed by this application. Saved settings are kept.";
+                                style: MaterialTypography.body_small;
+                                color: MaterialPalette.on_surface;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                alignment: start;
+                                spacing: 10px;
+                                Switch {
+                                    enabled: !root.service-busy;
+                                    checked: root.service-remove-purge;
+                                    checked_state_changed(purge) => { root.service-remove-purge = purge; }
+                                }
+                                MaterialText {
+                                    text: "Also delete saved service settings";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                FilledButton {
+                                    text: "Confirm removal";
+                                    enabled: !root.service-busy;
+                                    clicked => { root.uninstall-service(); }
+                                }
+                                OutlineButton {
+                                    text: "Cancel";
+                                    enabled: !root.service-busy;
+                                    clicked => { root.service-confirming-remove = false; root.service-remove-purge = false; }
+                                }
+                            }
+                        }
+
+                        if root.service-progress != "" : MaterialText {
+                            text: root.service-progress;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.primary;
+                            wrap: word-wrap;
+                        }
+                        if root.service-result != "" : MaterialText {
+                            text: root.service-result;
+                            style: MaterialTypography.body_small;
+                            color: root.service-result-is-error ? MaterialPalette.error : MaterialPalette.on_surface_variant;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            if root.service-can-setup : FilledButton {
+                                text: "Set up service";
+                                enabled: !root.service-busy;
+                                tooltip: "Authorize your account, start the service and enable it at boot";
+                                clicked => { root.setup-service(); }
+                            }
+                            if root.service-can-install && !root.service-confirming-install : FilledButton {
+                                text: "Install background service";
+                                enabled: !root.service-busy;
+                                clicked => { root.service-confirming-install = true; root.service-confirming-remove = false; }
+                            }
+                            if root.service-can-update : TonalButton {
+                                text: "Update service";
+                                enabled: !root.service-busy;
+                                clicked => { root.update-service(); }
+                            }
+                            if root.service-can-remove && !root.service-confirming-remove : OutlineButton {
+                                text: "Remove service";
+                                enabled: !root.service-busy;
+                                clicked => { root.service-confirming-remove = true; root.service-confirming-install = false; root.service-remove-purge = false; }
+                            }
+                            OutlineButton {
+                                text: "Check status";
+                                enabled: !root.service-busy && !root.is-simulated;
+                                clicked => { root.refresh-service-status(); }
+                            }
+                        }
+                    }
+                }
+
+                ElevatedCard {
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 12px;
+
+                        MaterialText {
+                            text: "Telemetry & Polling Settings";
+                            style: MaterialTypography.title_medium;
+                            color: MaterialPalette.on_surface;
+                        }
+
+                        HorizontalLayout {
+                            height: 34px;
+                            alignment: space-between;
+
+                            VerticalLayout {
+                                alignment: center;
+                                MaterialText {
+                                    text: "Automatic Telemetry Refresh";
+                                    style: MaterialTypography.body_medium;
+                                    color: MaterialPalette.on_surface;
+                                }
+                                MaterialText {
+                                    text: "Only controls how often this window updates its readings. The background service evaluates the fan curve on its own schedule.";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+                            }
+
+                            Switch {
+                                width: 52px;
+                                height: 32px;
+                                y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                checked <=> root.auto-refresh-enabled;
+                                checked_state_changed(enabled) => {
+                                    root.toggle-auto-refresh(enabled);
+                                }
+                            }
+                        }
+
+                        HorizontalDivider {}
+
+                        HorizontalLayout {
+                            height: 34px;
+                            spacing: 8px;
+                            alignment: start;
+
+                            MaterialText {
+                                width: 150px;
+                                vertical-alignment: center;
+                                text: "Refresh Interval:";
+                                style: MaterialTypography.label_large;
+                                color: MaterialPalette.on_surface;
+                            }
+
+                            InputChip {
+                                enabled: root.auto-refresh-enabled;
+                                text: "0.5s (Fast)";
+                                checked: root.refresh-interval-ms == 500;
+                                clicked => { root.select-refresh-interval(500); }
+                            }
+                            InputChip {
+                                enabled: root.auto-refresh-enabled;
+                                text: "1.0s (Default)";
+                                checked: root.refresh-interval-ms == 1000;
+                                clicked => { root.select-refresh-interval(1000); }
+                            }
+                            InputChip {
+                                enabled: root.auto-refresh-enabled;
+                                text: "2.0s";
+                                checked: root.refresh-interval-ms == 2000;
+                                clicked => { root.select-refresh-interval(2000); }
+                            }
+                            InputChip {
+                                enabled: root.auto-refresh-enabled;
+                                text: "5.0s (Low Power)";
+                                checked: root.refresh-interval-ms == 5000;
+                                clicked => { root.select-refresh-interval(5000); }
+                            }
+                        }
+                    }
+                }
+
+                ElevatedCard {
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+
+                        MaterialText {
+                            text: "Lighting & Startup Preferences";
+                            style: MaterialTypography.title_medium;
+                            color: MaterialPalette.on_surface;
+                        }
+
+                        HorizontalLayout {
+                            height: 34px;
+                            alignment: space-between;
+
+                            VerticalLayout {
+                                alignment: center;
+                                MaterialText {
+                                    text: "Save Lighting Changes as Boot Default";
+                                    style: MaterialTypography.body_medium;
+                                    color: MaterialPalette.on_surface;
+                                }
+                                MaterialText {
+                                    text: "When enabled, Apply Lighting stores effects in controller flash so they persist across reboots.";
+                                    style: MaterialTypography.body_small;
+                                    color: MaterialPalette.on_surface_variant;
+                                }
+                            }
+
+                            Switch {
+                                width: 52px;
+                                height: 32px;
+                                y: floor((parent.height - self.height) / 2 / 1px) * 1px;
+                                checked <=> root.staged-lighting-persist-boot;
+                            }
+                        }
+                    }
+                }
+
+                OutlinedCard {
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 6px;
+
+                        MaterialText {
+                            text: "System & Hardware Controller Details";
+                            style: MaterialTypography.title_medium;
+                            color: MaterialPalette.on_surface;
+                        }
+
+                        MaterialText {
+                            text: "Device Model: \{root.device-name}  ·  SMBIOS ID: \{root.smbios-id}  ·  ACPI WMAX Path: \{root.acpi-path}";
+                            style: MaterialTypography.body_medium;
+                            color: MaterialPalette.on_surface_variant;
+                        }
+
+                        MaterialText {
+                            text: "Profile Database Source: \{root.db-source}";
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.on_surface_variant;
+                        }
+
+                        MaterialText {
+                            text: root.elc-firmware-summary;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.primary;
+                        }
+
+                        if root.telemetry-notice != "" : MaterialText {
+                            text: root.telemetry-notice;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.error;
+                        }
+
+                        if root.build-summary != "" : MaterialText {
+                            text: root.build-summary;
+                            style: MaterialTypography.body_small;
+                            color: MaterialPalette.on_surface_variant;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

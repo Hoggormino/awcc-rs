@@ -1,0 +1,97 @@
+{
+  "schema_version": "1.0.0",
+  "project": "AWCC Linux",
+  "target_device": {
+    "dmi_product_name": "Alienware m15 R6",
+    "smbios_system_id": "0x0A86",
+    "acpi_prefix": "\\_SB.AMWW.WMAX",
+    "usb_elc_vid_pid": "187c:0550"
+  },
+  "slint_library": "@material 1.1.0",
+  "pages": [
+    {
+      "name": "01 Foundations & @material Tokens",
+      "color_scheme": "dark",
+      "tokens": {
+        "surface": "#111318",
+        "surfaceContainerLow": "#1A1B20",
+        "surfaceContainer": "#1E1F25",
+        "surfaceContainerHigh": "#282A2F",
+        "surfaceContainerHighest": "#33353A",
+        "onSurface": "#E2E2E9",
+        "onSurfaceVariant": "#C4C6D0",
+        "primary": "#ADC6FF",
+        "onPrimary": "#112F60",
+        "primaryContainer": "#2B4678",
+        "onPrimaryContainer": "#D8E2FF",
+        "secondaryContainer": "#3F4759",
+        "onSecondaryContainer": "#DBE2F9",
+        "tertiaryContainer": "#583E5B",
+        "onTertiaryContainer": "#FCD7FB",
+        "error": "#FFB4AB",
+        "errorContainer": "#93000A",
+        "onErrorContainer": "#FFDAD6",
+        "outline": "#8E9099",
+        "outlineVariant": "#44474F"
+      }
+    },
+    {
+      "name": "Page 1 (#0:1) — AWCC Desktop Screens (Alienware m15 R6)",
+      "variable_collection": {
+        "name": "AWCC Material 3 Dark",
+        "variables": {
+          "surface": "VariableID:1:19",
+          "surface-container-low": "VariableID:1:20",
+          "surface-container-high": "VariableID:1:21",
+          "surface-container-highest": "VariableID:1:22",
+          "primary": "VariableID:1:23",
+          "primary-container": "VariableID:1:24",
+          "secondary-container": "VariableID:1:25",
+          "tertiary-container": "VariableID:1:26",
+          "error-container": "VariableID:1:27"
+        }
+      },
+      "frames": [
+        {
+          "id": "F-01",
+          "node_id": "1:15",
+          "name": "F-01 · AWCC Desktop — Normal (1120x720) — Balanced",
+          "width": 1120,
+          "height": 720,
+          "scenario": "normal",
+          "figma_screenshot": "docs/screenshots/figma-frame-f01-normal.png",
+          "slint_screenshot": "docs/screenshots/prototype-normal-1120x720.png"
+        },
+        {
+          "id": "F-02",
+          "node_id": "1:16",
+          "name": "F-02 · AWCC Desktop — Compact (880x620) — Manual Boost Staged",
+          "width": 880,
+          "height": 620,
+          "scenario": "compact",
+          "figma_screenshot": "docs/screenshots/figma-frame-f02-compact.png",
+          "slint_screenshot": "docs/screenshots/prototype-compact-880x620.png"
+        },
+        {
+          "id": "F-03",
+          "node_id": "1:17",
+          "name": "F-03 · AWCC Desktop — G-Mode Failure Rollback & Unavailable Sensors (1120x720)",
+          "width": 1120,
+          "height": 720,
+          "scenario": "rollback",
+          "figma_screenshot": "docs/screenshots/figma-frame-f03-rollback.png",
+          "slint_screenshot": "docs/screenshots/prototype-rollback-1120x720.png"
+        },
+        {
+          "id": "F-04",
+          "node_id": "1:17#1:48",
+          "name": "Diagnostics & Zero-Write Audit Inspector (1120x720)",
+          "width": 1120,
+          "height": 720,
+          "scenario": "diagnostics",
+          "slint_screenshot": "docs/screenshots/prototype-diagnostics-1120x720.png"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+# Maintainer: AWCC Linux Contributors <https://github.com/Hoggormino/awcc-rs>
+pkgname=awcc-rs
+pkgver=@PKGVER@
+pkgrel=@PKGREL@
+pkgdesc="Unofficial Alienware Command Center for Linux (Rust + Slint Material 3 CLI & GUI)"
+arch=('x86_64')
+url="https://github.com/Hoggormino/awcc-rs"
+license=('BSD-2-Clause' 'MIT')
+depends=('glibc' 'gcc-libs' 'libusb' 'fontconfig' 'ttf-dejavu' 'hicolor-icon-theme' 'systemd' 'util-linux')
+optdepends=(
+  'libxkbcommon: Wayland and X11 keyboard handling for awcc-gui'
+  'libxkbcommon-x11: X11 keyboard handling for awcc-gui'
+  'wayland: Wayland display session support for awcc-gui'
+  'libx11: X11 display session support for awcc-gui'
+  'libxcursor: X11 cursor theme support for awcc-gui'
+  'libxi: X11 input extension support for awcc-gui'
+  'libxrender: X11 rendering support for awcc-gui'
+  'mesa: OpenGL/EGL hardware acceleration for awcc-gui'
+  'acpi_call: /proc/acpi/call kernel interface for live WMAX thermal control'
+  'polkit: one-time service setup when the installing user cannot be identified'
+)
+backup=('etc/awcc/database.json')
+options=('!strip' '!debug')
+install=awcc-rs.install
+source=("https://github.com/Hoggormino/awcc-rs/releases/download/v${pkgver}/awcc-rs-${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+sha256sums=('@TARBALL_SHA256@')
+
+package() {
+  local _root="${srcdir}/awcc-rs-${pkgver}-x86_64-unknown-linux-gnu"
+
+  install -Dm755 "${_root}/bin/awcc-cli" "${pkgdir}/usr/bin/awcc-cli"
+  install -Dm755 "${_root}/bin/awcc-gui" "${pkgdir}/usr/bin/awcc-gui"
+  install -Dm644 "${_root}/share/awcc/database.json" "${pkgdir}/etc/awcc/database.json"
+  install -Dm644 "${_root}/share/awcc/database.json" "${pkgdir}/usr/share/awcc/database.json"
+  # The release tarball declares itself `tarball`; this package declares its own format.
+  printf 'arch\n' | install -Dm644 /dev/stdin "${pkgdir}/usr/share/awcc/package-format"
+  install -Dm644 "${_root}/share/applications/awcc-gui.desktop" "${pkgdir}/usr/share/applications/awcc-gui.desktop"
+  install -Dm644 "${_root}/share/systemd/awccd.service" "${pkgdir}/usr/lib/systemd/system/awccd.service"
+  install -Dm644 "${_root}/share/modules-load.d/awcc-rs.conf" "${pkgdir}/usr/lib/modules-load.d/awcc-rs.conf"
+  install -Dm644 "${_root}/share/udev/rules.d/70-awcc-rs.rules" "${pkgdir}/usr/lib/udev/rules.d/70-awcc-rs.rules"
+  install -Dm644 "${_root}/share/libalpm/hooks/05-awcc-rs-remove.hook" "${pkgdir}/usr/share/libalpm/hooks/05-awcc-rs-remove.hook"
+  install -Dm755 "${_root}/share/libalpm/scripts/awcc-rs-pre-remove" "${pkgdir}/usr/share/libalpm/scripts/awcc-rs-pre-remove"
+  install -Dm644 "${_root}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/awcc-gui.svg"
+  install -Dm644 "${_root}/share/icons/hicolor/256x256/apps/awcc-gui.png" "${pkgdir}/usr/share/icons/hicolor/256x256/apps/awcc-gui.png"
+  install -Dm644 "${_root}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "${pkgdir}/usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"
+  install -Dm644 "${_root}/share/licenses/awcc-rs/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${_root}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_NOTICES.md"
+  install -Dm644 "${_root}/share/doc/awcc-rs/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "${_root}/share/doc/awcc-rs/INSTALL.txt" "${pkgdir}/usr/share/doc/${pkgname}/INSTALL.txt"
+}

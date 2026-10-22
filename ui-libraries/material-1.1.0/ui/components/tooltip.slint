@@ -1,0 +1,33 @@
+// Copyright © SixtyFPS GmbH <info@slint.dev>
+// SPDX-License-Identifier: MIT
+
+import { MaterialText } from "./material_text.slint";
+import { MaterialPalette } from "../styling/material_palette.slint";
+import { MaterialTypography } from "../styling/material_typography.slint";
+
+export component ToolTip {
+    in property <string> text;
+
+    z: 10000;
+    width: background_layer.preferred_width;
+    height: background_layer.preferred_height;
+
+    background_layer := Rectangle {
+        border_radius: 4px;
+        background: MaterialPalette.inverse_surface;
+
+        layout := HorizontalLayout {
+            padding_top: 6px;
+            padding_bottom: 6px;
+            padding_left: 10px;
+            padding_right: 10px;
+
+            MaterialText {
+                text: root.text;
+                vertical_alignment: center;
+                color: MaterialPalette.inverse_on_surface;
+                style: MaterialTypography.body_small;
+            }
+        }
+    }
+}

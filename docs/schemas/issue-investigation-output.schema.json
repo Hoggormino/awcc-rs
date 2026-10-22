@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AwccRsHostedIssueInvestigationOutput",
+  "description": "Strict structured output contract for the read-only GitHub-hosted issue investigation workflow.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "affected_versions",
+    "evidence",
+    "hypotheses",
+    "missing_information",
+    "reproduction_status",
+    "suggested_test",
+    "recommended_next_step",
+    "requires_hardware",
+    "candidate_duplicates"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 1200,
+      "description": "Concise source-grounded summary of the issue and primary finding."
+    },
+    "affected_versions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 160
+      },
+      "description": "Reported version(s), commit SHA(s), package format(s), or 'unknown (not provided in report)'."
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 15,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "observation"],
+        "properties": {
+          "source": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 240,
+            "description": "Exact file:line in the checkout or issue/comment reference."
+          },
+          "observation": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 600,
+            "description": "Verified factual observation from the source code or issue text."
+          }
+        }
+      }
+    },
+    "hypotheses": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["hypothesis", "rationale", "confidence"],
+        "properties": {
+          "hypothesis": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 500
+          },
+          "rationale": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 600
+          },
+          "confidence": {
+            "type": "string",
+            "enum": ["low", "medium", "high"]
+          }
+        }
+      }
+    },
+    "missing_information": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 15,
+      "items": {
+        "type": "string",
+        "minLength": 5,
+        "maxLength": 400
+      },
+      "description": "Specific missing diagnostic evidence, uninspected attachments, or hardware details."
+    },
+    "reproduction_status": {
+      "type": "string",
+      "enum": [
+        "not_attempted_static_analysis_only",
+        "insufficient_evidence_to_reproduce",
+        "needs_local_simulation_reproduction",
+        "needs_physical_hardware_reproduction"
+      ],
+      "description": "Static source inspection in the hosted read-only sandbox is never a completed reproduction or passed test."
+    },
+    "suggested_test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_crate", "test_description", "mock_or_fixture"],
+      "properties": {
+        "target_crate": {
+          "type": "string",
+          "enum": [
+            "awcc-core",
+            "awcc-build-info",
+            "awcc-diagnostics",
+            "awcc-platform",
+            "awcc-service",
+            "awcc-cli",
+            "awcc-gui",
+            "scripts"
+          ]
+        },
+        "test_description": {
+          "type": "string",
+          "minLength": 15,
+          "maxLength": 600
+        },
+        "mock_or_fixture": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 400
+        }
+      }
+    },
+    "recommended_next_step": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 1200,
+      "description": "Actionable next step for the maintainer or local coding agent."
+    },
+    "requires_hardware": {
+      "type": "boolean",
+      "description": "True if verifying the root cause or fix requires testing on physical Alienware / Dell G-Series hardware."
+    },
+    "candidate_duplicates": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["issue_number", "url", "reason"],
+        "properties": {
+          "issue_number": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "url": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 240
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 400
+          }
+        }
+      }
+    }
+  }
+}

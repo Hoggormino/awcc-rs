@@ -1,0 +1,28 @@
+[package]
+name = "awcc-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+awcc-build-info.workspace = true
+awcc-core.workspace = true
+awcc-diagnostics.workspace = true
+awcc-platform.workspace = true
+awcc-service.workspace = true
+i-slint-backend-testing.workspace = true
+png.workspace = true
+serde_json.workspace = true
+slint.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
+
+[lints]
+workspace = true

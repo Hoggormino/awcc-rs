@@ -1,0 +1,4 @@
+if [ "${1:-0}" -eq 0 ]; then
+    awcc_native_remove rpm || exit 1
+fi
+exit 0

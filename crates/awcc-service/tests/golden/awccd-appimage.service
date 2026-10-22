@@ -1,0 +1,46 @@
+[Unit]
+Description=AWCC privileged hardware service (installed from the AppImage)
+Documentation=https://github.com/Hoggormino/awcc-rs
+# acpi_call is loaded by systemd-modules-load when configured; order after it and after /var, /opt.
+After=local-fs.target systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/opt/awcc-rs/service/current/bin/awcc-cli -d
+Environment=LD_LIBRARY_PATH=/opt/awcc-rs/service/current/lib
+Environment=XDG_STATE_HOME=/var/lib/awcc
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+KillMode=mixed
+User=root
+Group=root
+# /run/awcc holds the control socket; removed on stop.
+RuntimeDirectory=awcc
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=no
+# /var/lib/awcc holds service settings and bounded session logs.
+StateDirectory=awcc
+# Hardening. The service only writes /proc/acpi/call, /sys/devices/system/cpu/**/boost|no_turbo
+# (both inside the API file systems that ProtectSystem=strict leaves writable), its own
+# /var/lib/awcc and /run/awcc (created through StateDirectory/RuntimeDirectory), and reads
+# /etc/awcc/authorized-users. ProtectKernelTunables is intentionally NOT set: it would make the
+# /proc and /sys writes impossible.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target

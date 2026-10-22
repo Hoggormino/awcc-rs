@@ -1,0 +1,63 @@
+#!/bin/sh
+# AppRun launcher for AWCC Linux AppImage.
+# Launches `awcc-gui` by default.
+# Dispatches to `awcc-cli` when invoked via an `awcc-cli` symlink/ARGV0 or when the first argument is `--cli` or `cli`.
+# Service lifecycle flags run headless (no display needed) and map to the CLI:
+#   --install-service            -> awcc-cli service install
+#   --update-service             -> awcc-cli service update
+#   --uninstall-service [--purge]-> awcc-cli service uninstall [--purge]
+#   --service-status [--json]    -> awcc-cli service status [--json]
+#   --service-apply <action> ... -> awcc-cli service-apply <action> ...   (internal; runs as root)
+set -eu
+
+APPDIR="${APPDIR:-$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)}"
+export APPDIR
+
+if [ -d "$APPDIR/usr/lib" ]; then
+    export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+if [ -z "${AWCC_DATABASE_PATH:-}" ] && [ -f "$APPDIR/usr/share/awcc/database.json" ]; then
+    export AWCC_DATABASE_PATH="$APPDIR/usr/share/awcc/database.json"
+fi
+
+export PATH="$APPDIR/usr/bin${PATH:+:$PATH}"
+
+# Translate service flags even when the image itself is named awcc-cli.AppImage. The elevated
+# relaunch uses the canonical image path with --service-apply, regardless of its filename.
+case "${1:-}" in
+    --install-service)
+        shift
+        exec "$APPDIR/usr/bin/awcc-cli" service install "$@"
+        ;;
+    --update-service)
+        shift
+        exec "$APPDIR/usr/bin/awcc-cli" service update "$@"
+        ;;
+    --uninstall-service)
+        shift
+        exec "$APPDIR/usr/bin/awcc-cli" service uninstall "$@"
+        ;;
+    --service-status)
+        shift
+        exec "$APPDIR/usr/bin/awcc-cli" service status "$@"
+        ;;
+    --service-apply)
+        shift
+        exec "$APPDIR/usr/bin/awcc-cli" service-apply "$@"
+        ;;
+esac
+
+INVOKED_NAME="$(basename -- "${ARGV0:-$0}")"
+case "$INVOKED_NAME" in
+    awcc-cli*)
+        exec "$APPDIR/usr/bin/awcc-cli" "$@"
+        ;;
+esac
+
+if [ "${1:-}" = "--cli" ] || [ "${1:-}" = "cli" ]; then
+    shift
+    exec "$APPDIR/usr/bin/awcc-cli" "$@"
+fi
+
+exec "$APPDIR/usr/bin/awcc-gui" "$@"

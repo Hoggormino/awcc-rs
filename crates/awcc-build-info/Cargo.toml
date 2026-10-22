@@ -1,0 +1,13 @@
+[package]
+name = "awcc-build-info"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Compile-time build identity and package-format hint shared by the AWCC binaries"
+build = "build.rs"
+
+[lints]
+workspace = true

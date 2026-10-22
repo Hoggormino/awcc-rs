@@ -1,0 +1,10 @@
+case "${1:-}" in
+    configure)
+        if [ -z "${2:-}" ]; then
+            awcc_native_configure deb fresh
+        else
+            awcc_native_configure deb upgrade
+        fi
+        ;;
+esac
+exit 0

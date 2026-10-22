@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AWCC Linux
+GenericName=Thermal and Lighting Controller
+Comment=Thermal profiles, fan curves, TCC offset, and RGB lighting control for Alienware and Dell G-Series systems
+Exec=awcc-gui
+TryExec=awcc-gui
+Icon=awcc-gui
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=Alienware;Dell;Thermal;Fan;RGB;G-Mode;AWCC;
+StartupNotify=true
+StartupWMClass=awcc-gui
+Actions=Simulate;
+
+[Desktop Action Simulate]
+Name=Launch in Simulation Mode (m15 R6)
+Exec=awcc-gui --sim

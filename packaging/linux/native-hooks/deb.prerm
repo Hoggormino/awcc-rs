@@ -1,0 +1,4 @@
+case "${1:-}" in
+    remove|deconfigure) awcc_native_remove deb || exit 1 ;;
+esac
+exit 0
