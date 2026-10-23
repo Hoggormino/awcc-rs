@@ -111,7 +111,8 @@ async fn authorize(
         "system-bus-name",
         HashMap::from([("name", Value::from(sender.as_str()))]),
     );
-    let (allowed, _, _): (bool, bool, HashMap<String, OwnedValue>) = authority
+    // Authorization result details are strings; subject details above are variants.
+    let (allowed, _, _): (bool, bool, HashMap<String, String>) = authority
         .call(
             "CheckAuthorization",
             &(subject, action, HashMap::<String, String>::new(), 1_u32, ""),
@@ -542,6 +543,8 @@ mod tests {
         process::{Command, Stdio},
         time::Instant,
     };
+    #[derive(serde::Serialize, zbus::zvariant::Type)]
+    struct AuthorizationReply(bool, bool, HashMap<String, String>);
     struct Authority(Arc<AtomicBool>);
     #[zbus::interface(name = "org.freedesktop.PolicyKit1.Authority")]
     impl Authority {
@@ -552,8 +555,15 @@ mod tests {
             _details: HashMap<String, String>,
             _flags: u32,
             _id: &str,
-        ) -> (bool, bool, HashMap<String, OwnedValue>) {
-            (self.0.load(Ordering::SeqCst), false, HashMap::new())
+        ) -> AuthorizationReply {
+            AuthorizationReply(
+                self.0.load(Ordering::SeqCst),
+                false,
+                HashMap::from([(
+                    "polkit.temporary_authorization_id".into(),
+                    "test-grant".into(),
+                )]),
+            )
         }
     }
     #[test]
@@ -608,6 +618,35 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
+        let authority = zbus::blocking::Proxy::new(
+            &client,
+            "org.freedesktop.PolicyKit1",
+            "/org/freedesktop/PolicyKit1/Authority",
+            "org.freedesktop.PolicyKit1.Authority",
+        )
+        .unwrap();
+        let reply = authority
+            .call_method(
+                "CheckAuthorization",
+                &(
+                    (
+                        "system-bus-name",
+                        HashMap::from([("name", Value::from(":1.0"))]),
+                    ),
+                    "io.github.hoggormino.awcc_rs.switch-profile",
+                    HashMap::<String, String>::new(),
+                    0_u32,
+                    "",
+                ),
+            )
+            .unwrap();
+        // Polkit returns one structure, with string-valued authorization details.
+        assert_eq!(reply.body().signature().to_string(), "(bba{ss})");
+        let (is_authorized, is_challenge, details): (bool, bool, HashMap<String, String>) =
+            reply.body().deserialize().unwrap();
+        assert!(is_authorized && !is_challenge);
+        assert_eq!(details["polkit.temporary_authorization_id"], "test-grant");
+        drop(authority);
         let proxy = zbus::blocking::Proxy::new(&client, MODERN.0, MODERN.1, MODERN.0).unwrap();
         assert_eq!(
             proxy.get_property::<String>("ActiveProfile").unwrap(),
@@ -627,7 +666,27 @@ mod tests {
         );
         if !rustix::process::geteuid().is_root() {
             allowed.store(false, Ordering::SeqCst);
-            assert!(proxy.set_property("ActiveProfile", "balanced").is_err());
+            let denied = proxy.set_property("ActiveProfile", "balanced").unwrap_err();
+            assert!(
+                denied
+                    .to_string()
+                    .contains("profile operation is not authorized")
+            );
+            let denied = proxy
+                .call::<_, _, u32>(
+                    "HoldProfile",
+                    &("performance", "denied workload", "awcc-test"),
+                )
+                .unwrap_err();
+            assert!(
+                denied
+                    .to_string()
+                    .contains("profile operation is not authorized")
+            );
+            assert_eq!(
+                service.bridge.status().active,
+                Some(PowerProfile::Performance)
+            );
             allowed.store(true, Ordering::SeqCst);
         }
         let saver: u32 = proxy
