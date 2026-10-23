@@ -176,6 +176,17 @@ expect_field commit "${EXPECT_COMMIT}"
 expect_field target "${EXPECT_TARGET}"
 expect_field dirty "${EXPECT_DIRTY}"
 expect_field package-format "${EXPECT_PACKAGE_FORMAT}"
+case "$(version_field "${CLI_VERSION_OUT}" package-format)" in
+    tarball|appimage|deb|rpm|arch)
+        PACKAGE_DOC_DIR="$(dirname -- "$(readlink -f -- "${CLI_BIN}")")/../share/doc/awcc-rs/docs"
+        for guide in power_profiles.md structured_logging_and_support_export.md; do
+            if [[ ! -f "${PACKAGE_DOC_DIR}/${guide}" ]]; then
+                echo "ERROR: [${LABEL}] shipped guide is missing: ${guide}" >&2
+                exit 1
+            fi
+        done
+        ;;
+esac
 echo "    $(head -n 1 <<<"${CLI_VERSION_OUT}") [package-format: $(version_field "${CLI_VERSION_OUT}" package-format)]"
 
 echo "==> [${LABEL}] Running isolated CLI smoke tests in ${ISOLATED_CWD}..."

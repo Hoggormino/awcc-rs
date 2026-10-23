@@ -87,6 +87,7 @@ install -m 0644 "%{staged_root}/share/metainfo/io.github.hoggormino.awcc_rs.meta
 install -m 0644 "%{staged_root}/share/licenses/awcc-rs/LICENSE" "%{buildroot}%{_licensedir}/%{name}/LICENSE"
 install -m 0644 "%{staged_root}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "%{buildroot}%{_licensedir}/%{name}/THIRD_PARTY_NOTICES.md"
 install -Dm0644 "%{staged_root}/share/doc/awcc-rs/docs/power_profiles.md" "%{buildroot}%{_docdir}/%{name}/docs/power_profiles.md"
+install -Dm0644 "%{staged_root}/share/doc/awcc-rs/docs/structured_logging_and_support_export.md" "%{buildroot}%{_docdir}/%{name}/docs/structured_logging_and_support_export.md"
 install -m 0644 "%{staged_root}/share/doc/awcc-rs/README.md" "%{buildroot}%{_docdir}/%{name}/README.md"
 install -m 0644 "%{staged_root}/share/doc/awcc-rs/INSTALL.txt" "%{buildroot}%{_docdir}/%{name}/INSTALL.txt"
 

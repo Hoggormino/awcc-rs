@@ -111,6 +111,7 @@ install -m 0644 "${STAGED_DIR}/share/metainfo/io.github.hoggormino.awcc_rs.metai
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/LICENSE" "${APPDIR}/usr/share/licenses/awcc-rs/LICENSE"
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "${APPDIR}/usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md"
 install -Dm0644 "${STAGED_DIR}/share/doc/awcc-rs/docs/power_profiles.md" "${APPDIR}/usr/share/doc/awcc-rs/docs/power_profiles.md"
+install -Dm0644 "${STAGED_DIR}/share/doc/awcc-rs/docs/structured_logging_and_support_export.md" "${APPDIR}/usr/share/doc/awcc-rs/docs/structured_logging_and_support_export.md"
 install -m 0644 "${STAGED_DIR}/share/doc/awcc-rs/README.md" "${APPDIR}/usr/share/doc/awcc-rs/README.md"
 install -m 0644 "${STAGED_DIR}/share/doc/awcc-rs/INSTALL.txt" "${APPDIR}/usr/share/doc/awcc-rs/INSTALL.txt"
 
