@@ -1442,13 +1442,15 @@ fn main() -> std::process::ExitCode {
             inv.cli_trace_raw_usb,
             std::env::var("AWCC_TRACE_RAW_USB").ok().as_deref(),
         );
-        let cfg = DiagnosticsConfig::from_env_and_cli("awcc-cli", resolved_level, trace_raw_usb);
+        let mut cfg =
+            DiagnosticsConfig::from_env_and_cli("awcc-cli", resolved_level, trace_raw_usb);
+        cfg.service_console = matches!(inv.command, CliCommand::DaemonMode);
         let runtime = init_global_diagnostics(cfg);
         install_panic_hook(runtime);
     }
 
-    let mut stdout = std::io::stdout().lock();
-    let mut stderr = std::io::stderr().lock();
+    let mut stdout = std::io::stdout();
+    let mut stderr = std::io::stderr();
     let code = run(&raw_args, &mut RealBackends, &mut stdout, &mut stderr);
     if let Some(diag) = global_diagnostics() {
         diag.shutdown(Duration::from_millis(250));

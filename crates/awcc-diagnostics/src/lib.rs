@@ -1,6 +1,7 @@
 //! Shared structured diagnostics, bounded event rings, rotating session logs, and passive
 //! support-report export for `awcc-cli` and `awcc-gui`.
 
+pub mod console;
 pub mod event;
 pub mod export;
 pub mod hash;
@@ -11,7 +12,6 @@ pub mod time;
 pub mod zip;
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -157,6 +157,7 @@ pub struct DiagnosticsConfig {
     pub log_dir: Option<PathBuf>,
     pub enable_file_sink: bool,
     pub enable_stderr_console: bool,
+    pub service_console: bool,
     pub event_ring_capacity: usize,
     pub rate_limit_window: Duration,
 }
@@ -179,6 +180,7 @@ impl DiagnosticsConfig {
             log_dir: env_dir.or_else(default_log_dir),
             enable_file_sink: true,
             enable_stderr_console: true,
+            service_console: false,
             event_ring_capacity: DEFAULT_EVENT_RING_CAPACITY,
             rate_limit_window: DEFAULT_RATE_LIMIT_WINDOW,
         }
@@ -279,7 +281,8 @@ pub struct DiagnosticsRuntime {
     sink: Option<FileSink>,
     sink_init_error: Option<String>,
     log_dir: Option<PathBuf>,
-    stderr_enabled: bool,
+    console: Option<console::ConsoleSink>,
+    service_console: bool,
     redactor: Redactor,
 }
 
@@ -346,7 +349,8 @@ impl DiagnosticsRuntime {
             sink,
             sink_init_error: sink_init_error.clone(),
             log_dir: cfg.log_dir,
-            stderr_enabled: cfg.enable_stderr_console,
+            console: cfg.enable_stderr_console.then(console::ConsoleSink::stderr),
+            service_console: cfg.service_console,
             redactor: Redactor::from_environment(),
         });
 
@@ -648,17 +652,18 @@ impl DiagnosticsRuntime {
             last
         };
         for ev in &events {
-            if self.stderr_enabled
-                && (self.level_source != "default"
-                    || ev.severity == Severity::Error
-                    || ev.code.as_deref() == Some("invalid_log_env"))
-            {
-                let _ = writeln!(std::io::stderr(), "{}", ev.render_line());
-            }
             if let Some(sink) = &self.sink
                 && let Ok(json_line) = serde_json::to_string(ev)
             {
                 let _ = sink.try_send_line(json_line);
+            }
+            if let Some(console) = &self.console
+                && (self.level_source != "default"
+                    || self.service_console
+                    || ev.severity == Severity::Error
+                    || ev.code.as_deref() == Some("invalid_log_env"))
+            {
+                console.send(self.redactor.redact_text(&ev.render_line()));
             }
         }
         last_seq
@@ -717,6 +722,12 @@ impl DiagnosticsRuntime {
         }
     }
 
+    pub fn console_status(&self) -> console::ConsoleStatus {
+        self.console
+            .as_ref()
+            .map_or_else(console::ConsoleStatus::default, |sink| sink.status())
+    }
+
     /// Publish updated [`SessionEvidence`] to the background writer (`evidence-<session>.json`).
     pub fn publish_evidence(&self, evidence: &SessionEvidence) {
         if let Some(sink) = &self.sink
@@ -728,7 +739,13 @@ impl DiagnosticsRuntime {
 
     /// Build the allowlisted [`ExportedSettings`] snapshot.
     #[must_use]
-    pub fn exported_settings(&self, extra: BTreeMap<String, String>) -> ExportedSettings {
+    pub fn exported_settings(&self, mut extra: BTreeMap<String, String>) -> ExportedSettings {
+        let console = self.console_status();
+        extra.insert("console_dropped".into(), console.dropped.to_string());
+        extra.insert("console_failures".into(), console.failures.to_string());
+        if let Some(error) = console.last_error {
+            extra.insert("console_error".into(), error);
+        }
         ExportedSettings {
             active_log_level: self.active_level().as_str().to_string(),
             base_log_level: self.base_level.as_str().to_string(),
@@ -772,6 +789,9 @@ impl DiagnosticsRuntime {
     /// Flush and stop the background file writer.
     pub fn shutdown(&self, timeout: Duration) {
         self.flush_rate_limits();
+        if let Some(console) = &self.console {
+            console.shutdown(timeout);
+        }
         if let Some(sink) = &self.sink {
             sink.shutdown(timeout);
         }
@@ -965,6 +985,7 @@ mod tests {
             log_dir: None,
             enable_file_sink: false,
             enable_stderr_console: false,
+            service_console: false,
             event_ring_capacity: 64,
             rate_limit_window: Duration::from_secs(10),
         })
@@ -1104,6 +1125,7 @@ mod tests {
             log_dir: None,
             enable_file_sink: false,
             enable_stderr_console: false,
+            service_console: false,
             event_ring_capacity: 4096,
             rate_limit_window: Duration::from_secs(60),
         });
