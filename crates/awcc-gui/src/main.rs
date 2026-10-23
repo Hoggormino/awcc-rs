@@ -1160,7 +1160,7 @@ fn sync_service_control_to_ui(ui: &MainWindow, snap: &SystemSnapshot) {
                     power
                         .thermal
                         .as_ref()
-                        .map_or_else(|| "unavailable".into(), |l| l.detail_message()),
+                        .map_or_else(|| "not attempted".into(), |l| l.detail_message()),
                     power
                         .problem
                         .as_ref()

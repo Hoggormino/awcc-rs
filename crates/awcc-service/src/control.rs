@@ -699,6 +699,7 @@ impl ControlCore {
         }
         let generation = self.desired_generation.clone();
         self.applied_policy = None;
+        self.power.thermal = None;
         self.power.cpu = self.cpu.apply(effective, &|| {
             generation
                 .as_ref()
@@ -2279,6 +2280,7 @@ mod tests {
             .handle(ControlOp::SelectPower(awcc_core::PowerProfile::Performance));
         assert!(reply.result.is_err());
         assert!(!reply.view.control.power.cpu.confirmed);
+        assert!(reply.view.control.power.thermal.is_none());
         assert_eq!(r.core.settings.power, saved);
     }
 
