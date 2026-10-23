@@ -213,6 +213,8 @@ jobs:
               useradd -m -s /bin/bash tester
               printf "%s\n" "tester ALL=(root) NOPASSWD: /usr/bin/apt-get" > /etc/sudoers.d/awcc-ci
               chmod 0440 /etc/sudoers.d/awcc-ci
+              # Minimal images filter documentation; retain the AWCC guides for validation.
+              printf "%s\n" "path-include=/usr/share/doc/awcc-rs" "path-include=/usr/share/doc/awcc-rs/*" > /etc/dpkg/dpkg.cfg.d/zz-awcc-ci-docs
               su - tester -c "sudo -n /usr/bin/apt-get install -y --no-install-recommends /work/dist/ubuntu/awcc-rs_*_amd64.deb"
               dpkg -s awcc-rs
               test -x /usr/bin/awcc-cli
@@ -302,7 +304,7 @@ jobs:
               chmod 0440 /etc/sudoers.d/awcc-ci
               cd /work
               ./scripts/package-rpm.sh --staged-dir /work/dist/staging/payload --out-dir /work/dist/fedora
-              su - tester -c "sudo -n /usr/bin/dnf install -y --setopt=install_weak_deps=False /work/dist/fedora/awcc-rs-*.x86_64.rpm"
+              su - tester -c "sudo -n /usr/bin/dnf install -y --setopt=install_weak_deps=False --setopt=tsflags= /work/dist/fedora/awcc-rs-*.x86_64.rpm"
               rpm -qi awcc-rs
               rpm -ql awcc-rs
               test -x /usr/bin/awcc-cli
@@ -399,6 +401,8 @@ jobs:
               chmod 0440 /etc/sudoers.d/awcc-ci
               chown -R builder:builder /work/dist/arch
               su - builder -c "AWCC_GIT_SHA=${AWCC_GIT_SHA} SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} /work/scripts/package-arch.sh --out-dir /work/dist/arch --tarball ${AWCC_TARBALL} --skip-smoke"
+              # Keep docs in this disposable container so the installed guide check is meaningful.
+              sed -i "s|usr/share/doc/[*]||g" /etc/pacman.conf
               su - builder -c "sudo -n /usr/bin/pacman -U --noconfirm /work/dist/arch/awcc-rs-*-x86_64.pkg.tar.zst"
               pacman -Qi awcc-rs
               pacman -Ql awcc-rs
