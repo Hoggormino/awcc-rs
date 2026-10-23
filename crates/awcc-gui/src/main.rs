@@ -2710,6 +2710,8 @@ fn run_interactive(sim_mode: bool) -> Result<()> {
     let ops: SharedOps = Rc::new(RefCell::new(UiOps::default()));
 
     let ui = MainWindow::new().context("failed to create Slint MainWindow")?;
+    // Match the installed desktop entry so Wayland and X11 shells resolve AWCC's icon.
+    slint::set_xdg_app_id("awcc-gui").context("failed to set desktop application identity")?;
     {
         let initial_snap = service.borrow().current_snapshot().clone();
         sync_snapshot_to_ui(&ui, &initial_snap, true);
