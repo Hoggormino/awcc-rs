@@ -544,12 +544,6 @@ export component MainWindow inherits MaterialWindow {
                                 checked: !root.mode-is-unknown && root.selected-mode-key == "Manual";
                                 clicked => { root.select-thermal-mode("Manual"); }
                             }
-                            InputChip {
-                                enabled: true;
-                                text: "G-Mode";
-                                checked: !root.mode-is-unknown && root.selected-mode-key == "GMode";
-                                clicked => { root.select-thermal-mode("GMode"); }
-                            }
                         }
                     }
                 }
