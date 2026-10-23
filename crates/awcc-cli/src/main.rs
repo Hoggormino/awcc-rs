@@ -41,6 +41,9 @@ pub enum CliCommand {
     Help,
     Version,
     DeviceInfo,
+    DiagnosticsRecording {
+        seconds: u16,
+    },
     DiagnosticsSummary {
         json: bool,
     },
@@ -525,6 +528,22 @@ fn parse_diagnostics_subcommand(rest: &[String]) -> Result<CliCommand> {
     }
 
     match sub {
+        "record" => {
+            let seconds = match &rest[idx..] {
+                [] => 300,
+                [flag, value] if flag == "--seconds" => value
+                    .parse::<u16>()
+                    .context("recording duration must be 1..=300 seconds")?,
+                _ => bail!("usage: awcc-cli diagnostics record [--seconds 1..300]"),
+            };
+            if !(1..=300).contains(&seconds) {
+                bail!("recording duration must be 1..=300 seconds");
+            }
+            Ok(CliCommand::DiagnosticsRecording { seconds })
+        }
+        "stop-recording" if idx == rest.len() => {
+            Ok(CliCommand::DiagnosticsRecording { seconds: 0 })
+        }
         "summary" | "status" => {
             let mut json = false;
             while idx < rest.len() {
@@ -577,7 +596,9 @@ fn parse_diagnostics_subcommand(rest: &[String]) -> Result<CliCommand> {
             })
         }
         other => {
-            bail!("unknown `diagnostics` subcommand `{other}` (expected `export` or `summary`)")
+            bail!(
+                "unknown `diagnostics` subcommand `{other}` (expected `export`, `summary`, `record` or `stop-recording`)"
+            )
         }
     }
 }
@@ -638,6 +659,8 @@ pub fn format_help() -> String {
         "",
         "Logging & Diagnostics Options (precedence: --log-level > -v > AWCC_LOG > info):",
         "  --log-level <level>      Set log filter level: error | warn | info | debug | trace",
+        "  diagnostics record [--seconds 1..300]  Record daemon DEBUG events temporarily",
+        "  diagnostics stop-recording  Stop daemon DEBUG recording",
         "  -v, --verbose            Enable verbose DEBUG diagnostics on stderr",
         "  --trace-raw-usb          Opt in to verbose raw 33-byte USB input report hex in audit/exports",
     ]
@@ -732,6 +755,7 @@ fn execute_passive_diagnostics_command(
     cmd: &CliCommand,
     inv: &CliInvocation,
     log_dir: Option<&Path>,
+    service_evidence: awcc_diagnostics::service::ServiceSupport,
 ) -> Result<CliOutput> {
     let resolved_level = resolve_log_level(
         inv.cli_log_level.as_deref(),
@@ -755,9 +779,10 @@ fn execute_passive_diagnostics_command(
         "cli_mode".to_string(),
         if inv.sim_mode { "simulated" } else { "default" }.to_string(),
     );
-    let bundle = runtime
+    let mut bundle = runtime
         .assemble_support_bundle(None, extra_settings)
         .context("failed to assemble passive support bundle")?;
+    bundle.attach_service_support(service_evidence)?;
 
     match cmd {
         CliCommand::DiagnosticsSummary { json: true } => Ok(CliOutput::line(bundle.report_json)),
@@ -817,7 +842,16 @@ pub fn execute_active_cli_command(
                 cli_verbose: false,
                 cli_trace_raw_usb: false,
             };
-            execute_passive_diagnostics_command(&cmd, &default_inv, default_log_dir().as_deref())
+            execute_passive_diagnostics_command(
+                &cmd,
+                &default_inv,
+                default_log_dir().as_deref(),
+                awcc_diagnostics::service::ServiceSupport {
+                    state: "unavailable".into(),
+                    gaps: vec!["No service evidence collector was supplied".into()],
+                    ..Default::default()
+                },
+            )
         }
         CliCommand::QueryMode => {
             let snap = orch.query_snapshot();
@@ -1043,7 +1077,8 @@ pub fn execute_active_cli_command(
         CliCommand::DaemonMode => {
             bail!("daemon mode is dispatched before command execution")
         }
-        CliCommand::ServiceStatus { .. }
+        CliCommand::DiagnosticsRecording { .. }
+        | CliCommand::ServiceStatus { .. }
         | CliCommand::ServiceManage { .. }
         | CliCommand::ServiceApply { .. }
         | CliCommand::ServiceAuthorize { .. }
@@ -1072,8 +1107,10 @@ fn daemon_build_summary() -> awcc_service::ipc::BuildSummary {
 /// Run the privileged daemon (the single entry point shared by every installation format) until
 /// SIGTERM/SIGINT. It owns thermal control; see `awcc_service::control` for the policies.
 fn run_privileged_daemon() -> Result<CliOutput> {
-    let report = awcc_service::daemon::run_system_daemon(daemon_build_summary())
-        .context("the privileged daemon could not run")?;
+    let report = awcc_service::daemon::run_system_daemon(daemon_build_summary()).map_err(|error| {
+        tracing::error!(target:"awcc_service::daemon", code="daemon_start_or_run_failed", error=%error, "privileged daemon could not run");
+        error
+    }).context("the privileged daemon could not run")?;
     Ok(CliOutput::line(format!("daemon stopped: {report}")))
 }
 
@@ -1139,6 +1176,20 @@ fn service_authorized_users(json: bool) -> Result<CliOutput> {
 
 /// Hardware/profile construction, injectable so tests can prove which paths touch a backend.
 pub trait CliBackends {
+    fn diagnostic_recording(
+        &mut self,
+        _seconds: u16,
+    ) -> Result<awcc_diagnostics::service::RecordingStatus> {
+        bail!("service recording backend unavailable")
+    }
+
+    fn support_evidence(&mut self, _simulated: bool) -> awcc_diagnostics::service::ServiceSupport {
+        awcc_diagnostics::service::ServiceSupport {
+            state: "unavailable".into(),
+            gaps: vec!["Backend diagnostic evidence unavailable".into()],
+            ..Default::default()
+        }
+    }
     /// Resolve the device profile (`--sim` selects the simulated m15 R6 profile).
     fn device_profile(&mut self, sim: bool) -> Result<DeviceProfile>;
     /// Construct the orchestrator that owns the ACPI/USB transports.
@@ -1149,6 +1200,18 @@ pub trait CliBackends {
 pub struct RealBackends;
 
 impl CliBackends for RealBackends {
+    fn diagnostic_recording(
+        &mut self,
+        seconds: u16,
+    ) -> Result<awcc_diagnostics::service::RecordingStatus> {
+        awcc_service::ipc::DaemonClient::system("awcc-cli-recording", env!("CARGO_PKG_VERSION"))
+            .diagnostic_recording(seconds)
+            .map_err(Into::into)
+    }
+
+    fn support_evidence(&mut self, simulated: bool) -> awcc_diagnostics::service::ServiceSupport {
+        awcc_service::diagnostics::collect(simulated)
+    }
     fn device_profile(&mut self, sim: bool) -> Result<DeviceProfile> {
         if sim {
             awcc_platform::resolve_simulated_m15_r6_profile()
@@ -1229,7 +1292,8 @@ pub fn run_with_log_dir(
     // In particular the elevated helper must emit only the JSONL protocol on stdout.
     let management = matches!(
         inv.command,
-        CliCommand::ServiceStatus { .. }
+        CliCommand::DiagnosticsRecording { .. }
+            | CliCommand::ServiceStatus { .. }
             | CliCommand::ServiceManage { .. }
             | CliCommand::ServiceApply { .. }
             | CliCommand::ServiceAuthorize { .. }
@@ -1246,6 +1310,22 @@ pub fn run_with_log_dir(
         );
     }
     match &inv.command {
+        CliCommand::DiagnosticsRecording { seconds } => {
+            let result = backends.diagnostic_recording(*seconds).map(|status| {
+                CliOutput::line(if status.active {
+                    format!(
+                        "Service DEBUG recording active ({}; no extra hardware polls)",
+                        status.remaining_secs.map_or_else(
+                            || "remaining time unavailable".into(),
+                            |seconds| format!("{seconds}s remaining")
+                        )
+                    )
+                } else {
+                    "Service DEBUG recording stopped".into()
+                })
+            });
+            return emit(out, err, result);
+        }
         CliCommand::ServiceStatus { json } => return emit(out, err, service_status(*json)),
         CliCommand::ServiceManage { action, json } => {
             let result = manage_service(*action, *json, err);
@@ -1336,7 +1416,8 @@ pub fn run_with_log_dir(
 
     let result = match inv.command.clone() {
         CliCommand::Help | CliCommand::Version => unreachable!("handled above"),
-        CliCommand::ServiceStatus { .. }
+        CliCommand::DiagnosticsRecording { .. }
+        | CliCommand::ServiceStatus { .. }
         | CliCommand::ServiceManage { .. }
         | CliCommand::ServiceApply { .. }
         | CliCommand::ServiceAuthorize { .. }
@@ -1347,7 +1428,12 @@ pub fn run_with_log_dir(
             .device_profile(inv.sim_mode)
             .map(|profile| CliOutput::line(format_device_info(&profile))),
         CliCommand::DiagnosticsSummary { .. } | CliCommand::DiagnosticsExport { .. } => {
-            execute_passive_diagnostics_command(&inv.command, &inv, log_dir)
+            execute_passive_diagnostics_command(
+                &inv.command,
+                &inv,
+                log_dir,
+                backends.support_evidence(inv.sim_mode),
+            )
         }
         CliCommand::DaemonMode if inv.sim_mode => Err(anyhow::anyhow!(
             "daemon mode serves real hardware only and cannot be combined with --sim"
@@ -1388,6 +1474,12 @@ fn main() -> std::process::ExitCode {
             eprintln!("provider handover requires root");
             return std::process::ExitCode::FAILURE;
         }
+        if let Ok(level) = resolve_log_level(None, false, None) {
+            let mut cfg = DiagnosticsConfig::from_env_and_cli("awcc-provider-setup", level, false);
+            cfg.log_dir = Some(PathBuf::from("/var/lib/awcc/awcc-rs/logs"));
+            cfg.service_console = true;
+            init_global_diagnostics(cfg);
+        }
         let paths = awcc_service::installer::InstallPaths::system();
         let runner = awcc_service::installer::SystemRunner::default();
         let result = match raw_args.get(1).map(String::as_str) {
@@ -1408,13 +1500,18 @@ fn main() -> std::process::ExitCode {
             Some("remove") => awcc_service::provider_install::remove(&paths, &runner),
             _ => Err("expected install or remove".into()),
         };
-        return match result {
+        let exit = match result {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
+                tracing::error!(target:"awcc_service::provider_install", code="provider_setup_failed", error=%e, "provider setup could not complete");
                 eprintln!("{e}");
                 std::process::ExitCode::FAILURE
             }
         };
+        if let Some(diag) = global_diagnostics() {
+            diag.shutdown(Duration::from_secs(1));
+        }
+        return exit;
     }
     // Only initialize global file/tracing diagnostics and panic hook when not running a pure
     // fast-path (`--help`, `--version`) or passive `diagnostics` export.
@@ -1425,6 +1522,7 @@ fn main() -> std::process::ExitCode {
                 | CliCommand::Version
                 | CliCommand::DiagnosticsSummary { .. }
                 | CliCommand::DiagnosticsExport { .. }
+                | CliCommand::DiagnosticsRecording { .. }
                 | CliCommand::ServiceStatus { .. }
                 | CliCommand::ServiceManage { .. }
                 | CliCommand::ServiceApply { .. }
@@ -2094,6 +2192,59 @@ mod tests {
                 "{flag}: {}",
                 result.stderr
             );
+        }
+    }
+
+    #[test]
+    fn daemon_recording_commands_never_construct_hardware_and_validate_bounds() {
+        #[derive(Default)]
+        struct RecordingBackend(Vec<u16>);
+        impl CliBackends for RecordingBackend {
+            fn device_profile(&mut self, _: bool) -> Result<DeviceProfile> {
+                panic!("recording must not resolve hardware")
+            }
+            fn orchestrator(&mut self, _: bool) -> Result<ThermalOrchestrator> {
+                panic!("recording must not construct hardware")
+            }
+            fn diagnostic_recording(
+                &mut self,
+                seconds: u16,
+            ) -> Result<awcc_diagnostics::service::RecordingStatus> {
+                self.0.push(seconds);
+                Ok(awcc_diagnostics::service::RecordingStatus {
+                    active: seconds > 0,
+                    remaining_secs: (seconds > 0).then_some(u64::from(seconds)),
+                })
+            }
+        }
+        let mut backend = RecordingBackend::default();
+        for (args, expected) in [
+            (&["diagnostics", "record"][..], 300),
+            (&["diagnostics", "record", "--seconds", "45"], 45),
+            (&["diagnostics", "stop-recording"], 0),
+        ] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(run(&to_args(args), &mut backend, &mut out, &mut err), 0);
+            assert_eq!(backend.0.last(), Some(&expected));
+            assert!(err.is_empty());
+        }
+        for args in [
+            &["diagnostics", "record", "--seconds", "0"][..],
+            &["diagnostics", "record", "--seconds", "301"],
+            &["--sim", "diagnostics", "record"],
+        ] {
+            let before = backend.0.len();
+            assert_ne!(
+                run(
+                    &to_args(args),
+                    &mut backend,
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                ),
+                0
+            );
+            assert_eq!(backend.0.len(), before);
         }
     }
 

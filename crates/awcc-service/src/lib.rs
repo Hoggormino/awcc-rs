@@ -62,6 +62,7 @@ use thiserror::Error;
 
 pub mod control;
 pub mod daemon;
+pub mod diagnostics;
 pub mod installer;
 pub mod ipc;
 pub mod keybinder;

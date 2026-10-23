@@ -9,6 +9,8 @@ use std::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CpuPolicyOutcome {
     pub confirmed: bool,
+    #[serde(default)]
+    pub drivers: Vec<String>,
     pub controls: Vec<String>,
     pub errors: Vec<String>,
 }
@@ -26,10 +28,15 @@ impl CpuPolicyBackend for SimCpuPolicy {
     fn apply(&mut self, _: PowerProfile, current: &dyn Fn() -> bool) -> CpuPolicyOutcome {
         CpuPolicyOutcome {
             confirmed: current(),
+            drivers: vec!["simulated".into()],
             controls: vec!["simulated CPU policy".into()],
             errors: vec![],
         }
     }
+}
+struct CpuPlan {
+    controls: Vec<(PathBuf, String)>,
+    drivers: Vec<String>,
 }
 pub struct LinuxCpuPolicy {
     root: PathBuf,
@@ -41,7 +48,7 @@ impl LinuxCpuPolicy {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
-    fn plan(&self, profile: PowerProfile) -> Result<Vec<(PathBuf, String)>, String> {
+    fn plan(&self, profile: PowerProfile) -> Result<CpuPlan, String> {
         let entries = fs::read_dir(&self.root).map_err(|e| format!("CPUFreq unavailable: {e}"))?;
         let mut policies = entries
             .filter_map(Result::ok)
@@ -56,8 +63,10 @@ impl LinuxCpuPolicy {
             return Err("no CPUFreq policies available".into());
         }
         let mut plan = Vec::new();
+        let mut drivers = Vec::new();
         for policy in policies {
             let driver = read(&policy.join("scaling_driver"))?;
+            drivers.push(format!("{}: {driver}", policy.display()));
             let governors = read(&policy.join("scaling_available_governors"))?;
             let epp = policy.join("energy_performance_preference");
             // Active HWP/EPP drivers need powersave to permit EPP writes. Passive drivers use
@@ -102,7 +111,10 @@ impl LinuxCpuPolicy {
                 plan.push((epp, value.into()));
             }
         }
-        Ok(plan)
+        Ok(CpuPlan {
+            controls: plan,
+            drivers,
+        })
     }
 }
 fn choose<'a>(available: &str, choices: &[&'a str]) -> Option<&'a str> {
@@ -129,7 +141,8 @@ impl CpuPolicyBackend for LinuxCpuPolicy {
                 return outcome;
             }
         };
-        for (path, value) in plan {
+        outcome.drivers = plan.drivers;
+        for (path, value) in plan.controls {
             if !current() {
                 outcome
                     .errors

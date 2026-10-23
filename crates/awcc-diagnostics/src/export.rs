@@ -380,6 +380,8 @@ pub struct SupportReport {
     pub sink_status: SinkStatus,
     pub redaction_policy: RedactionPolicySummary,
     pub evidence: EvidenceEnvelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_diagnostics: Option<crate::service::ServiceSupport>,
 }
 
 /// Inputs used to build a passive support bundle or diagnostic summary.
@@ -921,6 +923,7 @@ impl SupportBundle {
             sink_status,
             redaction_policy: RedactionPolicySummary::new(input.settings.trace_raw_usb_opt_in),
             evidence: envelope,
+            service_diagnostics: None,
         };
         let report_json = serde_json::to_string_pretty(&report)?;
         let build_info_json = serde_json::to_string_pretty(&redacted_build)?;
@@ -948,7 +951,7 @@ impl SupportBundle {
 
     /// Encode this bundle as a bounded ZIP archive in memory.
     pub fn to_zip_bytes(&self) -> Result<Vec<u8>, ExportError> {
-        let entries = [
+        let mut entries = vec![
             ZipEntry {
                 name: "summary.txt".to_string(),
                 data: self.summary_txt.as_bytes().to_vec(),
@@ -974,6 +977,23 @@ impl SupportBundle {
                 data: self.settings_json.as_bytes().to_vec(),
             },
         ];
+        if let Some(service) = &self.report.service_diagnostics {
+            entries.push(ZipEntry {
+                name: "service-diagnostics.json".into(),
+                data: serde_json::to_vec_pretty(service)?,
+            });
+            let mut events = String::new();
+            if let Some(daemon) = &service.daemon {
+                for event in daemon.history.iter().chain(&daemon.events) {
+                    events.push_str(&serde_json::to_string(event)?);
+                    events.push('\n');
+                }
+            }
+            entries.push(ZipEntry {
+                name: "daemon-events.jsonl".into(),
+                data: events.into_bytes(),
+            });
+        }
         Ok(write_zip(&entries, self.report.generated_unix_ms)?)
     }
 

@@ -10,7 +10,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use zbus::{
     fdo,
@@ -55,25 +55,48 @@ impl Bridge {
             .ok_or_else(|| error("provider initializing"))
     }
     fn apply_desired(&self, op: ControlOp, desired: Option<u64>) -> fdo::Result<()> {
+        let id = desired.map_or_else(
+            || self.new_id("operation"),
+            |generation| format!("dbus-intent-{generation}"),
+        );
+        self.apply_request(op, desired, id)
+    }
+    fn new_id(&self, kind: &str) -> String {
+        format!(
+            "dbus-{kind}-{}",
+            self.sequence.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+    fn apply_request(&self, op: ControlOp, desired: Option<u64>, id: String) -> fdo::Result<()> {
+        let started = Instant::now();
+        tracing::info!(target:"awcc_service::power_bus", code="power_request_submitted", request_id=%id, generation=?desired, operation=match &op { ControlOp::SelectPower(_) => "select", ControlOp::HoldPower(_) => "hold", ControlOp::ReleasePower { .. } => "release", ControlOp::DisconnectPower(_) => "disconnect", _ => "control" }, "profile request submitted to control worker");
         let handle = self
             .control
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .ok_or_else(|| error("provider initializing"))?;
-        let id = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let request = ControlRequest::Op {
-            id: format!("dbus-{id}"),
-            op,
-        };
+        let request = ControlRequest::Op { id: id.clone(), op };
         let submission = if let Some(g) = desired {
             handle.request_desired(request, Duration::from_secs(12), g)
         } else {
             handle.request(request, Duration::from_secs(12))
         };
-        let reply = submission
-            .map_err(|e| error(format!("{e:?}")))?
-            .ok_or_else(|| error("operation pending; inspect provider state before retrying"))?;
+        let reply = submission.map_err(|e| {
+            tracing::error!(target:"awcc_service::power_bus", code="power_queue_rejected", request_id=%id, error=?e, "control queue rejected profile request");
+            error(format!("{e:?}"))
+        })?.ok_or_else(|| {
+            tracing::warn!(target:"awcc_service::power_bus", code="power_request_pending", request_id=%id, elapsed_ms=started.elapsed().as_millis() as u64, "request still pending; outcome must be inspected before retrying");
+            error("operation pending; inspect provider state before retrying")
+        })?;
+        tracing::info!(target:"awcc_service::power_bus", code="power_request_completed", request_id=%id, elapsed_ms=started.elapsed().as_millis() as u64, outcome=?reply.result, "control worker returned profile outcome");
+        if !reply
+            .result
+            .as_ref()
+            .is_ok_and(|lifecycle| !lifecycle.is_error_or_rollback())
+        {
+            tracing::warn!(target:"awcc_service::power_bus", code="power_request_failed", request_id=%id, outcome=?reply.result, "profile request failed or rolled back");
+        }
         match reply.result {
             Ok(lifecycle) if !lifecycle.is_error_or_rollback() => Ok(()),
             Ok(lifecycle) => Err(error(lifecycle.detail_message())),
@@ -89,14 +112,23 @@ async fn authorize(
     connection: &zbus::Connection,
     header: Option<&Header<'_>>,
     action: &str,
+    request_id: &str,
+    endpoint: &str,
 ) -> fdo::Result<String> {
-    let sender = header
-        .and_then(|h| h.sender())
-        .ok_or_else(|| fdo::Error::AccessDenied("missing bus credentials".into()))?
-        .to_string();
-    let bus = fdo::DBusProxy::new(connection).await?;
+    let started = Instant::now();
+    let sender = header.and_then(|header| header.sender()).ok_or_else(|| {
+        tracing::error!(target:"awcc_service::power_bus", code="power_credentials_missing", request_id, endpoint, "bus request has no authenticated sender");
+        fdo::Error::AccessDenied("missing bus credentials".into())
+    })?.to_string();
+    tracing::debug!(target:"awcc_service::power_bus", code="power_authorization_started", request_id, endpoint, sender, action, "checking profile authorization");
+    let bus = fdo::DBusProxy::new(connection).await.map_err(|e| { tracing::error!(target:"awcc_service::power_bus", code="power_credentials_failed", request_id, endpoint, error=%e, "cannot create bus credentials proxy"); e })?;
     let name = zbus::names::BusName::try_from(sender.as_str()).map_err(error)?;
-    if bus.get_connection_unix_user(name).await? == 0 {
+    let uid = bus.get_connection_unix_user(name).await.map_err(|e| {
+        tracing::error!(target:"awcc_service::power_bus", code="power_credentials_failed", request_id, endpoint, error=%e, "cannot obtain bus sender credentials");
+        e
+    })?;
+    if uid == 0 {
+        tracing::info!(target:"awcc_service::power_bus", code="power_authorization_allowed", request_id, endpoint, authority="root_credentials", elapsed_ms=started.elapsed().as_millis() as u64, "profile request authorized");
         return Ok(sender);
     }
     let authority = zbus::Proxy::new(
@@ -106,26 +138,31 @@ async fn authorize(
         "org.freedesktop.PolicyKit1.Authority",
     )
     .await
-    .map_err(error)?;
+    .map_err(|e| { tracing::error!(target:"awcc_service::power_bus", code="polkit_proxy_failed", request_id, endpoint, error=%e, "cannot contact authorization service"); error(e) })?;
     let subject = (
         "system-bus-name",
         HashMap::from([("name", Value::from(sender.as_str()))]),
     );
-    // Authorization result details are strings; subject details above are variants.
-    let (allowed, _, _): (bool, bool, HashMap<String, String>) = authority
-        .call(
-            "CheckAuthorization",
-            &(subject, action, HashMap::<String, String>::new(), 1_u32, ""),
-        )
-        .await
-        .map_err(|e| fdo::Error::AccessDenied(e.to_string()))?;
+    let reply = authority.call_method("CheckAuthorization", &(subject, action, HashMap::<String,String>::new(), 1_u32, "")).await.map_err(|e| {
+        tracing::error!(target:"awcc_service::power_bus", code="polkit_call_failed", request_id, endpoint, error=%e, "authorization service call failed");
+        error(e)
+    })?;
+    let body = reply.body();
+    let received = body.signature().to_string();
+    let (allowed, challenge, _): (bool,bool,HashMap<String,String>) = body.deserialize().map_err(|e| {
+        tracing::error!(target:"awcc_service::power_bus", code="polkit_reply_decode_failed", request_id, endpoint, expected_signature="(bba{ss})", received_signature=%received, error=%e, "authorization reply could not be decoded");
+        error(e)
+    })?;
     if !allowed {
+        tracing::warn!(target:"awcc_service::power_bus", code="power_authorization_denied", request_id, endpoint, challenge, elapsed_ms=started.elapsed().as_millis() as u64, "authorization policy denied the profile request");
         return Err(fdo::Error::AccessDenied(
             "profile operation is not authorized".into(),
         ));
     }
+    tracing::info!(target:"awcc_service::power_bus", code="power_authorization_allowed", request_id, endpoint, authority="polkit", elapsed_ms=started.elapsed().as_millis() as u64, "profile request authorized");
     Ok(sender)
 }
+
 struct Modern(Arc<Bridge>);
 struct Compat(Arc<Bridge>);
 macro_rules! endpoint {
@@ -150,13 +187,16 @@ macro_rules! endpoint {
                 #[zbus(connection)] connection: &zbus::Connection,
             ) -> fdo::Result<()> {
                 let generation = self.0.reserve_desired()?;
+                let request_id = format!("dbus-intent-{generation}");
+                tracing::info!(target:"awcc_service::power_bus", code="power_request_received", request_id=%request_id, endpoint=$name, member="ActiveProfile.Set", requested=%crate::diagnostics::short(value), "desktop profile selection received");
                 authorize(
                     connection,
                     header.as_ref(),
                     "io.github.hoggormino.awcc_rs.switch-profile",
+                    &request_id, $name,
                 )
                 .await?;
-                let profile = PowerProfile::parse(value).map_err(fdo::Error::InvalidArgs)?;
+                let profile = PowerProfile::parse(value).map_err(|reason| { tracing::warn!(target:"awcc_service::power_bus", code="power_profile_invalid", request_id=%request_id, endpoint=$name, requested=%crate::diagnostics::short(value), error=%reason, "unsupported public profile name"); fdo::Error::InvalidArgs(reason) })?;
                 let bridge = Arc::clone(&self.0);
                 blocking::unblock(move || {
                     bridge.apply_desired(ControlOp::SelectPower(profile), Some(generation))
@@ -198,6 +238,7 @@ macro_rules! endpoint {
             #[zbus(property)]
             fn set_battery_aware(&mut self, enabled: bool) -> fdo::Result<()> {
                 if enabled {
+                    tracing::warn!(target:"awcc_service::power_bus", code="power_optional_property_unsupported", endpoint=$name, property="BatteryAware", "desktop requested unsupported optional provider behavior");
                     Err(fdo::Error::NotSupported(
                         "AC/battery selection belongs to the desktop".into(),
                     ))
@@ -236,13 +277,16 @@ macro_rules! endpoint {
                 #[zbus(header)] header: Header<'_>,
                 #[zbus(connection)] connection: &zbus::Connection,
             ) -> fdo::Result<u32> {
+                let request_id = self.0.new_id("hold");
+                tracing::info!(target:"awcc_service::power_bus", code="power_hold_received", request_id=%request_id, endpoint=$name, requested=%crate::diagnostics::short(profile), "temporary profile hold received");
                 let owner = authorize(
                     connection,
                     Some(&header),
                     "io.github.hoggormino.awcc_rs.hold-profile",
+                    &request_id, $name,
                 )
                 .await?;
-                let profile = PowerProfile::parse(profile).map_err(fdo::Error::InvalidArgs)?;
+                let profile = PowerProfile::parse(profile).map_err(|reason| { tracing::warn!(target:"awcc_service::power_bus", code="power_profile_invalid", request_id=%request_id, endpoint=$name, error=%crate::diagnostics::short(&reason), "unsupported hold profile name"); fdo::Error::InvalidArgs(reason) })?;
                 let cookie = self.0.sequence.fetch_add(1, Ordering::Relaxed);
                 let hold = ProfileHold {
                     cookie,
@@ -252,7 +296,7 @@ macro_rules! endpoint {
                     application_id: application_id.into(),
                 };
                 let bridge = Arc::clone(&self.0);
-                blocking::unblock(move || bridge.apply(ControlOp::HoldPower(hold))).await?;
+                blocking::unblock(move || bridge.apply_request(ControlOp::HoldPower(hold), None, request_id)).await?;
                 Ok(cookie)
             }
             async fn release_profile(
@@ -261,17 +305,21 @@ macro_rules! endpoint {
                 #[zbus(header)] header: Header<'_>,
                 #[zbus(connection)] connection: &zbus::Connection,
             ) -> fdo::Result<()> {
+                let request_id = self.0.new_id("release");
+                tracing::info!(target:"awcc_service::power_bus", code="power_hold_release_received", request_id=%request_id, endpoint=$name, cookie, "profile hold release received");
                 let owner = authorize(
                     connection,
                     Some(&header),
                     "io.github.hoggormino.awcc_rs.hold-profile",
+                    &request_id, $name,
                 )
                 .await?;
                 let bridge = Arc::clone(&self.0);
-                blocking::unblock(move || bridge.apply(ControlOp::ReleasePower { cookie, owner }))
+                blocking::unblock(move || bridge.apply_request(ControlOp::ReleasePower { cookie, owner }, None, request_id))
                     .await
             }
             async fn set_action_enabled(&self, _action: &str, _enabled: bool) -> fdo::Result<()> {
+                tracing::warn!(target:"awcc_service::power_bus", code="power_optional_action_unsupported", endpoint=$name, "desktop requested an unsupported optional action");
                 Err(fdo::Error::NotSupported(
                     "no optional actions are implemented".into(),
                 ))
@@ -297,7 +345,7 @@ impl PowerBus {
     /// Claim both names without replacing or queueing behind another provider. Call before any
     /// hardware factory or startup restore. No thermal writes occur when ownership is refused.
     pub fn system() -> Result<Self, String> {
-        Self::build(zbus::blocking::connection::Builder::system().map_err(|e| e.to_string())?)
+        Self::build(zbus::blocking::connection::Builder::system().map_err(|e| { tracing::error!(target:"awcc_service::power_bus", code="power_bus_connect_failed", error=%e, "cannot connect to system bus"); e.to_string() })?)
     }
     fn build(builder: zbus::blocking::connection::Builder<'_>) -> Result<Self, String> {
         let bridge = Arc::new(Bridge::default());
@@ -307,11 +355,19 @@ impl PowerBus {
             .serve_at(COMPAT.1, Compat(bridge.clone()))
             .map_err(|e| e.to_string())?
             .build()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| { tracing::error!(target:"awcc_service::power_bus", code="power_bus_connect_failed", error=%e, "cannot connect and register provider endpoints"); e.to_string() })?;
+        tracing::info!(target:"awcc_service::power_bus", code="power_bus_connected", "connected to system profile bus");
         for (name, _) in [MODERN, COMPAT] {
             connection
                 .request_name_with_flags(name, zbus::fdo::RequestNameFlags::DoNotQueue.into())
-                .map_err(|e| format!("cannot own {name}: {e}"))?;
+                .map_err(|e| {
+                    let bus = zbus::blocking::fdo::DBusProxy::new(&connection).ok();
+                    let owner = bus.and_then(|bus| zbus::names::BusName::try_from(name).ok().and_then(|name| bus.get_name_owner(name).ok())).map(|name| name.to_string());
+                    let competing_pid = owner.as_deref().and_then(|owner| zbus::blocking::fdo::DBusProxy::new(&connection).ok().and_then(|bus| zbus::names::BusName::try_from(owner).ok().and_then(|name| bus.get_connection_unix_process_id(name).ok())));
+                    tracing::error!(target:"awcc_service::power_bus", code="power_bus_name_failed", endpoint=name, competing_owner=?owner, competing_pid, error=%e, "cannot acquire provider name; hardware owner will not start");
+                    format!("cannot own {name}: {e}")
+                })?;
+            tracing::info!(target:"awcc_service::power_bus", code="power_bus_name_acquired", endpoint=name, "provider name acquired");
         }
         Ok(Self {
             connection,
@@ -335,6 +391,7 @@ impl PowerBus {
             Ok(life) => return Err(life.detail_message()),
             Err(e) => return Err(e.message),
         }
+        tracing::info!(target:"awcc_service::power_bus", code="power_provider_ready", active=?initial.view.control.power.active, available=?initial.view.control.power.available, "PowerProfiles provider initialized");
         *self
             .bridge
             .control
@@ -394,41 +451,49 @@ impl PowerBus {
                                 changed.insert("Profiles", value);
                             }
                             let invalidated: Vec<&str> = vec![];
-                            let _ = connection.emit_signal(
+                            let emitted = connection.emit_signal(
                                 None::<&str>,
                                 path,
                                 "org.freedesktop.DBus.Properties",
                                 "PropertiesChanged",
                                 &(iface, changed, invalidated),
                             );
+                            match emitted {
+                                Ok(()) => tracing::info!(target:"awcc_service::power_bus", code="power_properties_published", endpoint=iface, generation=now.generation, active=?now.active, "profile properties notification sent"),
+                                Err(e) => tracing::error!(target:"awcc_service::power_bus", code="power_properties_publish_failed", endpoint=iface, generation=now.generation, error=%e, "profile properties notification failed"),
+                            }
                             for (seq, cookie, owner) in &now.releases {
-                                if *seq > release_seq {
-                                    let _ = connection.emit_signal(
+                                if *seq > release_seq
+                                    && let Err(e) = connection.emit_signal(
                                         Some(owner.as_str()),
                                         path,
                                         iface,
                                         "ProfileReleased",
                                         &(cookie,),
-                                    );
-                                }
+                                    ) { tracing::error!(target:"awcc_service::power_bus", code="power_release_publish_failed", endpoint=iface, cookie, error=%e, "hold release notification failed"); }
                             }
                         }
                         release_seq = now.releases.last().map_or(release_seq, |r| r.0);
                         previous = now.clone();
                     }
-                    if let Ok(bus) = zbus::blocking::fdo::DBusProxy::new(&connection) {
-                        for owner in now
-                            .holds
-                            .iter()
-                            .map(|h| h.owner.clone())
-                            .collect::<std::collections::BTreeSet<_>>()
-                        {
-                            if let Ok(name) = zbus::names::BusName::try_from(owner.as_str())
-                                && bus.name_has_owner(name).ok() == Some(false)
-                            {
-                                let _ = bridge.apply(ControlOp::DisconnectPower(owner));
+                    match zbus::blocking::fdo::DBusProxy::new(&connection) {
+                        Ok(bus) => {
+                            for owner in now.holds.iter().map(|hold| hold.owner.clone()).collect::<std::collections::BTreeSet<_>>() {
+                                let name = match zbus::names::BusName::try_from(owner.as_str()) {
+                                    Ok(name) => name,
+                                    Err(error) => { tracing::warn!(target:"awcc_service::power_bus", code="power_owner_monitor_failed", error=%error, "hold owner name could not be checked"); continue; }
+                                };
+                                match bus.name_has_owner(name) {
+                                    Ok(false) => {
+                                        tracing::info!(target:"awcc_service::power_bus", code="power_hold_owner_disconnected", sender=%owner, "releasing disconnected caller holds");
+                                        if let Err(error) = bridge.apply(ControlOp::DisconnectPower(owner)) { tracing::error!(target:"awcc_service::power_bus", code="power_hold_cleanup_failed", error=%error, "hold cleanup failed"); }
+                                    }
+                                    Ok(true) => {}
+                                    Err(error) => tracing::warn!(target:"awcc_service::power_bus", code="power_owner_monitor_failed", error=%error, "hold owner connection could not be checked"),
+                                }
                             }
                         }
+                        Err(error) => tracing::warn!(target:"awcc_service::power_bus", code="power_bus_monitor_failed", error=%error, "provider bus monitoring unavailable"),
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
@@ -440,6 +505,7 @@ impl PowerBus {
 impl Drop for PowerBus {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        tracing::info!(target:"awcc_service::power_bus", code="power_provider_stopped", "PowerProfiles provider stopping");
     }
 }
 
@@ -545,6 +611,40 @@ mod tests {
     };
     #[derive(serde::Serialize, zbus::zvariant::Type)]
     struct AuthorizationReply(bool, bool, HashMap<String, String>);
+    fn test_diagnostics() -> Arc<awcc_diagnostics::DiagnosticsRuntime> {
+        static RUNTIME: std::sync::OnceLock<Arc<awcc_diagnostics::DiagnosticsRuntime>> =
+            std::sync::OnceLock::new();
+        RUNTIME
+            .get_or_init(|| {
+                let mut cfg = awcc_diagnostics::DiagnosticsConfig::from_env_and_cli(
+                    "provider-test",
+                    awcc_diagnostics::resolve_log_level(Some("debug"), false, None).unwrap(),
+                    false,
+                );
+                cfg.enable_file_sink = false;
+                cfg.log_dir = None;
+                cfg.enable_stderr_console = false;
+                cfg.event_ring_capacity = 16384;
+                awcc_diagnostics::init_global_diagnostics(cfg)
+            })
+            .clone()
+    }
+    #[derive(serde::Serialize, zbus::zvariant::Type)]
+    struct WrongAuthorizationReply(bool, bool, HashMap<String, OwnedValue>);
+    struct WrongAuthority;
+    #[zbus::interface(name = "org.freedesktop.PolicyKit1.Authority")]
+    impl WrongAuthority {
+        fn check_authorization(
+            &self,
+            _subject: (&str, HashMap<String, OwnedValue>),
+            _action: &str,
+            _details: HashMap<String, String>,
+            _flags: u32,
+            _id: &str,
+        ) -> WrongAuthorizationReply {
+            WrongAuthorizationReply(true, false, HashMap::new())
+        }
+    }
     struct Authority(Arc<AtomicBool>);
     #[zbus::interface(name = "org.freedesktop.PolicyKit1.Authority")]
     impl Authority {
@@ -568,6 +668,7 @@ mod tests {
     }
     #[test]
     fn private_bus_contract_authorization_holds_and_owner_cleanup() {
+        let diagnostics = test_diagnostics();
         let mut daemon = Command::new("dbus-daemon")
             .args(["--session", "--nofork", "--print-address=1"])
             .stdout(Stdio::piped())
@@ -749,6 +850,100 @@ mod tests {
             service.bridge.status().active,
             Some(PowerProfile::PowerSaver)
         );
+        let events = diagnostics.events_snapshot().0;
+        let request_id = events
+            .iter()
+            .find(|event| {
+                event.code.as_deref() == Some("power_request_received")
+                    && event
+                        .fields
+                        .get("requested")
+                        .is_some_and(|value| value == "power-saver")
+            })
+            .unwrap()
+            .fields["request_id"]
+            .clone();
+        for code in [
+            "power_authorization_allowed",
+            "power_cpu_completed",
+            "power_thermal_completed",
+            "power_state_published",
+        ] {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.code.as_deref() == Some(code)
+                        && event.fields.get("request_id") == Some(&request_id)),
+                "missing {code} for {request_id}"
+            );
+        }
         let _ = handle.stop(Duration::from_secs(3));
+    }
+
+    #[test]
+    fn malformed_authorization_reply_is_logged_with_signatures_before_any_policy_change() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let diagnostics = test_diagnostics();
+        let mut daemon = Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        struct Cleanup(std::process::Child);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut address = String::new();
+        BufReader::new(daemon.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let address = address.trim();
+        let _cleanup = Cleanup(daemon);
+        let _authority = zbus::blocking::connection::Builder::address(address)
+            .unwrap()
+            .serve_at("/org/freedesktop/PolicyKit1/Authority", WrongAuthority)
+            .unwrap()
+            .name("org.freedesktop.PolicyKit1")
+            .unwrap()
+            .build()
+            .unwrap();
+        let service =
+            PowerBus::build(zbus::blocking::connection::Builder::address(address).unwrap())
+                .unwrap();
+        let core = ControlCore::new(
+            ThermalOrchestrator::new_simulated_m15_r6().unwrap(),
+            SettingsLoad::Missing,
+            Arc::new(NullSettingsSink),
+            Duration::from_secs(60),
+        );
+        let handle = ControlHandle::spawn(core).unwrap();
+        service.attach(handle.clone()).unwrap();
+        let before = service.bridge.status();
+        let client = zbus::blocking::connection::Builder::address(address)
+            .unwrap()
+            .build()
+            .unwrap();
+        let proxy = zbus::blocking::Proxy::new(&client, MODERN.0, MODERN.1, MODERN.0).unwrap();
+        let error = proxy
+            .set_property("ActiveProfile", "performance")
+            .unwrap_err();
+        assert!(error.to_string().contains("Signature mismatch"));
+        assert_eq!(service.bridge.status(), before);
+        let event = diagnostics
+            .events_snapshot()
+            .0
+            .into_iter()
+            .find(|event| event.code.as_deref() == Some("polkit_reply_decode_failed"))
+            .unwrap();
+        assert_eq!(event.severity, awcc_diagnostics::Severity::Error);
+        assert_eq!(event.fields["expected_signature"], "(bba{ss})");
+        assert_eq!(event.fields["received_signature"], "(bba{sv})");
+        assert!(event.fields.contains_key("request_id"));
+        assert!(handle.stop(Duration::from_secs(3)).is_some());
     }
 }

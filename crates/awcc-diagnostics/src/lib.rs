@@ -7,6 +7,7 @@ pub mod export;
 pub mod hash;
 pub mod redact;
 pub mod ring;
+pub mod service;
 pub mod sink;
 pub mod time;
 pub mod zip;
@@ -193,6 +194,7 @@ struct FailureKey {
     component: String,
     code: Option<String>,
     message: String,
+    fields: BTreeMap<String, String>,
 }
 
 struct PendingFold {
@@ -548,6 +550,7 @@ impl DiagnosticsRuntime {
                     component: item.component.clone(),
                     code: item.code.clone(),
                     message: item.message.clone(),
+                    fields: item.fields.clone(),
                 };
                 if let Some(pending) = rl.pending_by_component.get_mut(&item.component) {
                     if pending.key == key {
@@ -663,7 +666,12 @@ impl DiagnosticsRuntime {
                     || ev.severity == Severity::Error
                     || ev.code.as_deref() == Some("invalid_log_env"))
             {
-                console.send(self.redactor.redact_text(&ev.render_line()));
+                console.send(
+                    self.redactor
+                        .redact_text(&ev.render_line())
+                        .replace('\r', "\\r")
+                        .replace('\n', "\\n"),
+                );
             }
         }
         last_seq

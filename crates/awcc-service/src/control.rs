@@ -331,6 +331,7 @@ pub struct ControlCore {
     applying_power: bool,
     desired_generation: Option<(Arc<AtomicU64>, u64)>,
     applied_policy: Option<(awcc_core::PowerProfile, awcc_core::ThermalPolicy)>,
+    diagnostic_request: Option<String>,
     settings: ServiceSettings,
     sink: Arc<dyn SettingsSink>,
     settings_problem: Option<String>,
@@ -448,6 +449,7 @@ impl ControlCore {
             applying_power: false,
             desired_generation: None,
             applied_policy: None,
+            diagnostic_request: None,
             settings,
             sink,
             settings_problem,
@@ -484,6 +486,11 @@ impl ControlCore {
 
     fn handle_power(&mut self, op: &ControlOp) -> Option<ControlReply> {
         use awcc_core::{PowerProfile as P, ThermalPolicy as T};
+        let request_id = self
+            .diagnostic_request
+            .clone()
+            .unwrap_or_else(|| format!("internal-power-{}", self.power.generation.wrapping_add(1)));
+        let transition_started = Instant::now();
         let original_settings = self.settings.clone();
         let original_holds = self.power.holds.clone();
         let mut wanted = None;
@@ -682,10 +689,12 @@ impl ControlCore {
             })
             .collect();
         let effective = self.power.effective(selected);
+        tracing::info!(target:"awcc_service::power", code="power_policy_requested", request_id=%request_id, generation=self.power.generation, selected=selected.as_str(), effective=effective.as_str(), held=!self.power.holds.is_empty(), "coordinating system and thermal profile policy");
         let policy = self.settings.power.counterparts.get(&effective).cloned();
         if self.applied_policy.as_ref() == policy.as_ref().map(|p| (effective, p.clone())).as_ref()
             && !matches!(op, ControlOp::EnablePower | ControlOp::ReconcilePower)
         {
+            tracing::info!(target:"awcc_service::power", code="power_policy_unchanged", request_id=%request_id, generation=self.power.generation, "requested policy already active; no hardware writes needed");
             if save {
                 self.persist();
             }
@@ -700,12 +709,15 @@ impl ControlCore {
         let generation = self.desired_generation.clone();
         self.applied_policy = None;
         self.power.thermal = None;
+        let cpu_started = Instant::now();
         self.power.cpu = self.cpu.apply(effective, &|| {
             generation
                 .as_ref()
                 .is_none_or(|(latest, g)| latest.load(Ordering::Acquire) == *g)
         });
+        tracing::info!(target:"awcc_service::power", code="power_cpu_completed", request_id=%request_id, generation=self.power.generation, confirmed=self.power.cpu.confirmed, drivers=?self.power.cpu.drivers, controls=?self.power.cpu.controls, errors=?self.power.cpu.errors, elapsed_ms=cpu_started.elapsed().as_millis() as u64, "CPU policy outcome recorded");
         if !self.power.cpu.confirmed {
+            tracing::error!(target:"awcc_service::power", code="power_cpu_failed", request_id=%request_id, generation=self.power.generation, errors=?self.power.cpu.errors, "CPU policy failed; thermal phase was not attempted");
             self.power.problem = Some(format!(
                 "CPU policy failed: {}",
                 self.power.cpu.errors.join("; ")
@@ -763,11 +775,13 @@ impl ControlCore {
         // configuration and user intent separate from temporary hold-derived activation.
         let saved = self.settings.clone();
         self.applying_power = true;
+        let thermal_started = Instant::now();
         let mut reply = self.handle(command);
         self.applying_power = false;
         self.settings.power = saved.power;
         self.settings.thermal_preset = saved.thermal_preset;
         self.power.thermal = reply.result.as_ref().ok().cloned();
+        tracing::info!(target:"awcc_service::power", code="power_thermal_completed", request_id=%request_id, generation=self.power.generation, outcome=?reply.result, elapsed_ms=thermal_started.elapsed().as_millis() as u64, "thermal policy outcome recorded without additional readback");
         if reply.result.as_ref().is_ok_and(operation_succeeded) {
             self.power.active = Some(effective);
             self.power.problem = None;
@@ -778,12 +792,14 @@ impl ControlCore {
                 self.power.holds = original_holds;
             }
             self.power.problem = Some("CPU policy applied, but thermal activation failed".into());
+            tracing::error!(target:"awcc_service::power", code="power_thermal_failed", request_id=%request_id, generation=self.power.generation, "CPU policy applied but thermal phase failed; previous active system profile retained");
         }
         if save {
             self.persist();
         }
         let snap = self.orch.query_snapshot();
         reply.view = self.view_from(&snap);
+        tracing::info!(target:"awcc_service::power", code="power_policy_completed", request_id=%request_id, generation=self.power.generation, active=?self.power.active, problem=?self.power.problem, elapsed_ms=transition_started.elapsed().as_millis() as u64, "profile policy outcome prepared for publication");
         Some(reply)
     }
 
@@ -1011,6 +1027,11 @@ impl ControlCore {
     }
 
     fn reject(&mut self, code: &'static str, message: String) -> ControlReply {
+        if code == "superseded" {
+            tracing::info!(target:"awcc_service::power", code="power_request_superseded", request_id=self.diagnostic_request.as_deref().unwrap_or("internal"), reason_code=code, "older profile intent superseded");
+        } else {
+            tracing::warn!(target:"awcc_service::control", code="control_request_rejected", request_id=self.diagnostic_request.as_deref().unwrap_or("internal"), reason_code=code, error=%message, "control request rejected");
+        }
         let snap = self.orch.query_snapshot();
         ControlReply {
             raw_output: None,
@@ -1904,6 +1925,7 @@ fn serve(core: &mut ControlCore, inner: &HandleInner, env: Envelope) -> bool {
                 ControlRequest::Op { id, .. } | ControlRequest::RawAcpi { id, .. } => id.clone(),
                 _ => unreachable!("only operations reach replay handling"),
             };
+            core.diagnostic_request = Some(id.clone());
             let recorded = inner
                 .memory
                 .lock()
@@ -1957,6 +1979,7 @@ fn serve(core: &mut ControlCore, inner: &HandleInner, env: Envelope) -> bool {
         }
         ControlRequest::Shutdown => (None, true),
     };
+    let diagnostic_request = core.diagnostic_request.take();
     if let Some(reply) = reply {
         if core.view_revision != before
             && let Some(view) = core.cached_view()
@@ -1964,6 +1987,9 @@ fn serve(core: &mut ControlCore, inner: &HandleInner, env: Envelope) -> bool {
             // Replaying a historical operation result must not roll the latest published
             // telemetry/control state backwards or make an old observation look fresh.
             publish(inner, view);
+            if let Some(request_id) = diagnostic_request.as_deref() {
+                tracing::info!(target:"awcc_service::power", code="power_state_published", request_id, generation=view.control.power.generation, active=?view.control.power.active, "control state published to clients");
+            }
         }
         // One-slot channel: never blocks even if the requester gave up.
         let _ = env.reply.try_send(reply);
@@ -2241,6 +2267,7 @@ mod tests {
                 self.0.store(2, Ordering::Release);
                 CpuPolicyOutcome {
                     confirmed: true,
+                    drivers: vec!["simulated".into()],
                     controls: vec!["earlier CPU phase completed".into()],
                     errors: vec![],
                 }

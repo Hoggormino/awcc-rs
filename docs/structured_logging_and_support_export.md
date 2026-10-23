@@ -19,12 +19,14 @@ Log filtering follows strict, deterministic precedence (`resolve_log_level`):
 
 **Stream separation:**
 - Command results and machine-readable `--json` output are written exclusively to `stdout`.
-- Console diagnostics and errors are written exclusively to `stderr`. By default (`level_source == "default"`), `INFO` events are recorded in the in-memory ring and local session file without cluttering `stderr`; setting `-v`, `--log-level`, or `AWCC_LOG` streams matching structured log lines to `stderr`.
+- Console diagnostics and errors are written exclusively to `stderr`. Ordinary CLI commands keep default `INFO` events in the ring/file; setting `-v`, `--log-level`, or `AWCC_LOG` also sends matching events to the console. The daemon and provider setup helper send their enabled `INFO`, `WARN`, and `ERROR` events to stderr so systemd captures them in the service journal.
+- Console output uses its own bounded background queue. A held stderr lock, full pipe or slow journal cannot block control workers or file/ring logging. Console drops and failures are exported separately. CLI main never holds a console lock while waiting for a worker or daemon. Console shutdown is bounded; file delivery is independent.
 
 ### Temporary `DEBUG` Recording
 
 In `awcc-gui` (via the **Start DEBUG Recording** / **Stop DEBUG Recording** button on the **Log** screen) and `DiagnosticsRuntime::start_recording(duration)`:
-- Temporarily elevates the active log filter to at least `DEBUG` for a bounded window (default 60 seconds in the GUI) without increasing hardware polling frequency or issuing any extra ACPI/USB commands.
+- Temporarily elevates the active log filter to at least `DEBUG` for a bounded window (five minutes in the GUI) without increasing hardware polling frequency or issuing any extra ACPI/USB commands.
+- Outside simulation, the GUI updates daemon recording through authorized `diagnostics.v1` IPC on a background job. Start/stop jobs are serialized, and unavailable/denied service recording is reported separately from local GUI recording. Simulation never contacts the host daemon.
 - Automatically restores the prior filter level when stopped manually or when the deadline expires, recording `diagnostic_recording_started` and `diagnostic_recording_stopped` / `diagnostic_recording_expired` events.
 
 ### Raw USB Response Opt-In (`--trace-raw-usb` / `AWCC_TRACE_RAW_USB=1`)
@@ -51,7 +53,7 @@ Every `Event` (`crates/awcc-diagnostics/src/event.rs`) is assigned a monotonic s
 | `elapsed_ms` | Monotonic execution duration in milliseconds where applicable |
 | `repeat_count` | Count of suppressed identical `WARN`/`ERROR` failures folded within the rate-limit window |
 
-- **Telemetry noise suppression & failure rate-limiting**: Routine telemetry refreshes are logged at `DEBUG` (`category = diagnostic_read`), never `INFO`. Repeated identical `WARN`/`ERROR` failures from the same component within the rate-limit window (default 5 seconds) are folded into a single summary event with `repeat_count`.
+- **Telemetry noise suppression & failure rate-limiting**: Routine telemetry refreshes are logged at `DEBUG` (`category = diagnostic_read`), never `INFO`. Repeated identical `WARN`/`ERROR` failures from the same component within the rate-limit window (default 10 seconds) are folded into a single summary event with `repeat_count`.
 
 ---
 
@@ -80,7 +82,7 @@ Session logs are written under `$XDG_STATE_HOME/awcc-rs/logs` (defaulting to `~/
   - Latest passive session evidence is cached alongside the logs in `evidence-<session_id>.json`.
   - On startup and rotation, inactive sessions (whose `<pid>` is no longer alive in `/proc/<pid>`) are pruned oldest-first to stay within the 50 MiB budget and 24-session cap.
 - **Multi-process safety**: Concurrent `awcc-gui` and `awcc-cli` processes write to separate `session-<utc>-<pid>-<session_id>.*.jsonl` files. Active writers (live `/proc/<pid>`) are never truncated, rotated, or deleted by another process.
-- **Non-blocking delivery**: `FileSink` runs on a dedicated background thread fed by a bounded `sync_channel(512)`. GUI and thermal-control threads use `try_send` and never block on disk I/O. Unwritable directories, disk-full errors, or queue saturation increment `dropped_queue` / `dropped_io` counters without altering hardware control outcomes.
+- **Non-blocking delivery**: `FileSink` runs on a dedicated background thread fed by a bounded `sync_channel(4096)`. GUI and thermal-control threads use `try_send` and never block on disk I/O. Unwritable directories, disk-full errors, or queue saturation increment `dropped_queue` / `dropped_io` counters without altering hardware control outcomes.
 - **Permissions**: The log directory is created with mode `0700` and all `.jsonl` / `.json` files are created with mode `0600`.
 
 ---
@@ -98,11 +100,15 @@ awcc-cli diagnostics export --output awcc-support.zip
 # Print the concise human-readable diagnostic summary to stdout (or --json):
 awcc-cli diagnostics summary
 awcc-cli diagnostics summary --json
+
+# Explicitly record daemon DEBUG events for a bounded window (default 300 seconds):
+awcc-cli diagnostics record --seconds 60
+awcc-cli diagnostics stop-recording
 ```
 
 ### GUI Actions (`Log` Screen)
 
-- **Start DEBUG Recording / Stop DEBUG Recording**: Toggles temporary 60-second `DEBUG` event capture.
+- **Start DEBUG Recording / Stop DEBUG Recording**: Toggles temporary five-minute GUI and daemon `DEBUG` capture; service failures are explicit.
 - **Copy Summary**: Copies the redacted `summary.txt` report into the application's copy buffer (`last-copied-text`) and displays status feedback.
 - **Export Support Report**: Writes `awcc-support-<utc>-<session_id>.zip` to `$XDG_STATE_HOME/awcc-rs/logs/` (or `AWCC_SUPPORT_EXPORT_PATH`).
 - **Row Selection & Copy Row**: Clicking any row in the hardware command log highlights it and displays its full decoded + raw hex + acknowledgement payload at the bottom of the card; clicking **Copy Row** copies that full detail line.
@@ -118,6 +124,36 @@ awcc-cli diagnostics summary --json
 | `hardware-audit.jsonl` | Bounded, redacted mutating hardware write-audit records (`HardwareAuditRecord` entries) |
 | `build-info.json` | Shared `BuildIdentityReport` (version, commit SHA & source, dirty state, target, profile, `rustc`, package format) |
 | `settings.json` | Allowlisted non-sensitive settings (`log_level`, `log_level_source`, `raw_usb_opt_in`, GUI refresh settings) |
+| `service-diagnostics.json` | Optional daemon build, cached profile/mapping/CPU/thermal/hold state, recording and sink status, passive integration context, service-journal excerpt and evidence gaps |
+| `daemon-events.jsonl` | Optional bounded daemon and previous daemon/setup session events, preserving session IDs, sequence numbers and request correlation |
+
+### PowerProfiles timeline and cross-system evidence
+
+Default events record provider bus-name acquisition, competing owners, handover and recovery,
+incoming profile/hold requests, authorization results, CPU and thermal outcomes, and state
+publication. D-Bus and socket requests carry the same request ID through the control worker.
+Policy generations link state publication with property notifications on both endpoints.
+Routine property reads are not logged at INFO. Notification failures are recorded rather than
+discarded. Failures retain stable codes such as `polkit_reply_decode_failed`, with expected and
+received signatures; policy denial is distinct from transport or reply-decoding failure.
+Failure folding includes structured fields so unrelated request IDs are not collapsed together.
+
+Support export fetches daemon evidence through the same kernel-peer authorization as other
+IPC requests. It uses published state only: no interest notification, Refresh or hardware read.
+Optional `diagnostics.v1` does not change protocol 2 compatibility for normal control operations.
+Pages contain at most 16 events and 24 KiB of event data; current-session export keeps at most
+256 recent events. Prior daemon/setup history is scanned within fixed bounds and capped at
+8 KiB. Oversized fields, evictions, clearing, scan limits, collection errors and restarts during
+export are identified explicitly. Clients without daemon access still produce a report.
+
+Passive context uses fixed read-only tool arguments and timeouts: bus ownership/features,
+polkit backend version, installed bus implementation versions, desktop version when available,
+known service states and KDE current/configured policy when the session exposes it. Installed
+bus versions are labeled as installed components; the active service unit is reported separately.
+Bus queries disable automatic service activation. CPU driver identity is retained from the
+existing CPU policy plan, not queried again during export. A journal excerpt is restricted to
+`awccd.service` and the recent 24-hour window. Missing permissions, tools or entries remain
+unavailable evidence; export never elevates privileges or captures unrelated bus traffic.
 
 ### Strict Passive Invariant
 
@@ -125,6 +161,7 @@ Support-report assembly and export are **100% passive**:
 - Never call `query_snapshot()`, construct hardware transports, refresh USB ELC diagnostics, invoke `/proc/acpi/call`, spawn `pkexec`/`sudo`, modify settings, or replay commands.
 - In `awcc-gui`, export reads the already-cached `SystemSnapshot` held in memory (`origin = "in_memory_cache"`).
 - In `awcc-cli`, export reads existing session logs and cached `evidence-<session_id>.json` from disk (`origin = "persisted_session_file"`), or resolves the static device profile from `database.json` without opening ACPI or USB transports (`origin = "unavailable"` if no prior session evidence exists).
+- Authorized cached daemon diagnostics and fixed read-only integration metadata may supplement those files. They never activate a missing provider, request fresh telemetry, change a profile, or start diagnostic recording implicitly.
 
 ---
 

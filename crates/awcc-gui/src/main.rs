@@ -1054,6 +1054,10 @@ impl ClipboardBackend for SystemClipboard {
 }
 
 enum DiagJobResult {
+    Recording {
+        enabled: bool,
+        result: Result<(), String>,
+    },
     Summary(Result<(String, Result<(), String>), String>),
     Export {
         out_path: PathBuf,
@@ -1451,11 +1455,29 @@ struct PendingRequest {
     label: String,
 }
 
+trait DiagnosticBackend: Send + Sync {
+    fn collect(&self, simulated: bool) -> awcc_diagnostics::service::ServiceSupport;
+    fn recording(&self, seconds: u16) -> Result<(), String>;
+}
+struct SystemDiagnostics;
+impl DiagnosticBackend for SystemDiagnostics {
+    fn collect(&self, simulated: bool) -> awcc_diagnostics::service::ServiceSupport {
+        awcc_service::diagnostics::collect(simulated)
+    }
+    fn recording(&self, seconds: u16) -> Result<(), String> {
+        awcc_service::ipc::DaemonClient::system("awcc-gui-recording", env!("CARGO_PKG_VERSION"))
+            .diagnostic_recording(seconds)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// UI-side bookkeeping for requests in flight, worker-failure notices, and passive diagnostics.
 struct UiOps {
     pending: Option<PendingRequest>,
     worker_failure_shown: bool,
     diagnostics: Arc<DiagnosticsRuntime>,
+    diagnostic_backend: Arc<dyn DiagnosticBackend>,
     export_output_override: Option<PathBuf>,
     clipboard: Arc<std::sync::Mutex<Box<dyn ClipboardBackend>>>,
     diagnostics_busy: bool,
@@ -1475,6 +1497,7 @@ impl Default for UiOps {
                 .unwrap_or_else(|_| unreachable!("default INFO level is valid"));
             let mut cfg = DiagnosticsConfig::from_env_and_cli("awcc-gui", resolved, false);
             cfg.enable_file_sink = false;
+            cfg.log_dir = None;
             cfg.enable_stderr_console = false;
             DiagnosticsRuntime::new(cfg)
         });
@@ -1484,6 +1507,7 @@ impl Default for UiOps {
             pending: None,
             worker_failure_shown: false,
             diagnostics,
+            diagnostic_backend: Arc::new(SystemDiagnostics),
             export_output_override: None,
             clipboard: Arc::new(std::sync::Mutex::new(Box::new(SystemClipboard))),
             diagnostics_busy: false,
@@ -1512,6 +1536,22 @@ fn poll_diagnostics_jobs(ui: &MainWindow, ops: &SharedOps) -> bool {
         ops.borrow_mut().diagnostics_busy = false;
         ui.set_diagnostics_busy(false);
         match job {
+            DiagJobResult::Recording { enabled, result } => {
+                let state = if enabled {
+                    "active (5m timeout)"
+                } else {
+                    "stopped"
+                };
+                let text = match result {
+                    Ok(()) => {
+                        format!("GUI and service DEBUG recording {state}; no extra hardware polls.")
+                    }
+                    Err(error) => format!(
+                        "GUI recording {state}; service recording could not be confirmed: {error}. Any service recording expires automatically."
+                    ),
+                };
+                ui.set_diagnostics_status_text(text.into());
+            }
             DiagJobResult::Summary(Ok((summary_txt, Ok(())))) => {
                 ui.set_clipboard_fallback_visible(false);
                 ui.set_last_copied_text(SharedString::from(summary_txt.as_str()));
@@ -1552,6 +1592,50 @@ fn poll_diagnostics_jobs(ui: &MainWindow, ops: &SharedOps) -> bool {
         }
     }
     completed_any
+}
+
+fn toggle_diagnostic_recording(w: &MainWindow, ops: &SharedOps, simulated: bool) {
+    if ops.borrow().diagnostics_busy {
+        return;
+    }
+    let diag = Arc::clone(&ops.borrow().diagnostics);
+    let enabled = !diag.is_recording_active();
+    if enabled {
+        diag.start_recording(Duration::from_secs(300));
+    } else {
+        diag.stop_recording();
+    }
+    sync_recording_state_to_ui(w, &diag);
+    if simulated {
+        w.set_diagnostics_status_text(
+            if enabled {
+                "Simulation DEBUG recording active (5m timeout, 0 extra hardware polls)."
+            } else {
+                "Simulation DEBUG recording stopped."
+            }
+            .into(),
+        );
+        return;
+    }
+    let backend = ops.borrow().diagnostic_backend.clone();
+    let tx = ops.borrow().diag_job_tx.clone();
+    ops.borrow_mut().diagnostics_busy = true;
+    w.set_diagnostics_busy(true);
+    w.set_diagnostics_status_text("Updating service diagnostic recording...".into());
+    if let Err(error) = std::thread::Builder::new()
+        .name("awcc-diag-recording".into())
+        .spawn(move || {
+            let result = backend.recording(if enabled { 300 } else { 0 });
+            let _ = tx.send(DiagJobResult::Recording { enabled, result });
+            let _ = slint::invoke_from_event_loop(|| {});
+        })
+    {
+        ops.borrow_mut().diagnostics_busy = false;
+        w.set_diagnostics_busy(false);
+        w.set_diagnostics_status_text(
+            format!("Service recording worker unavailable: {error}").into(),
+        );
+    }
 }
 
 fn sync_recording_state_to_ui(ui: &MainWindow, diag: &DiagnosticsRuntime) {
@@ -2157,24 +2241,12 @@ fn wire_ui_callbacks(
     {
         let ui_weak = ui.as_weak();
         let ops = Rc::clone(ops);
+        let svc = Rc::clone(service);
         ui.on_toggle_diagnostic_recording(move || {
             let Some(w) = ui_weak.upgrade() else {
                 return;
             };
-            let diag = Arc::clone(&ops.borrow().diagnostics);
-            if diag.is_recording_active() {
-                diag.stop_recording();
-                sync_recording_state_to_ui(&w, &diag);
-                w.set_diagnostics_status_text(SharedString::from(
-                    "Stopped temporary DEBUG recording — restored prior log filter.",
-                ));
-            } else {
-                diag.start_recording(Duration::from_secs(300));
-                sync_recording_state_to_ui(&w, &diag);
-                w.set_diagnostics_status_text(SharedString::from(
-                    "Temporary DEBUG recording active (5m timeout, 0 extra hardware polls).",
-                ));
-            }
+            toggle_diagnostic_recording(&w, &ops, svc.borrow().current_snapshot().is_simulated);
         });
     }
 
@@ -2199,7 +2271,7 @@ fn wire_ui_callbacks(
                 )
             };
             let gui_settings = collect_gui_settings(&w);
-            let (diag, clipboard, tx, hook) = {
+            let (diag, clipboard, tx, hook, diagnostic_backend) = {
                 let mut borrowed = ops.borrow_mut();
                 borrowed.diagnostics_busy = true;
                 (
@@ -2207,6 +2279,7 @@ fn wire_ui_callbacks(
                     Arc::clone(&borrowed.clipboard),
                     borrowed.diag_job_tx.clone(),
                     borrowed.diag_job_hook.clone(),
+                    borrowed.diagnostic_backend.clone(),
                 )
             };
             w.set_diagnostics_busy(true);
@@ -2226,6 +2299,12 @@ fn wire_ui_callbacks(
                     );
                     let res = diag
                         .assemble_support_bundle(Some(evidence), gui_settings)
+                        .and_then(|mut bundle| {
+                            bundle.attach_service_support(
+                                diagnostic_backend.collect(snap.is_simulated),
+                            )?;
+                            Ok(bundle)
+                        })
                         .map_err(|e| e.to_string())
                         .map(|bundle| {
                             let clip_res = match clipboard.lock() {
@@ -2270,7 +2349,7 @@ fn wire_ui_callbacks(
                 )
             };
             let gui_settings = collect_gui_settings(&w);
-            let (diag, override_path, tx, hook) = {
+            let (diag, override_path, tx, hook, diagnostic_backend) = {
                 let mut borrowed = ops.borrow_mut();
                 borrowed.diagnostics_busy = true;
                 (
@@ -2278,6 +2357,7 @@ fn wire_ui_callbacks(
                     borrowed.export_output_override.clone(),
                     borrowed.diag_job_tx.clone(),
                     borrowed.diag_job_hook.clone(),
+                    borrowed.diagnostic_backend.clone(),
                 )
             };
             let out_path =
@@ -2299,7 +2379,12 @@ fn wire_ui_callbacks(
                     );
                     let result = diag
                         .assemble_support_bundle(Some(evidence), gui_settings)
-                        .and_then(|bundle| bundle.write_to_path(&out_path))
+                        .and_then(|mut bundle| {
+                            bundle.attach_service_support(
+                                diagnostic_backend.collect(snap.is_simulated),
+                            )?;
+                            bundle.write_to_path(&out_path)
+                        })
                         .map_err(|e| e.to_string());
                     let _ = tx.send(DiagJobResult::Export { out_path, result });
                     let _ = slint::invoke_from_event_loop(|| {});
@@ -3935,6 +4020,56 @@ mod tests {
             ui.get_audit_rows().row_data(0).unwrap().seq_text.as_str(),
             "#267"
         );
+    }
+
+    #[test]
+    fn shared_recording_is_async_serialized_and_reports_service_failures() {
+        #[derive(Default)]
+        struct Backend {
+            calls: std::sync::Mutex<Vec<u16>>,
+            fail: std::sync::atomic::AtomicBool,
+        }
+        impl DiagnosticBackend for Backend {
+            fn collect(&self, _: bool) -> awcc_diagnostics::service::ServiceSupport {
+                Default::default()
+            }
+            fn recording(&self, seconds: u16) -> Result<(), String> {
+                self.calls.lock().unwrap().push(seconds);
+                if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("permission denied".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let ops = Rc::new(RefCell::new(UiOps::default()));
+        let backend = Arc::new(Backend::default());
+        ops.borrow_mut().diagnostic_backend = backend.clone();
+        toggle_diagnostic_recording(&ui, &ops, false);
+        assert!(ui.get_diagnostics_busy());
+        // A second action cannot overtake the first daemon recording update.
+        toggle_diagnostic_recording(&ui, &ops, false);
+        wait_for_diagnostics_job(&ui, &ops);
+        assert_eq!(*backend.calls.lock().unwrap(), vec![300]);
+        assert!(ui.get_diagnostics_status_text().contains("GUI and service"));
+        toggle_diagnostic_recording(&ui, &ops, false);
+        wait_for_diagnostics_job(&ui, &ops);
+        assert_eq!(*backend.calls.lock().unwrap(), vec![300, 0]);
+        backend
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        toggle_diagnostic_recording(&ui, &ops, false);
+        wait_for_diagnostics_job(&ui, &ops);
+        assert!(
+            ui.get_diagnostics_status_text()
+                .contains("could not be confirmed")
+        );
+        assert!(ui.get_diagnostic_recording_active());
+        toggle_diagnostic_recording(&ui, &ops, true);
+        assert_eq!(*backend.calls.lock().unwrap(), vec![300, 0, 300]);
+        assert!(!ui.get_diagnostic_recording_active());
     }
 
     #[test]

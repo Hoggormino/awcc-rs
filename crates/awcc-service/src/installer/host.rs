@@ -37,6 +37,11 @@ pub enum HostTool {
     Dpkg,
     Pacman,
     Pkexec,
+    Journalctl,
+    DbusBroker,
+    DbusDaemon,
+    PlasmaShell,
+    GnomeShell,
 }
 
 impl HostTool {
@@ -50,6 +55,11 @@ impl HostTool {
             Self::Dpkg => "dpkg",
             Self::Pacman => "pacman",
             Self::Pkexec => "pkexec",
+            Self::Journalctl => "journalctl",
+            Self::DbusBroker => "dbus-broker",
+            Self::DbusDaemon => "dbus-daemon",
+            Self::PlasmaShell => "plasmashell",
+            Self::GnomeShell => "gnome-shell",
         }
     }
 }

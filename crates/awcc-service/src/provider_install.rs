@@ -5,9 +5,13 @@ use crate::installer::{
 use awcc_diagnostics::hash::sha256_hex;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::MetadataExt;
-use std::{fs, path::Path, time::Duration};
+use std::{
+    fs,
+    path::Path,
+    time::{Duration, Instant},
+};
 const RECORD: &str = "/var/lib/awcc/provider-handover.json";
-const UNITS: &[&str] = &[
+pub(crate) const UNITS: &[&str] = &[
     "power-profiles-daemon.service",
     "tuned-ppd.service",
     "tuned.service",
@@ -38,14 +42,20 @@ struct Record {
     files: Vec<File>,
 }
 fn command(runner: &dyn HostRunner, tool: HostTool, args: &[&str]) -> Result<String, String> {
+    let started = Instant::now();
+    tracing::debug!(target:"awcc_service::provider_install", code="provider_command_started", tool=?tool, command=?args, "running fixed provider handover command");
     let output = runner
         .run(
             &HostCommand::new(tool, args.iter().copied()).with_timeout(Duration::from_secs(15)),
             None,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| { tracing::error!(target:"awcc_service::provider_install", code="provider_command_failed", tool=?tool, command=?args, error=%e, elapsed_ms=started.elapsed().as_millis() as u64, "provider handover command could not complete"); e.to_string() })?;
     if output.code != Some(0) {
+        tracing::error!(target:"awcc_service::provider_install", code="provider_command_failed", tool=?tool, command=?args, exit_code=?output.code, error=%output.stderr, "provider handover command returned failure");
         return Err(format!("{}: {}", args.join(" "), output.stderr));
+    }
+    if args.first() != Some(&"show") {
+        tracing::info!(target:"awcc_service::provider_install", code="provider_command_completed", tool=?tool, command=?args, elapsed_ms=started.elapsed().as_millis() as u64, "provider handover action completed");
     }
     Ok(output.stdout)
 }
@@ -85,6 +95,7 @@ pub fn install(
     runner: &dyn HostRunner,
     executable: &str,
 ) -> Result<(), String> {
+    tracing::info!(target:"awcc_service::provider_install", code="provider_handover_started", "inspecting provider ownership before takeover");
     ensure_dir_chain(paths, "/etc/systemd/system", 0o755).map_err(|e| e.to_string())?;
     if let Some(record) = load(paths)? {
         if record.ready {
@@ -108,8 +119,10 @@ pub fn install(
                     ));
                 }
             }
+            tracing::info!(target:"awcc_service::provider_install", code="provider_handover_unchanged", "recorded provider handover remains valid");
             return Ok(());
         }
+        tracing::warn!(target:"awcc_service::provider_install", code="provider_handover_interrupted", "recovering interrupted provider handover before retry");
         remove(paths, runner)?;
     }
     if !executable.starts_with('/') || executable.contains('\n') {
@@ -177,6 +190,16 @@ pub fn install(
                     | "ActiveState=deactivating"
             )
         });
+        if needs_stop || !props.lines().any(|p| p == "LoadState=not-found") {
+            let property = |key: &str| {
+                props
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key))
+                    .unwrap_or("unavailable")
+                    .to_string()
+            };
+            tracing::info!(target:"awcc_service::provider_install", code="provider_unit_detected", unit, load_state=%property("LoadState="), active_state=%property("ActiveState="), unit_file_state=%property("UnitFileState="), needs_stop, "known provider inspected before handover");
+        }
         if props.lines().any(|p| p == "LoadState=not-found") && !needs_stop {
             continue;
         }
@@ -215,6 +238,7 @@ pub fn install(
             enabled: props.lines().any(|p| p == "UnitFileState=enabled"),
         });
     }
+    tracing::info!(target:"awcc_service::provider_install", code="provider_handover_planned", units=?record.units.iter().map(|unit| unit.name.as_str()).collect::<Vec<_>>(), registrations=record.files.len(), "saving handover journal before changes");
     save(paths, &record)?;
     let result: Result<(), String> = (|| {
         for unit in &record.units {
@@ -239,9 +263,11 @@ pub fn install(
     if result.is_ok() {
         record.ready = true;
         save(paths, &record)?;
+        tracing::info!(target:"awcc_service::provider_install", code="provider_handover_completed", "provider registrations and masks installed");
     }
     if let Err(e) = result {
         let recovery = remove(paths, runner);
+        tracing::error!(target:"awcc_service::provider_install", code="provider_handover_failed", error=%e, recovery=?recovery, "provider handover failed; recovery outcome recorded");
         return Err(format!(
             "provider handover failed: {e}; recovery: {recovery:?}"
         ));
@@ -250,7 +276,9 @@ pub fn install(
 }
 /// Restore only recorded masks/registrations which still match what AWCC installed.
 pub fn remove(paths: &InstallPaths, runner: &dyn HostRunner) -> Result<(), String> {
+    tracing::info!(target:"awcc_service::provider_install", code="provider_recovery_started", "restoring recorded provider state");
     let Some(record) = load(paths)? else {
+        tracing::info!(target:"awcc_service::provider_install", code="provider_recovery_not_needed", "no provider journal to restore");
         return Ok(());
     };
     for file in &record.files {
@@ -326,6 +354,7 @@ pub fn remove(paths: &InstallPaths, runner: &dyn HostRunner) -> Result<(), Strin
         )?;
     }
     fs::remove_file(paths.join(RECORD)).map_err(|e| e.to_string())?;
+    tracing::info!(target:"awcc_service::provider_install", code="provider_recovery_completed", "recorded provider changes restored");
     Ok(())
 }
 

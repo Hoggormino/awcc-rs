@@ -138,6 +138,19 @@ handover is not reported as a ready provider. Hardware startup requires the matc
 `acpi_call` module and usable CPUFreq controls. The live laptop is not automatically
 modified by development tests.
 
+## Diagnosing desktop integration
+
+The Log screen's temporary DEBUG recording covers both GUI and daemon for five minutes.
+Reproduce the profile change, then use Export Support Report. Default service events already
+retain failures, so an authorization or startup error can be reported without enabling DEBUG.
+CLI users can use `awcc-cli diagnostics record --seconds 60`, reproduce the problem, and run
+`awcc-cli diagnostics export --output awcc-support.zip`; `diagnostics stop-recording` ends
+recording early. These diagnostic operations do not increase hardware polling or select profiles.
+
+The report includes separate daemon events and integration context, with request IDs linking
+authorization, CPU/thermal policy and publication. Missing daemon/journal access and export
+limits are stated explicitly. See [diagnostic retention and export](structured_logging_and_support_export.md).
+
 ## Verification limits
 
 Tests use simulated thermal transports, temporary CPUFreq trees, a private real

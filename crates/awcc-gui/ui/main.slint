@@ -1608,8 +1608,8 @@ export component MainWindow inherits MaterialWindow {
                         padding: 12px;
                         spacing: 8px;
 
-                        HorizontalLayout {
-                            alignment: space-between;
+                        VerticalLayout {
+                            spacing: 2px;
 
                             VerticalLayout {
                                 spacing: 2px;
@@ -1626,18 +1626,18 @@ export component MainWindow inherits MaterialWindow {
                             }
 
                             MaterialText {
-                                vertical-alignment: center;
+                                horizontal-alignment: right;
                                 text: root.audit-counter-summary;
                                 style: MaterialTypography.label_medium_prominent;
                                 color: MaterialPalette.primary;
                             }
                         }
 
-                        // Diagnostics & Support Export Toolbar (100% passive — zero hardware writes)
-                        HorizontalLayout {
+                        // Keep all diagnostic actions reachable in compact windows.
+                        VerticalLayout {
                             // Preserve the Material buttons' intrinsic text and padding height.
                             vertical-stretch: 0;
-                            alignment: space-between;
+                            alignment: start;
                             spacing: 8px;
 
                             HorizontalLayout {
@@ -1646,6 +1646,7 @@ export component MainWindow inherits MaterialWindow {
 
                                 TonalButton {
                                     text: root.diagnostic-recording-label;
+                                    enabled: !root.diagnostics-busy;
                                     clicked => {
                                         root.toggle-diagnostic-recording();
                                     }

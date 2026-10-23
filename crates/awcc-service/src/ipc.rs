@@ -72,6 +72,7 @@ pub const CAPABILITIES: &[&str] = &[
     "startup_preference.v1",
     "reconcile.v1",
     "legacy_rpc.v1",
+    "diagnostics.v1",
 ];
 
 /// Capabilities a client of this build requires.
@@ -153,6 +154,15 @@ pub enum Op {
         profile: awcc_core::PowerProfile,
         policy: awcc_core::ThermalPolicy,
     },
+    /// Bounded, already-recorded evidence; never refreshes hardware.
+    Diagnostics {
+        after_seq: u64,
+        limit: u16,
+    },
+    /// Zero stops recording; nonzero durations are bounded to five minutes.
+    DiagnosticRecording {
+        seconds: u16,
+    },
     /// Daemon status; never touches hardware.
     Status,
     /// Latest view; refreshed from hardware only when older than `max_age_ms`.
@@ -202,6 +212,12 @@ pub struct Response {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Body {
+    Diagnostics {
+        diagnostics: Box<awcc_diagnostics::service::DaemonDiagnostics>,
+    },
+    Recording {
+        recording: awcc_diagnostics::service::RecordingStatus,
+    },
     Ok {
         status: Option<DaemonStatus>,
         view: Option<Box<ThermalView>>,
@@ -730,6 +746,7 @@ struct ServerContext {
     started: Instant,
     connections: AtomicUsize,
     counter: AtomicU64,
+    diagnostics: Option<Arc<awcc_diagnostics::DiagnosticsRuntime>>,
 }
 
 /// The bound, listening socket server. Construct only while holding a [`DaemonLock`].
@@ -748,6 +765,20 @@ impl IpcServer {
         control: ControlHandle,
         _lock: &DaemonLock,
     ) -> Result<Self, OwnershipError> {
+        Self::bind_with_diagnostics(
+            cfg,
+            control,
+            _lock,
+            awcc_diagnostics::global_diagnostics().cloned(),
+        )
+    }
+
+    pub fn bind_with_diagnostics(
+        cfg: ServerConfig,
+        control: ControlHandle,
+        _lock: &DaemonLock,
+        diagnostics: Option<Arc<awcc_diagnostics::DiagnosticsRuntime>>,
+    ) -> Result<Self, OwnershipError> {
         if let Some(dir) = cfg.socket_path.parent() {
             ensure_private_dir(dir, false)?;
         }
@@ -764,6 +795,7 @@ impl IpcServer {
                 started: Instant::now(),
                 connections: AtomicUsize::new(0),
                 counter: AtomicU64::new(0),
+                diagnostics,
             }),
             listener,
         })
@@ -1001,6 +1033,64 @@ fn dispatch(ctx: &ServerContext, request: Request) -> Response {
         );
     }
     match request.op {
+        Op::Diagnostics { after_seq, limit } => {
+            let Some(runtime) = &ctx.diagnostics else {
+                return Response::err(
+                    &id,
+                    ErrorClass::Unsupported,
+                    "daemon diagnostics unavailable",
+                );
+            };
+            let power = ctx
+                .control
+                .published()
+                .map(|(view, age)| {
+                    let mut power = crate::diagnostics::power_summary(&view.control.power);
+                    if let Some(object) = power.as_object_mut() {
+                        object.insert(
+                            "cached_view_age_ms".into(),
+                            serde_json::json!(age.as_millis()),
+                        );
+                        object.insert(
+                            "observed_thermal_mode".into(),
+                            serde_json::to_value(&view.thermal_mode_state).unwrap_or_default(),
+                        );
+                        object.insert(
+                            "observed_cpu_turbo".into(),
+                            serde_json::to_value(&view.cpu_turbo).unwrap_or_default(),
+                        );
+                    }
+                    power
+                })
+                .unwrap_or_default();
+            Response {
+                id,
+                body: Body::Diagnostics {
+                    diagnostics: Box::new(runtime.daemon_page(
+                        after_seq,
+                        usize::from(limit),
+                        power,
+                    )),
+                },
+            }
+        }
+        Op::DiagnosticRecording { seconds } => {
+            tracing::info!(target:"awcc_service::ipc", code="daemon_recording_requested", request_id=%id, seconds=seconds.min(300), "authorized diagnostic recording request received");
+            let Some(runtime) = &ctx.diagnostics else {
+                return Response::err(&id, ErrorClass::Unsupported, "daemon recording unavailable");
+            };
+            if seconds == 0 {
+                runtime.stop_recording();
+            } else {
+                runtime.start_recording(Duration::from_secs(u64::from(seconds.min(300))));
+            }
+            Response {
+                id,
+                body: Body::Recording {
+                    recording: runtime.recording_status(),
+                },
+            }
+        }
         Op::Status => Response {
             id,
             body: Body::Ok {
@@ -1094,6 +1184,7 @@ fn refresh(ctx: &ServerContext, id: &str) -> Response {
 }
 
 fn run_op(ctx: &ServerContext, id: String, op: ControlOp) -> Response {
+    tracing::info!(target:"awcc_service::ipc", code="socket_control_received", request_id=%id, source="authorized_socket", "control request received");
     let counter = ctx.counter.fetch_add(1, Ordering::Relaxed);
     let _ = counter;
     match ctx.control.request(
@@ -1413,6 +1504,41 @@ impl DaemonClient {
         }
     }
 
+    pub fn diagnostics(
+        &self,
+        after_seq: u64,
+    ) -> Result<awcc_diagnostics::service::DaemonDiagnostics, ClientError> {
+        match self
+            .simple(
+                Op::Diagnostics {
+                    after_seq,
+                    limit: 16,
+                },
+                Duration::from_secs(3),
+            )?
+            .body
+        {
+            Body::Diagnostics { diagnostics } => Ok(*diagnostics),
+            Body::Err { kind, message } => Err(map_error(kind, message)),
+            _ => Err(ClientError::Failed(
+                "unexpected diagnostics response".into(),
+            )),
+        }
+    }
+    pub fn diagnostic_recording(
+        &self,
+        seconds: u16,
+    ) -> Result<awcc_diagnostics::service::RecordingStatus, ClientError> {
+        match self
+            .simple(Op::DiagnosticRecording { seconds }, Duration::from_secs(3))?
+            .body
+        {
+            Body::Recording { recording } => Ok(recording),
+            Body::Err { kind, message } => Err(map_error(kind, message)),
+            _ => Err(ClientError::Failed("unexpected recording response".into())),
+        }
+    }
+
     /// Latest authoritative state, refreshed only if older than `max_age`.
     ///
     /// # Errors
@@ -1672,6 +1798,147 @@ mod tests {
         };
         send_json(s, &req, dl).unwrap();
         recv_json(s, dl).unwrap()
+    }
+
+    #[test]
+    fn diagnostic_ipc_is_authorized_bounded_and_never_refreshes_control() {
+        for (tag, allowed) in [("diagnostic-allowed", true), ("diagnostic-denied", false)] {
+            let dir = base_dir(tag);
+            let lock = DaemonLock::acquire(&dir.join("lock"), false).unwrap();
+            let core = crate::control::ControlCore::new(
+                ThermalOrchestrator::new_simulated_m15_r6().unwrap(),
+                crate::settings::SettingsLoad::Missing,
+                Arc::new(crate::control::NullSettingsSink),
+                Duration::from_secs(60),
+            );
+            let control = ControlHandle::spawn(core).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while control.published().is_none() {
+                assert!(Instant::now() < until);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let baseline = control.published().unwrap().0;
+            let mut cfg = awcc_diagnostics::DiagnosticsConfig::from_env_and_cli(
+                "ipc-test",
+                awcc_diagnostics::resolve_log_level(None, false, None).unwrap(),
+                false,
+            );
+            cfg.enable_file_sink = false;
+            cfg.log_dir = None;
+            cfg.enable_stderr_console = false;
+            let runtime = awcc_diagnostics::DiagnosticsRuntime::new(cfg);
+            runtime.record(awcc_diagnostics::NewEvent::new(
+                awcc_diagnostics::Severity::Info,
+                "test",
+                "provider evidence",
+            ));
+            let server = IpcServer::bind_with_diagnostics(
+                ServerConfig {
+                    socket_path: dir.join("socket"),
+                    authorizer: if allowed {
+                        Arc::new(AllowAll)
+                    } else {
+                        Arc::new(DenyAll)
+                    },
+                    build: BuildSummary {
+                        version: "test".into(),
+                        commit: "test".into(),
+                        package_format: "test".into(),
+                    },
+                    device_name: "simulated".into(),
+                    acpi_prefix: "AMWW".into(),
+                },
+                control.clone(),
+                &lock,
+                Some(runtime.clone()),
+            )
+            .unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_thread = stop.clone();
+            let thread = std::thread::spawn(move || server.serve(&stop_thread));
+            let client = DaemonClient::new(dir.join("socket"), "diagnostic-test", "test");
+            if allowed {
+                let page = client.diagnostics(0).unwrap();
+                assert!(
+                    page.events
+                        .iter()
+                        .any(|event| event.message == "provider evidence")
+                );
+                assert!(serde_json::to_vec(&page).unwrap().len() < MAX_FRAME_BYTES);
+                let status = client.diagnostic_recording(u16::MAX).unwrap();
+                assert!(status.active);
+                assert!(status.remaining_secs.unwrap() <= 300);
+                assert!(!client.diagnostic_recording(0).unwrap().active);
+                assert!(!runtime.is_recording_active());
+                struct PassiveTools;
+                impl crate::installer::HostRunner for PassiveTools {
+                    fn run(
+                        &self,
+                        command: &crate::installer::HostCommand,
+                        _: Option<&mut dyn FnMut(&str)>,
+                    ) -> Result<crate::installer::HostOutput, crate::installer::HostError>
+                    {
+                        assert!(!matches!(
+                            command.tool,
+                            crate::installer::HostTool::Pkexec
+                                | crate::installer::HostTool::Pacman
+                                | crate::installer::HostTool::Rpm
+                                | crate::installer::HostTool::Dpkg
+                        ));
+                        Ok(crate::installer::HostOutput {
+                            code: Some(0),
+                            stdout: "passive metadata".into(),
+                            stderr: String::new(),
+                        })
+                    }
+                }
+                for n in 0..70 {
+                    runtime.record(awcc_diagnostics::NewEvent::new(
+                        awcc_diagnostics::Severity::Info,
+                        "test",
+                        format!("daemon pagination evidence {n}"),
+                    ));
+                }
+                let support = crate::diagnostics::collect_with(&client, &PassiveTools, None);
+                let collected = support.daemon.as_ref().unwrap();
+                assert!(!collected.has_more);
+                assert!(collected.events.len() > 16);
+                assert!(
+                    collected
+                        .events
+                        .iter()
+                        .any(|event| event.message == "daemon pagination evidence 69")
+                );
+                let mut bundle = runtime
+                    .assemble_support_bundle(None, Default::default())
+                    .unwrap();
+                bundle.attach_service_support(support).unwrap();
+                assert!(bundle.report_json.contains("daemon pagination evidence 69"));
+                assert!(
+                    String::from_utf8_lossy(&bundle.to_zip_bytes().unwrap())
+                        .contains("daemon-events.jsonl")
+                );
+                assert_eq!(control.published().unwrap().0.as_ref(), baseline.as_ref());
+                runtime.start_recording(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(65));
+                assert!(!client.diagnostics(0).unwrap().recording.active);
+            } else {
+                assert!(matches!(
+                    client.diagnostics(0),
+                    Err(ClientError::AccessDenied(_))
+                ));
+                assert!(matches!(
+                    client.diagnostic_recording(300),
+                    Err(ClientError::AccessDenied(_))
+                ));
+                assert!(!runtime.is_recording_active());
+            }
+            stop.store(true, Ordering::SeqCst);
+            thread.join().unwrap();
+            assert!(control.stop(Duration::from_secs(2)).is_some());
+            drop(lock);
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

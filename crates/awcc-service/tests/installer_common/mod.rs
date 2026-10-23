@@ -261,6 +261,11 @@ impl HostRunner for FakeHost {
                 }
                 _ => Ok(out(1, "", "not owned")),
             },
+            HostTool::Journalctl
+            | HostTool::DbusBroker
+            | HostTool::DbusDaemon
+            | HostTool::PlasmaShell
+            | HostTool::GnomeShell => panic!("unexpected diagnostic tool during installer test"),
             HostTool::Pkexec => {
                 let lines = state.pkexec_stdout_lines.clone();
                 let response = state.pkexec.clone();

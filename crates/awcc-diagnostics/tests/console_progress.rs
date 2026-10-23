@@ -18,6 +18,7 @@ fn worker_logs_while_main_holds_stderr() {
         false,
     );
     cfg.enable_file_sink = false;
+    cfg.log_dir = None;
     cfg.service_console = true;
     let runtime = DiagnosticsRuntime::new(cfg);
     let (done, rx) = mpsc::sync_channel(1);
