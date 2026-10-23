@@ -654,10 +654,20 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(3)).unwrap(),
             Some(saver)
         );
-        proxy
+        let compat = zbus::blocking::Proxy::new(&client, COMPAT.0, COMPAT.1, COMPAT.0).unwrap();
+        compat
             .call::<_, _, ()>("ReleaseProfile", &(cookie,))
             .unwrap();
-        let compat = zbus::blocking::Proxy::new(&client, COMPAT.0, COMPAT.1, COMPAT.0).unwrap();
+        let legacy_cookie: u32 = compat
+            .call(
+                "HoldProfile",
+                &("performance", "compatibility test", "awcc-test"),
+            )
+            .unwrap();
+        proxy
+            .call::<_, _, ()>("ReleaseProfile", &(legacy_cookie,))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
             compat.get_property::<String>("ActiveProfile").unwrap(),
             "power-saver"

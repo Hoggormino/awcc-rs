@@ -2072,7 +2072,21 @@ mod tests {
         ));
         assert_eq!(fs::read(dir.join("run/awcc.sock")).unwrap(), b"precious");
         // Failed startup must stop its already-spawned worker before relinquishing ownership.
-        drop(DaemonLock::acquire(&dir.join("run/daemon.lock"), false).unwrap());
+        // The filesystem writer retains ownership until its asynchronous close completes.
+        // A successor must wait for that close, including on startup failure.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match DaemonLock::acquire(&dir.join("run/daemon.lock"), false) {
+                Ok(lock) => {
+                    drop(lock);
+                    break;
+                }
+                Err(OwnershipError::AlreadyRunning(_)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                other => panic!("failed startup did not release ownership: {other:?}"),
+            }
+        }
 
         // A symlink in the socket path is never followed.
         fs::remove_file(dir.join("run/awcc.sock")).unwrap();
