@@ -45,9 +45,9 @@ use crate::daemon::DaemonRpcRequest;
 use crate::wire::ThermalView;
 
 /// Protocol version spoken by this build.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Oldest protocol version this build still speaks.
-pub const MIN_SUPPORTED_PROTOCOL: u32 = 1;
+pub const MIN_SUPPORTED_PROTOCOL: u32 = 2;
 /// Upper bound of one frame's payload.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Exclusive daemon lock file.
@@ -108,6 +108,7 @@ pub struct DaemonStatus {
     pub acpi_prefix: String,
     /// Whether the control thread has produced a view (process/protocol health, not hardware).
     pub control_running: bool,
+    pub power_provider_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +146,13 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
+    SelectPower {
+        profile: awcc_core::PowerProfile,
+    },
+    ConfigurePower {
+        profile: awcc_core::PowerProfile,
+        policy: awcc_core::ThermalPolicy,
+    },
     /// Daemon status; never touches hardware.
     Status,
     /// Latest view; refreshed from hardware only when older than `max_age_ms`.
@@ -960,6 +968,9 @@ fn daemon_status(ctx: &ServerContext) -> DaemonStatus {
         device_name: ctx.cfg.device_name.clone(),
         acpi_prefix: ctx.cfg.acpi_prefix.clone(),
         control_running: ctx.control.published().is_some(),
+        power_provider_ready: ctx.control.published().is_some_and(|(v, _)| {
+            v.control.power.active.is_some() && !v.control.power.available.is_empty()
+        }),
     }
 }
 
@@ -1037,6 +1048,10 @@ fn dispatch(ctx: &ServerContext, request: Request) -> Response {
         Op::Legacy { request: legacy } => run_legacy(ctx, id, legacy),
         other => {
             let op = match other {
+                Op::SelectPower { profile } => ControlOp::SelectPower(profile),
+                Op::ConfigurePower { profile, policy } => {
+                    ControlOp::ConfigurePower { profile, policy }
+                }
                 Op::SetThermalMode { mode } => ControlOp::SetThermalMode(mode),
                 Op::ToggleGMode => ControlOp::ToggleGMode,
                 Op::ApplyManualBoost {
@@ -1645,7 +1660,7 @@ mod tests {
 
     fn handshake(s: &mut UnixStream) -> ServerHello {
         let dl = Instant::now() + Duration::from_secs(3);
-        write_frame(s, &raw_hello(1, 1), dl).unwrap();
+        write_frame(s, &raw_hello(PROTOCOL_VERSION, PROTOCOL_VERSION), dl).unwrap();
         serde_json::from_slice(&read_frame(s, dl).unwrap()).unwrap()
     }
 
@@ -1812,14 +1827,14 @@ mod tests {
     fn fragmented_requests_are_reassembled() {
         let d = start("fragment");
         let mut s = raw_connect(&d);
-        let bytes = frame(&raw_hello(1, 1));
+        let bytes = frame(&raw_hello(PROTOCOL_VERSION, PROTOCOL_VERSION));
         for b in bytes {
             s.write_all(&[b]).unwrap();
             std::thread::sleep(Duration::from_millis(2));
         }
         let dl = Instant::now() + Duration::from_secs(3);
         let hello: ServerHello = serde_json::from_slice(&read_frame(&mut s, dl).unwrap()).unwrap();
-        assert_eq!(hello.protocol, 1);
+        assert_eq!(hello.protocol, PROTOCOL_VERSION);
         let req = serde_json::to_vec(&Request {
             id: "frag-1".into(),
             op: Op::Status,

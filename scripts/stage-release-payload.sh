@@ -94,6 +94,7 @@ mkdir -p \
     "${OUT_DIR}/share/licenses/awcc-rs" \
     "${OUT_DIR}/share/doc/awcc-rs"
 
+install -m 0755 "${AWCC_REPO_ROOT}/packaging/linux/powerprofilesctl" "${OUT_DIR}/bin/powerprofilesctl"
 install -m 0755 "${BIN_DIR}/awcc-cli" "${OUT_DIR}/bin/awcc-cli"
 install -m 0755 "${BIN_DIR}/awcc-gui" "${OUT_DIR}/bin/awcc-gui"
 
@@ -103,6 +104,12 @@ fi
 
 install -m 0644 "${AWCC_REPO_ROOT}/crates/awcc-core/data/database.json" "${OUT_DIR}/share/awcc/database.json"
 install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/awcc-gui.desktop" "${OUT_DIR}/share/applications/awcc-gui.desktop"
+mkdir -p "${OUT_DIR}/share/dbus-1/system-services" "${OUT_DIR}/share/dbus-1/system.d" "${OUT_DIR}/share/polkit-1/actions"
+install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/power-profiles/awcc-power-profiles.conf" "${OUT_DIR}/share/dbus-1/system.d/awcc-power-profiles.conf"
+install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/power-profiles/awcc-power-profiles.policy" "${OUT_DIR}/share/polkit-1/actions/awcc-power-profiles.policy"
+for name in org.freedesktop.UPower.PowerProfiles net.hadess.PowerProfiles; do
+    printf '[D-BUS Service]\nName=%s\nExec=/usr/bin/awcc-cli -d\nUser=root\nSystemdService=awccd.service\n' "$name" > "${OUT_DIR}/share/dbus-1/system-services/${name}.service"
+done
 install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/awccd.service" "${OUT_DIR}/share/systemd/awccd.service"
 install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/awcc-rs.modules-load.conf" "${OUT_DIR}/share/modules-load.d/awcc-rs.conf"
 install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/70-awcc-rs.rules" "${OUT_DIR}/share/udev/rules.d/70-awcc-rs.rules"

@@ -59,6 +59,7 @@ mkdir -p \
     "${PKG_ROOT}/usr/share/licenses/awcc-rs" \
     "${PKG_ROOT}/usr/share/doc/awcc-rs"
 
+install -m 0755 "${STAGED_DIR}/bin/powerprofilesctl" "${PKG_ROOT}/usr/bin/powerprofilesctl"
 install -m 0755 "${STAGED_DIR}/bin/awcc-cli" "${PKG_ROOT}/usr/bin/awcc-cli"
 install -m 0755 "${STAGED_DIR}/bin/awcc-gui" "${PKG_ROOT}/usr/bin/awcc-gui"
 install -m 0644 "${STAGED_DIR}/share/awcc/database.json" "${PKG_ROOT}/etc/awcc/database.json"
@@ -66,6 +67,12 @@ install -m 0644 "${STAGED_DIR}/share/awcc/database.json" "${PKG_ROOT}/usr/share/
 printf 'deb\n' > "${PKG_ROOT}/usr/share/awcc/package-format"
 chmod 0644 "${PKG_ROOT}/usr/share/awcc/package-format"
 install -m 0644 "${STAGED_DIR}/share/applications/awcc-gui.desktop" "${PKG_ROOT}/usr/share/applications/awcc-gui.desktop"
+mkdir -p "${PKG_ROOT}/usr/share/dbus-1/system-services"
+cp "${STAGED_DIR}/share/dbus-1/system-services/"* "${PKG_ROOT}/usr/share/dbus-1/system-services/"
+mkdir -p "${PKG_ROOT}/usr/share/dbus-1/system.d"
+cp "${STAGED_DIR}/share/dbus-1/system.d/"* "${PKG_ROOT}/usr/share/dbus-1/system.d/"
+mkdir -p "${PKG_ROOT}/usr/share/polkit-1/actions"
+cp "${STAGED_DIR}/share/polkit-1/actions/"* "${PKG_ROOT}/usr/share/polkit-1/actions/"
 install -m 0644 "${STAGED_DIR}/share/systemd/awccd.service" "${PKG_ROOT}/usr/lib/systemd/system/awccd.service"
 install -m 0644 "${STAGED_DIR}/share/modules-load.d/awcc-rs.conf" "${PKG_ROOT}/usr/lib/modules-load.d/awcc-rs.conf"
 install -m 0644 "${STAGED_DIR}/share/udev/rules.d/70-awcc-rs.rules" "${PKG_ROOT}/usr/lib/udev/rules.d/70-awcc-rs.rules"
@@ -124,7 +131,10 @@ Section: utils
 Priority: optional
 Architecture: ${AWCC_DEB_ARCH}
 Installed-Size: ${INSTALLED_SIZE}
-Depends: ${SHLIB_DEPENDS}, init-system-helpers (>= 1.54~), util-linux
+Depends: ${SHLIB_DEPENDS}, init-system-helpers (>= 1.54~), util-linux, dbus, policykit-1 | polkitd
+Provides: power-profiles-daemon
+Conflicts: power-profiles-daemon, tuned-ppd, tlp-pd
+Replaces: power-profiles-daemon
 Recommends: libxkbcommon0, libxkbcommon-x11-0, libx11-6, libxcursor1, libxi6, libxrender1, libwayland-client0, libwayland-egl1, libegl1, libgl1, policykit-1 | pkexec
 Suggests: acpi-call-dkms
 Maintainer: AWCC Linux Contributors <https://github.com/Hoggormino/awcc-rs>

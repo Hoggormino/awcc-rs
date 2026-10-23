@@ -524,6 +524,18 @@ fn setup(run: &mut Run<'_, '_>) -> Result<ApplyReport, InstallError> {
     // Inspect again after reload before any start: the loaded unit must still match ownership.
     let reloaded = detect(paths, run.ctx.runner, run.ctx.options.command_timeout);
     validate_setup_unit(paths, &reloaded)?;
+    if paths.is_privileged() {
+        crate::provider_install::install(
+            paths,
+            run.ctx.runner,
+            if det.ours {
+                "/opt/awcc-rs/service/current/bin/awcc-cli"
+            } else {
+                "/usr/bin/awcc-cli"
+            },
+        )
+        .map_err(setup_failed)?;
+    }
     run.emit(
         ProgressStep::StartingService,
         "enabling and starting the installed service",
@@ -663,6 +675,12 @@ fn rollback(run: &mut Run<'_, '_>, journal: &Journal) -> RollbackSummary {
             note(
                 "stopping the new release",
                 run.systemd.act("stop", true).map_err(|e| e.to_string()),
+            );
+        }
+        if paths.is_privileged() && !journal.previous.unit_existed {
+            note(
+                "restoring previous PowerProfiles provider",
+                crate::provider_install::remove(paths, run.ctx.runner),
             );
         }
         let prev = &journal.previous;
@@ -1118,6 +1136,14 @@ fn deploy_steps(
         .act("daemon-reload", false)
         .map_err(|e| fail("reloading systemd", e))?;
 
+    if paths.is_privileged() {
+        crate::provider_install::install(
+            paths,
+            run.ctx.runner,
+            "/opt/awcc-rs/service/current/bin/awcc-cli",
+        )
+        .map_err(|e| fail("provider handover", e))?;
+    }
     journal.phase = Phase::Started;
     save_journal(paths, journal).map_err(|e| fail("journal", e))?;
     let start = fresh || journal.previous.active;
@@ -1292,6 +1318,9 @@ fn uninstall(
                 unit_path.display()
             ));
         }
+    }
+    if paths.is_privileged() {
+        crate::provider_install::remove(paths, run.ctx.runner).map_err(setup_failed)?;
     }
     run.systemd.act("daemon-reload", false)?;
 

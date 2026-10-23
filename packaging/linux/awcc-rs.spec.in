@@ -9,6 +9,12 @@ License:        BSD-2-Clause AND MIT
 URL:            https://github.com/Hoggormino/awcc-rs
 ExclusiveArch:  x86_64
 
+Provides:       power-profiles-daemon
+Conflicts:      power-profiles-daemon
+Conflicts:      tuned-ppd
+Requires:       systemd
+Requires:       dbus
+Requires:       polkit
 Requires:       hicolor-icon-theme
 Requires:       dejavu-sans-fonts
 Requires(post): systemd
@@ -58,6 +64,7 @@ mkdir -p %{buildroot}%{_datadir}/metainfo
 mkdir -p %{buildroot}%{_licensedir}/%{name}
 mkdir -p %{buildroot}%{_docdir}/%{name}
 
+install -m 0755 "%{staged_root}/bin/powerprofilesctl" "%{buildroot}/usr/bin/powerprofilesctl"
 install -m 0755 "%{staged_root}/bin/awcc-cli" "%{buildroot}%{_bindir}/awcc-cli"
 install -m 0755 "%{staged_root}/bin/awcc-gui" "%{buildroot}%{_bindir}/awcc-gui"
 install -m 0644 "%{staged_root}/share/awcc/database.json" "%{buildroot}%{_sysconfdir}/awcc/database.json"
@@ -65,6 +72,12 @@ install -m 0644 "%{staged_root}/share/awcc/database.json" "%{buildroot}%{_datadi
 printf 'rpm\n' > "%{buildroot}%{_datadir}/awcc/package-format"
 chmod 0644 "%{buildroot}%{_datadir}/awcc/package-format"
 install -m 0644 "%{staged_root}/share/applications/awcc-gui.desktop" "%{buildroot}%{_datadir}/applications/awcc-gui.desktop"
+mkdir -p "%{buildroot}/usr/share/dbus-1/system-services"
+cp "%{staged_root}/share/dbus-1/system-services/"* "%{buildroot}/usr/share/dbus-1/system-services/"
+mkdir -p "%{buildroot}/usr/share/dbus-1/system.d"
+cp "%{staged_root}/share/dbus-1/system.d/"* "%{buildroot}/usr/share/dbus-1/system.d/"
+mkdir -p "%{buildroot}/usr/share/polkit-1/actions"
+cp "%{staged_root}/share/polkit-1/actions/"* "%{buildroot}/usr/share/polkit-1/actions/"
 install -m 0644 "%{staged_root}/share/systemd/awccd.service" "%{buildroot}/usr/lib/systemd/system/awccd.service"
 install -m 0644 "%{staged_root}/share/modules-load.d/awcc-rs.conf" "%{buildroot}/usr/lib/modules-load.d/awcc-rs.conf"
 install -m 0644 "%{staged_root}/share/udev/rules.d/70-awcc-rs.rules" "%{buildroot}/usr/lib/udev/rules.d/70-awcc-rs.rules"
@@ -83,6 +96,7 @@ install -m 0644 "%{staged_root}/share/doc/awcc-rs/INSTALL.txt" "%{buildroot}%{_d
 %postun -f %{native_hooks_root}/rpm.postun
 
 %files
+%{_bindir}/powerprofilesctl
 %{_bindir}/awcc-cli
 %{_bindir}/awcc-gui
 %dir %{_sysconfdir}/awcc
@@ -92,6 +106,9 @@ install -m 0644 "%{staged_root}/share/doc/awcc-rs/INSTALL.txt" "%{buildroot}%{_d
 %{_datadir}/awcc/package-format
 %{_datadir}/applications/awcc-gui.desktop
 /usr/lib/systemd/system/awccd.service
+/usr/share/dbus-1/system-services/*.service
+/usr/share/dbus-1/system.d/awcc-power-profiles.conf
+/usr/share/polkit-1/actions/awcc-power-profiles.policy
 /usr/lib/modules-load.d/awcc-rs.conf
 /usr/lib/udev/rules.d/70-awcc-rs.rules
 %{_datadir}/icons/hicolor/scalable/apps/awcc-gui.svg

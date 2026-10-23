@@ -517,12 +517,14 @@ dependencies = [
  "awcc-core",
  "awcc-diagnostics",
  "awcc-platform",
+ "blocking",
  "rustix 1.1.5",
  "serde",
  "serde_json",
  "signal-hook",
  "thiserror 2.0.21",
  "tracing",
+ "zbus",
 ]
 
 [[package]]

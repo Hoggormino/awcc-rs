@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 // AWCC Linux — Slint Material 3 (@material 1.1.0) Desktop UI
 
-import { Palette, ListView, ScrollView } from "std-widgets.slint";
+import { Palette, ListView, ScrollView, ComboBox } from "std-widgets.slint";
 import {
     MaterialWindow,
     NavigationRail,
@@ -160,6 +160,11 @@ export component MainWindow inherits MaterialWindow {
     in property <string> service-state-label: "Checking…";
     in property <string> service-state-detail: "";
     in property <string> service-managed-by: "";
+    in property <string> power-summary: "";
+    in property <string> power-saver-counterpart: "Quiet";
+    in property <string> balanced-counterpart: "Balanced";
+    in property <string> performance-counterpart: "Performance";
+    callback configure-power(string, string);
     in property <string> service-curve-summary: "";
     in property <string> service-version-line: "";
     in property <bool> service-state-is-problem: false;
@@ -1867,6 +1872,24 @@ export component MainWindow inherits MaterialWindow {
                             wrap: word-wrap;
                         }
 
+                        if root.power-summary != "" : VerticalLayout {
+                            spacing: 8px;
+                            MaterialText { text: "System power profiles"; style: MaterialTypography.title_medium; }
+                            MaterialText { text: root.power-summary; wrap: word-wrap; style: MaterialTypography.body_small; }
+                            HorizontalLayout {
+                                MaterialText { text: "Power Save"; min-width: 110px; }
+                                ComboBox { model: ["Quiet", "Cool", "Manual"]; current-value: root.power-saver-counterpart; selected(value) => { root.configure-power("power-saver", value); } }
+                            }
+                            HorizontalLayout {
+                                MaterialText { text: "Balanced"; min-width: 110px; }
+                                ComboBox { model: ["Balanced", "Manual"]; current-value: root.balanced-counterpart; selected(value) => { root.configure-power("balanced", value); } }
+                            }
+                            HorizontalLayout {
+                                MaterialText { text: "Performance"; min-width: 110px; }
+                                ComboBox { model: ["Performance", "Full Speed", "Manual", "G-Mode"]; current-value: root.performance-counterpart; selected(value) => { root.configure-power("performance", value); } }
+                            }
+                            MaterialText { text: "Each system profile remembers its own thermal preset or manual fan settings. Configure manual speeds and curves in Thermal Control."; wrap: word-wrap; style: MaterialTypography.body_small; }
+                        }
                         if root.service-restore-available : HorizontalLayout {
                             height: 34px;
                             alignment: space-between;

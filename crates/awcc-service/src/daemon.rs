@@ -511,12 +511,20 @@ impl Daemon {
             AsyncSettingsSink::spawn_owned(store, block_overwrite, Arc::clone(&lock))
                 .map_err(|e| DaemonError::Io(format!("cannot start settings writer: {e}")))?,
         );
-        let core = ControlCore::new(
+        let constructor = if options.strict_owner {
+            ControlCore::new_deferred
+        } else {
+            ControlCore::new
+        };
+        let mut core = constructor(
             orchestrator,
             load,
             Arc::clone(&sink) as Arc<dyn SettingsSink>,
             options.tick_interval,
         );
+        if options.strict_owner {
+            core.set_cpu_backend(Box::new(awcc_platform::cpu_policy::LinuxCpuPolicy::system()));
+        }
         let control = ControlHandle::spawn_owned(core, Arc::clone(&lock))
             .map_err(|e| DaemonError::Io(format!("cannot start control thread: {e}")))?;
         let server = match IpcServer::bind(
@@ -620,7 +628,11 @@ pub fn run_system_daemon(build: BuildSummary) -> Result<String, DaemonError> {
         signal_hook::flag::register(signal, Arc::clone(&stop))
             .map_err(|e| DaemonError::Io(format!("cannot install signal handler: {e}")))?;
     }
+    let power_bus = crate::power_bus::PowerBus::system().map_err(DaemonError::Io)?;
     let daemon = Daemon::start(DaemonOptions::system(build), system_orchestrator)?;
+    power_bus
+        .attach(daemon.control().clone())
+        .map_err(DaemonError::Io)?;
     let report = daemon.run(&stop);
     tracing::info!(
         target: "awcc_service::daemon",

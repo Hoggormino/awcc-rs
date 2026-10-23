@@ -32,6 +32,7 @@ const OUTPUT_CAP: usize = 1 << 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HostTool {
     Systemctl,
+    Busctl,
     Rpm,
     Dpkg,
     Pacman,
@@ -44,6 +45,7 @@ impl HostTool {
     pub const fn executable_name(self) -> &'static str {
         match self {
             Self::Systemctl => "systemctl",
+            Self::Busctl => "busctl",
             Self::Rpm => "rpm",
             Self::Dpkg => "dpkg",
             Self::Pacman => "pacman",

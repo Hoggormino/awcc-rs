@@ -101,7 +101,7 @@ fn validate_health(probe: ServiceProbe, action: ServiceAction) -> Result<(), Str
                     env!("CARGO_PKG_VERSION")
                 ));
             }
-            if status.control_running {
+            if status.control_running && status.power_provider_ready {
                 Ok(())
             } else {
                 Err("service control is not ready".to_owned())
@@ -244,6 +244,7 @@ mod tests {
                 device_name: "test".into(),
                 acpi_prefix: "test".into(),
                 control_running,
+                power_provider_ready: control_running,
             },
             capabilities: vec![],
         }

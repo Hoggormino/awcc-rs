@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::daemon::DaemonRpcRequest;
 
 /// Current settings schema version.
-pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
 /// Persistent service state directory.
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/awcc";
 /// File name of the settings document inside the state directory.
@@ -40,6 +40,8 @@ pub struct ServiceSettings {
     /// G-Mode selections are not restored. Absent on fresh installs and schema 1 settings.
     #[serde(default)]
     pub thermal_preset: Option<ThermalMode>,
+    #[serde(default)]
+    pub power: crate::power::PowerSettings,
     /// Saved curve parameters (`enabled` is always stored as `false`; see `intent_active`).
     pub curve: FanCurveConfig,
     /// The user's intent: run the curve.
@@ -57,6 +59,7 @@ impl ServiceSettings {
             device_name: device_name.to_string(),
             acpi_prefix: acpi_prefix.to_string(),
             thermal_preset: None,
+            power: crate::power::PowerSettings::default(),
             curve: FanCurveConfig::default(),
             intent_active: false,
             restore_at_startup: false,
@@ -190,7 +193,7 @@ impl SettingsStore {
                 };
             }
         };
-        if !matches!(settings.schema_version, 1 | SETTINGS_SCHEMA_VERSION) {
+        if !matches!(settings.schema_version, 1 | 2 | SETTINGS_SCHEMA_VERSION) {
             return SettingsLoad::Invalid {
                 reason: format!("unsupported schema version {}", settings.schema_version),
             };
@@ -213,6 +216,43 @@ impl SettingsStore {
             return SettingsLoad::Invalid {
                 reason: "saved thermal preset must not be Manual or G-Mode".to_string(),
             };
+        }
+        for (profile, policy) in &settings.power.counterparts {
+            if let Err(reason) = policy.validate(*profile) {
+                return SettingsLoad::Invalid { reason };
+            }
+            if let awcc_core::ThermalPolicy::Manual {
+                curve: Some(curve), ..
+            } = policy
+                && let Err(reason) = validate_curve(curve)
+            {
+                return SettingsLoad::Invalid { reason };
+            }
+        }
+        if settings.schema_version < 3 {
+            if let Some(mode) = settings.thermal_preset
+                && let Some(profile) = awcc_core::PowerProfile::for_mode(mode)
+            {
+                settings.power.selected = Some(profile);
+                settings
+                    .power
+                    .counterparts
+                    .insert(profile, awcc_core::ThermalPolicy::Preset { mode });
+            }
+            if settings.intent_active && settings.restore_at_startup {
+                let profile = settings
+                    .power
+                    .selected
+                    .unwrap_or(awcc_core::PowerProfile::Balanced);
+                settings.power.counterparts.insert(
+                    profile,
+                    awcc_core::ThermalPolicy::Manual {
+                        cpu_boost_pct: 0,
+                        gpu_boost_pct: 0,
+                        curve: Some(settings.curve.clone()),
+                    },
+                );
+            }
         }
         // Migrate in memory. Reading old settings never creates new user intent or rewrites the
         // file; a later explicit settings change persists the current schema atomically.
@@ -325,11 +365,49 @@ mod tests {
         let mut old = serde_json::to_value(&settings).unwrap();
         old["schema_version"] = 1.into();
         old.as_object_mut().unwrap().remove("thermal_preset");
+        old.as_object_mut().unwrap().remove("power");
         let bytes = serde_json::to_vec(&old).unwrap();
         fs::write(store.path(), &bytes).unwrap();
         fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        settings.power.counterparts.insert(
+            awcc_core::PowerProfile::Balanced,
+            awcc_core::ThermalPolicy::Manual {
+                cpu_boost_pct: 0,
+                gpu_boost_pct: 0,
+                curve: Some(settings.curve.clone()),
+            },
+        );
         assert_eq!(store.load("M15", "AMWW"), SettingsLoad::Loaded(settings));
         assert_eq!(fs::read(store.path()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn schema_two_keeps_the_curve_and_migrates_the_preset_without_enabling_old_restore() {
+        let d = dir("schema_two");
+        let store = SettingsStore::new(&d);
+        let mut s = ServiceSettings::fresh("M15", "AMWW");
+        s.thermal_preset = Some(ThermalMode::Cool);
+        s.intent_active = true;
+        let mut old = serde_json::to_value(&s).unwrap();
+        old["schema_version"] = 2.into();
+        old.as_object_mut().unwrap().remove("power");
+        fs::write(store.path(), serde_json::to_vec(&old).unwrap()).unwrap();
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let SettingsLoad::Loaded(loaded) = store.load("M15", "AMWW") else {
+            panic!("schema two did not migrate")
+        };
+        assert_eq!(loaded.curve, s.curve);
+        assert!(!loaded.restore_at_startup);
+        assert_eq!(
+            loaded.power.selected,
+            Some(awcc_core::PowerProfile::PowerSaver)
+        );
+        assert_eq!(
+            loaded.power.counterparts[&awcc_core::PowerProfile::PowerSaver],
+            awcc_core::ThermalPolicy::Preset {
+                mode: ThermalMode::Cool
+            }
+        );
     }
 
     #[test]

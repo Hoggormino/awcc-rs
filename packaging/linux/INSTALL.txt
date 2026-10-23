@@ -52,28 +52,21 @@ USB access rules for the supported lighting controllers. The kernel module must
 be installed for the running kernel; the package does not build or download a
 kernel driver during installation. See Hardware Access Prerequisites below.
 
-Saved Thermal Preset and Desktop Power Management
---------------------------------------------------
-An accepted firmware preset selection (for example Cool or Quiet) is saved by the
-service in /var/lib/awcc/settings.json and restored when the service starts. The
-GUI does not have to be running. A failed request preserves the previous choice.
-Fresh installations and upgrades from settings schema 1 have no saved preset;
-select your preference once after upgrading. Manual boost and G-Mode are
-transient and clear preset restoration. Saved custom-curve auto-restore takes
-precedence when enabled; its startup preference is separate from presets.
-Save failures and startup restore failures are reported in GUI service details.
+System PowerProfiles Provider
+-----------------------------
+AWCC provides the standard system PowerProfiles service for KDE/GNOME. Setup
+hands over ownership from competing providers with a reversible journal under
+/var/lib/awcc/provider-handover.json. Administrator overrides are preserved and
+reported for explicit review. Only recorded masks/registration files still owned
+by AWCC are restored on removal. A previous provider removed by the native
+package manager must be reinstalled through that package manager if desired.
 
-The desktop's power manager can also change the firmware profile. For example,
-Power Profiles Daemon's platform_profile driver can replace AWCC's restored
-preset at login or on AC/battery transitions. AWCC restores saved intent once;
-it does not repeatedly overwrite another controller's changes.
-
-If AWCC should own firmware thermal profiles while the desktop retains CPU power
-management, an administrator can configure Power Profiles Daemon to start with
---block-driver=platform_profile, when supported by the installed version. Check
-its --help-all output and existing systemd ExecStart before creating a service
-override; executable paths and existing arguments vary by distribution. This is
-an administrator choice, and installing AWCC does not change other services.
+Power Save, Balanced and Performance each remember a thermal preset or Manual
+configuration, including a curve. Configure the counterparts in Settings. Intel
+and AMD CPUFreq controls are detected and verified by readback. Explicit turbo
+toggles persist and profile changes never implicitly toggle turbo. Optional PPD
+hardware actions are not implemented. powerprofilesctl supports get, set, list,
+list-holds and launch. Full policy and recovery details are in docs/power_profiles.md.
 
 Removal and Purge
 -----------------
@@ -160,11 +153,11 @@ System Installation from Binary Archive
   sudo install -Dm755 bin/awcc-gui /usr/local/bin/awcc-gui
   sudo install -Dm644 share/awcc/database.json /etc/awcc/database.json
   sudo install -Dm644 share/applications/awcc-gui.desktop /usr/local/share/applications/awcc-gui.desktop
-  sudo install -Dm644 share/systemd/awccd.service /etc/systemd/system/awccd.service   # then edit ExecStart to /usr/local/bin/awcc-cli -d
+  sudo install -Dm644 share/systemd/awccd.service /etc/systemd/system/awccd.service   # then edit both ExecStart and ExecStartPre to use /usr/local/bin/awcc-cli
   sudo install -Dm644 share/icons/hicolor/scalable/apps/awcc-gui.svg /usr/local/share/icons/hicolor/scalable/apps/awcc-gui.svg
   sudo install -Dm644 share/icons/hicolor/256x256/apps/awcc-gui.png /usr/local/share/icons/hicolor/256x256/apps/awcc-gui.png
 
-This is a manual installation: edit the installed unit's ExecStart as noted above,
+This is a manual installation: edit the installed unit's ExecStart and ExecStartPre as noted above,
 then authorize your desktop account and start the service:
   sudo awcc-cli service authorize "$USER"
   sudo systemctl daemon-reload

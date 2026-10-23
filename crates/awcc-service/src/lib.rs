@@ -66,6 +66,9 @@ pub mod installer;
 pub mod ipc;
 pub mod keybinder;
 pub mod management;
+pub mod power;
+pub mod power_bus;
+pub mod provider_install;
 pub mod settings;
 pub mod wire;
 
@@ -415,6 +418,11 @@ impl SystemSnapshot {
 /// Commands dispatched from the GUI or CLI to the background service worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceCommand {
+    SelectPower(awcc_core::PowerProfile),
+    ConfigurePower {
+        profile: awcc_core::PowerProfile,
+        policy: awcc_core::ThermalPolicy,
+    },
     Refresh,
     SetThermalMode(ThermalMode),
     ToggleGMode,
@@ -466,6 +474,10 @@ impl ServiceCommand {
     #[must_use]
     pub fn label(&self) -> String {
         match self {
+            Self::SelectPower(p) => format!("Select system profile {}", p.as_str()),
+            Self::ConfigurePower { profile, .. } => {
+                format!("Configure {} thermal counterpart", profile.as_str())
+            }
             Self::Refresh => "Refresh".to_string(),
             Self::SetThermalMode(mode) => format!("Switch thermal mode to {mode}"),
             Self::ToggleGMode => "Toggle G-Mode".to_string(),
@@ -1406,6 +1418,29 @@ impl ThermalOrchestrator {
     }
 
     fn exec_enter_gmode(&mut self) -> Settled {
+        let latch = match self.transport.query_game_shift_status() {
+            Ok(value) => value,
+            Err(error) => {
+                return Settled::Terminal(OperationLifecycle::Failed {
+                    summary: "G-Mode activation refused".into(),
+                    error: format!("cannot ensure the GameShift latch state: {error}"),
+                });
+            }
+        };
+        if latch
+            && self
+                .transport
+                .query_raw_thermal_mode()
+                .ok()
+                .is_some_and(|raw| {
+                    self.profile.code_table.decode_query_response(raw)
+                        == ThermalModeState::Known(ThermalMode::GMode)
+                })
+        {
+            return Settled::Terminal(OperationLifecycle::Confirmed {
+                summary: "G-Mode already enabled".into(),
+            });
+        }
         if let Ok(raw) = self.transport.query_raw_thermal_mode()
             && let ThermalModeState::Known(current) =
                 self.profile.code_table.decode_query_response(raw)
@@ -1730,6 +1765,10 @@ impl ThermalOrchestrator {
 
     /// `(device name, ACPI prefix)` this orchestrator controls.
     #[must_use]
+    pub fn supports_mode(&self, mode: ThermalMode) -> bool {
+        self.profile.entry.supports_thermal_mode(mode)
+    }
+
     pub fn device_identity(&self) -> (String, String) {
         (
             self.profile.device_name.clone(),
@@ -2016,6 +2055,14 @@ impl ThermalOrchestrator {
                 }
                 self.query_snapshot()
             }
+            ServiceCommand::SelectPower(_) | ServiceCommand::ConfigurePower { .. } => {
+                self.run_op("Configure system power policy", |_| {
+                    Settled::Terminal(OperationLifecycle::Failed {
+                        summary: "provider required".into(),
+                        error: "system profiles require the background provider".into(),
+                    })
+                })
+            }
             ServiceCommand::SetThermalMode(mode) => self.set_thermal_mode(mode),
             ServiceCommand::ToggleGMode => self.toggle_gmode(),
             ServiceCommand::ApplyManualBoost {
@@ -2102,6 +2149,15 @@ impl RemoteThermal for DaemonClient {
     fn execute(&mut self, op: ControlOp) -> Result<(ThermalView, OperationLifecycle), ClientError> {
         use crate::ipc::Op;
         let wire = match op {
+            ControlOp::SelectPower(profile) => Op::SelectPower { profile },
+            ControlOp::ConfigurePower { profile, policy } => Op::ConfigurePower { profile, policy },
+            ControlOp::EnablePower
+            | ControlOp::HoldPower(_)
+            | ControlOp::ReleasePower { .. }
+            | ControlOp::DisconnectPower(_)
+            | ControlOp::ReconcilePower => {
+                return Err(ClientError::Rejected("internal power operation".into()));
+            }
             ControlOp::SetThermalMode(mode) => Op::SetThermalMode { mode },
             ControlOp::ToggleGMode => Op::ToggleGMode,
             ControlOp::ApplyManualBoost {
@@ -2192,6 +2248,11 @@ impl ThermalTransport for InertThermalTransport {
 impl ThermalOrchestrator {
     fn remote_op_for(cmd: &ServiceCommand) -> Option<ControlOp> {
         Some(match cmd {
+            ServiceCommand::SelectPower(p) => ControlOp::SelectPower(*p),
+            ServiceCommand::ConfigurePower { profile, policy } => ControlOp::ConfigurePower {
+                profile: *profile,
+                policy: policy.clone(),
+            },
             ServiceCommand::SetThermalMode(m) => ControlOp::SetThermalMode(*m),
             ServiceCommand::ToggleGMode => ControlOp::ToggleGMode,
             ServiceCommand::ApplyManualBoost {

@@ -31,7 +31,15 @@ args = sys.argv[1:]
 with (root / "calls.jsonl").open("a") as stream:
     stream.write(json.dumps([tool] + args) + "\n")
 code = 0
-if tool == "awcc-cli":
+if tool == "awcc-cli" and args == ["--provider-health"]:
+    code = 0 if state["active"] and not state.get("health_fails") else 1
+elif tool == "awcc-cli" and args[:1] == ["--provider-handover"]:
+    if args[1] == "install":
+        code = 1 if state.get("handover_fails") else 0
+        state["provider_owned"] = code == 0
+    else:
+        state["provider_owned"] = False
+elif tool == "awcc-cli":
     assert args[:2] == ["service", "authorize"], args
     if state.get("authorize_fails"):
         code = 1
@@ -178,6 +186,20 @@ class PackageLifecycleTests(unittest.TestCase):
                 self.assertEqual(self.marker.stat().st_mode & 0o777, 0o600)
                 self.assertTrue(self.state()["enabled"])
                 self.assertTrue(self.state()["active"])
+
+    def test_failed_provider_health_recovers_after_stopping_new_service(self):
+        self.update_state(health_fails=True)
+        self.configure("arch")
+        self.assertFalse(self.state()["active"])
+        self.assertFalse(self.state()["provider_owned"])
+        calls=self.calls()
+        self.assertLess(calls.index(["systemctl","stop","awccd.service"]),calls.index(["awcc-cli","--provider-handover","remove"]))
+
+    def test_failed_provider_handover_does_not_start_the_service(self):
+        self.update_state(handover_fails=True)
+        self.configure("arch")
+        self.assertFalse(self.state()["active"])
+        self.assertFalse(self.state()["provider_owned"])
 
     def test_pkexec_identity_takes_precedence(self):
         self.env["PKEXEC_UID"] = "1001"

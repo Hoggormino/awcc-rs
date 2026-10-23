@@ -294,6 +294,8 @@ pub enum ControlState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlStatus {
+    #[serde(default)]
+    pub power: crate::power::PowerStatus,
     pub state: ControlState,
     /// Saved curve parameters (the `enabled` flag inside is not the intent: see `intent_active`).
     pub saved_curve: FanCurveConfig,

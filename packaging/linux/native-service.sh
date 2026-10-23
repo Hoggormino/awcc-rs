@@ -193,6 +193,20 @@ awcc_native_configure() {
         return 0
     fi
 
+    awcc_attempt_start=0
+    if awcc_native_live_systemd; then
+        if [ "$2" = fresh ] || systemctl is-active --quiet "$AWCC_NATIVE_UNIT"; then
+            awcc_attempt_start=1
+        fi
+        if [ "$1" = deb ] && [ -x "${AWCC_NATIVE_ROOT}/usr/sbin/policy-rc.d" ] &&
+           ! "${AWCC_NATIVE_ROOT}/usr/sbin/policy-rc.d" "$AWCC_NATIVE_UNIT" start >/dev/null 2>&1; then
+            awcc_attempt_start=0
+        fi
+    fi
+    if [ "$awcc_attempt_start" = 1 ] && ! "$AWCC_NATIVE_CLI" --provider-handover install; then
+        awcc_native_notice 'PowerProfiles handover failed and recovery was attempted; resolve the reported provider conflict before setup.'
+        return 0
+    fi
     if [ "$1" = deb ]; then
         if [ "$2" = fresh ]; then
             deb-systemd-helper enable "$AWCC_NATIVE_UNIT" >/dev/null || \
@@ -221,6 +235,11 @@ awcc_native_configure() {
     else
         systemctl "$awcc_service_action" "$AWCC_NATIVE_UNIT" || \
             awcc_native_notice 'service startup failed; open AWCC and choose Set up service for details.'
+    fi
+    if [ "$awcc_attempt_start" = 1 ] && ! "$AWCC_NATIVE_CLI" --provider-health; then
+        awcc_native_notice 'PowerProfiles provider health check failed; restoring recorded provider state.'
+        systemctl stop "$AWCC_NATIVE_UNIT" || true
+        "$AWCC_NATIVE_CLI" --provider-handover remove || awcc_native_notice 'provider recovery needs administrator attention.'
     fi
     return 0
 }
@@ -256,6 +275,7 @@ awcc_native_remove() {
             return 1
         fi
     fi
+    "$AWCC_NATIVE_CLI" --provider-handover remove || return 1
     if [ "$1" = deb ]; then
         deb-systemd-helper disable "$AWCC_NATIVE_UNIT" >/dev/null || return 1
     elif command -v systemctl >/dev/null 2>&1; then

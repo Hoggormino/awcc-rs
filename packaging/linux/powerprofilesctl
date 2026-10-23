@@ -1,0 +1,4 @@
+#!/bin/sh
+# Standalone tarballs and native packages use the same desktop API client.
+awcc_bin_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+exec "${awcc_bin_dir}/awcc-cli" --powerprofilesctl "$@"

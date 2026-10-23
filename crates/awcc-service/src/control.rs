@@ -33,7 +33,7 @@
 //! The GPU temperature falls back to the CPU temperature (the pre-existing curve behaviour).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -69,6 +69,19 @@ pub const OPERATION_MEMORY: usize = 64;
 /// A thermal operation that a client may request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlOp {
+    EnablePower,
+    SelectPower(awcc_core::PowerProfile),
+    ConfigurePower {
+        profile: awcc_core::PowerProfile,
+        policy: awcc_core::ThermalPolicy,
+    },
+    HoldPower(crate::power::ProfileHold),
+    ReleasePower {
+        cookie: u32,
+        owner: String,
+    },
+    DisconnectPower(String),
+    ReconcilePower,
     SetThermalMode(ThermalMode),
     ToggleGMode,
     ApplyManualBoost {
@@ -128,6 +141,7 @@ pub enum ControlRequest {
 }
 
 struct Envelope {
+    generation: Option<u64>,
     request: ControlRequest,
     reply: SyncSender<ControlReply>,
 }
@@ -311,6 +325,12 @@ impl Drop for AsyncSettingsSink {
 /// The synchronous control state machine. [`ControlHandle`] runs it on its own thread.
 pub struct ControlCore {
     orch: ThermalOrchestrator,
+    cpu: Box<dyn awcc_platform::cpu_policy::CpuPolicyBackend>,
+    power: crate::power::PowerStatus,
+    power_enabled: bool,
+    applying_power: bool,
+    desired_generation: Option<(Arc<AtomicU64>, u64)>,
+    applied_policy: Option<(awcc_core::PowerProfile, awcc_core::ThermalPolicy)>,
     settings: ServiceSettings,
     sink: Arc<dyn SettingsSink>,
     settings_problem: Option<String>,
@@ -373,6 +393,33 @@ impl ControlCore {
         clock: Box<dyn Fn() -> Instant + Send>,
         wall_clock: Box<dyn Fn() -> SystemTime + Send>,
     ) -> Self {
+        Self::construct(orch, load, sink, tick_interval, clock, wall_clock, true)
+    }
+    pub(crate) fn new_deferred(
+        orch: ThermalOrchestrator,
+        load: SettingsLoad,
+        sink: Arc<dyn SettingsSink>,
+        tick_interval: Duration,
+    ) -> Self {
+        Self::construct(
+            orch,
+            load,
+            sink,
+            tick_interval,
+            Box::new(Instant::now),
+            Box::new(SystemTime::now),
+            false,
+        )
+    }
+    fn construct(
+        orch: ThermalOrchestrator,
+        load: SettingsLoad,
+        sink: Arc<dyn SettingsSink>,
+        tick_interval: Duration,
+        clock: Box<dyn Fn() -> Instant + Send>,
+        wall_clock: Box<dyn Fn() -> SystemTime + Send>,
+        restore: bool,
+    ) -> Self {
         let device = orch.device_identity();
         let (settings, settings_problem) = match load {
             SettingsLoad::Loaded(s) => (s, None),
@@ -395,6 +442,12 @@ impl ControlCore {
         let started = clock();
         let mut core = Self {
             orch,
+            cpu: Box::new(awcc_platform::cpu_policy::SimCpuPolicy),
+            power: Default::default(),
+            power_enabled: false,
+            applying_power: false,
+            desired_generation: None,
+            applied_policy: None,
             settings,
             sink,
             settings_problem,
@@ -415,8 +468,344 @@ impl ControlCore {
             last_view: None,
             view_revision: 0,
         };
-        core.startup_restore();
+        if restore {
+            core.startup_restore();
+        }
         core
+    }
+
+    /// Inject CPU controls before enabling the provider; tests never access system sysfs.
+    pub fn set_cpu_backend(
+        &mut self,
+        backend: Box<dyn awcc_platform::cpu_policy::CpuPolicyBackend>,
+    ) {
+        self.cpu = backend;
+    }
+
+    fn handle_power(&mut self, op: &ControlOp) -> Option<ControlReply> {
+        use awcc_core::{PowerProfile as P, ThermalPolicy as T};
+        let original_settings = self.settings.clone();
+        let original_holds = self.power.holds.clone();
+        let mut wanted = None;
+        let mut save = false;
+        match op {
+            ControlOp::EnablePower => {
+                self.power_enabled = true;
+            }
+            ControlOp::SelectPower(profile) if self.power.active == Some(*profile) => {}
+            ControlOp::SelectPower(profile) => {
+                self.settings.power.selected = Some(*profile);
+                let cookies = self
+                    .power
+                    .holds
+                    .iter()
+                    .map(|h| h.cookie)
+                    .collect::<Vec<_>>();
+                for cookie in cookies {
+                    self.power.release(cookie);
+                }
+                save = true;
+            }
+            ControlOp::ConfigurePower { profile, policy } => {
+                if let Err(reason) = self.validate_policy(*profile, policy) {
+                    return Some(self.reject("invalid_policy", reason));
+                }
+                self.settings
+                    .power
+                    .counterparts
+                    .insert(*profile, policy.clone());
+                save = true;
+            }
+            ControlOp::HoldPower(hold) => {
+                if hold.profile == P::Balanced
+                    || hold.reason.len() > 256
+                    || hold.application_id.len() > 256
+                    || self.power.holds.len() >= 64
+                    || self.power.holds.iter().any(|h| h.cookie == hold.cookie)
+                {
+                    return Some(
+                        self.reject("invalid_hold", "invalid or excessive profile holds".into()),
+                    );
+                }
+                self.power.holds.push(hold.clone());
+            }
+            ControlOp::ReleasePower { cookie, owner } => {
+                if !self
+                    .power
+                    .holds
+                    .iter()
+                    .any(|h| h.cookie == *cookie && &h.owner == owner)
+                {
+                    return Some(self.reject(
+                        "access_denied",
+                        "hold does not belong to this caller".into(),
+                    ));
+                }
+                self.power.release(*cookie);
+            }
+            ControlOp::DisconnectPower(owner) => {
+                let cookies = self
+                    .power
+                    .holds
+                    .iter()
+                    .filter(|h| &h.owner == owner)
+                    .map(|h| h.cookie)
+                    .collect::<Vec<_>>();
+                if cookies.is_empty() {
+                    return Some(ControlReply {
+                        raw_output: None,
+                        view: self.refresh(),
+                        result: Ok(OperationLifecycle::Idle),
+                    });
+                }
+                for cookie in cookies {
+                    self.power.release(cookie);
+                }
+            }
+            ControlOp::ReconcilePower if self.power_enabled => {}
+            ControlOp::SetThermalMode(mode) if self.power_enabled => {
+                let profile = P::for_mode(*mode)
+                    .unwrap_or(self.settings.power.selected.unwrap_or(P::Balanced));
+                let policy = if *mode == ThermalMode::Manual {
+                    self.settings
+                        .power
+                        .counterparts
+                        .get(&profile)
+                        .filter(|p| matches!(p, T::Manual { .. }))
+                        .cloned()
+                        .unwrap_or(T::Manual {
+                            cpu_boost_pct: 30,
+                            gpu_boost_pct: 30,
+                            curve: None,
+                        })
+                } else {
+                    T::Preset { mode: *mode }
+                };
+                if let Err(reason) = self.validate_policy(profile, &policy) {
+                    return Some(self.reject("invalid_policy", reason));
+                }
+                wanted = Some((profile, policy));
+                save = true;
+            }
+            ControlOp::ApplyManualBoost {
+                cpu_boost_pct,
+                gpu_boost_pct,
+            } if self.power_enabled => {
+                let profile = self.settings.power.selected.unwrap_or(P::Balanced);
+                wanted = Some((
+                    profile,
+                    T::Manual {
+                        cpu_boost_pct: *cpu_boost_pct,
+                        gpu_boost_pct: *gpu_boost_pct,
+                        curve: None,
+                    },
+                ));
+                save = true;
+            }
+            ControlOp::ConfigureCurve(curve) if self.power_enabled => {
+                let profile = self.settings.power.selected.unwrap_or(P::Balanced);
+                wanted = Some((
+                    profile,
+                    T::Manual {
+                        cpu_boost_pct: 0,
+                        gpu_boost_pct: 0,
+                        curve: Some(curve.clone()),
+                    },
+                ));
+                save = true;
+            }
+            ControlOp::StopCurve if self.power_enabled => {
+                self.applying_power = true;
+                let reply = self.handle(ControlOp::StopCurve);
+                self.applying_power = false;
+                if reply.result.as_ref().is_ok_and(operation_succeeded)
+                    && let ThermalModeState::Known(mode) = reply.view.thermal_mode_state
+                    && awcc_core::PowerProfile::for_mode(mode).is_some()
+                {
+                    return Some(self.handle(ControlOp::SetThermalMode(mode)));
+                }
+                return Some(reply);
+            }
+            ControlOp::ToggleGMode if self.power_enabled => {
+                let mode = if matches!(
+                    self.orch.query_snapshot().thermal_mode_state,
+                    ThermalModeState::Known(ThermalMode::GMode)
+                ) {
+                    ThermalMode::Performance
+                } else {
+                    ThermalMode::GMode
+                };
+                return Some(self.handle(ControlOp::SetThermalMode(mode)));
+            }
+            ControlOp::SetCpuTurbo(enabled) if self.power_enabled => {
+                self.applying_power = true;
+                let reply = self.handle(op.clone());
+                self.applying_power = false;
+                if reply.result.as_ref().is_ok_and(operation_succeeded) {
+                    self.settings.power.turbo_override = Some(*enabled);
+                    self.persist();
+                }
+                return Some(reply);
+            }
+            _ => return None,
+        }
+        if let Some((profile, policy)) = wanted {
+            if let Err(reason) = self.validate_policy(profile, &policy) {
+                return Some(self.reject("invalid_policy", reason));
+            }
+            self.settings.power.selected = Some(profile);
+            self.settings.power.counterparts.insert(profile, policy);
+            let cookies = self
+                .power
+                .holds
+                .iter()
+                .map(|h| h.cookie)
+                .collect::<Vec<_>>();
+            for cookie in cookies {
+                self.power.release(cookie);
+            }
+        }
+        // One serialized control worker orders CPU and thermal effects. A generation identifies
+        // every attempted effective policy; published ActiveProfile advances only on success.
+        self.power.generation = self.power.generation.wrapping_add(1);
+        let selected = self.settings.power.selected.unwrap_or(P::Balanced);
+        self.power.available = P::ALL
+            .into_iter()
+            .filter(|p| {
+                self.cpu.available(*p)
+                    && self
+                        .settings
+                        .power
+                        .counterparts
+                        .get(p)
+                        .is_some_and(|policy| self.validate_policy(*p, policy).is_ok())
+            })
+            .collect();
+        let effective = self.power.effective(selected);
+        let policy = self.settings.power.counterparts.get(&effective).cloned();
+        if self.applied_policy.as_ref() == policy.as_ref().map(|p| (effective, p.clone())).as_ref()
+            && !matches!(op, ControlOp::EnablePower | ControlOp::ReconcilePower)
+        {
+            if save {
+                self.persist();
+            }
+            return Some(ControlReply {
+                raw_output: None,
+                view: self.refresh(),
+                result: Ok(OperationLifecycle::Confirmed {
+                    summary: "profile policy already active".into(),
+                }),
+            });
+        }
+        let generation = self.desired_generation.clone();
+        self.applied_policy = None;
+        self.power.cpu = self.cpu.apply(effective, &|| {
+            generation
+                .as_ref()
+                .is_none_or(|(latest, g)| latest.load(Ordering::Acquire) == *g)
+        });
+        if !self.power.cpu.confirmed {
+            self.power.problem = Some(format!(
+                "CPU policy failed: {}",
+                self.power.cpu.errors.join("; ")
+            ));
+            self.settings = original_settings;
+            if matches!(op, ControlOp::HoldPower(_)) {
+                self.power.holds = original_holds;
+            }
+            let reason = self.power.problem.clone().unwrap_or_default();
+            return Some(self.reject("cpu_policy_failed", reason));
+        }
+        if matches!(op, ControlOp::ReconcilePower | ControlOp::EnablePower)
+            && let Some(enabled) = self.settings.power.turbo_override
+        {
+            let turbo = self.orch.execute(ServiceCommand::SetCpuTurbo(enabled));
+            if !operation_succeeded(&turbo.snapshot.lifecycle) {
+                self.power.problem = Some("saved turbo override could not be restored".into());
+                return Some(self.reject(
+                    "turbo_restore_failed",
+                    "saved turbo override could not be restored".into(),
+                ));
+            }
+        }
+        if generation
+            .as_ref()
+            .is_some_and(|(latest, g)| latest.load(Ordering::Acquire) != *g)
+        {
+            self.settings = original_settings;
+            if matches!(op, ControlOp::HoldPower(_)) {
+                self.power.holds = original_holds;
+            }
+            self.power.problem = Some("CPU phase superseded; awaiting newer policy".into());
+            return Some(self.reject(
+                "superseded",
+                "CPU transition superseded; thermal policy was not applied".into(),
+            ));
+        }
+        let applied = policy.clone().map(|p| (effective, p));
+        let command = match policy {
+            Some(T::Preset { mode }) => ControlOp::SetThermalMode(mode),
+            Some(T::Manual {
+                curve: Some(curve), ..
+            }) => ControlOp::ConfigureCurve(curve),
+            Some(T::Manual {
+                cpu_boost_pct,
+                gpu_boost_pct,
+                ..
+            }) => ControlOp::ApplyManualBoost {
+                cpu_boost_pct,
+                gpu_boost_pct,
+            },
+            None => return Some(self.reject("missing_policy", "no counterpart configured".into())),
+        };
+        // Thermal writes use the existing curve ownership and rollback paths. Keep the curve
+        // configuration and user intent separate from temporary hold-derived activation.
+        let saved = self.settings.clone();
+        self.applying_power = true;
+        let mut reply = self.handle(command);
+        self.applying_power = false;
+        self.settings.power = saved.power;
+        self.settings.thermal_preset = saved.thermal_preset;
+        self.power.thermal = reply.result.as_ref().ok().cloned();
+        if reply.result.as_ref().is_ok_and(operation_succeeded) {
+            self.power.active = Some(effective);
+            self.power.problem = None;
+            self.applied_policy = applied;
+        } else {
+            self.settings = original_settings;
+            if matches!(op, ControlOp::HoldPower(_)) {
+                self.power.holds = original_holds;
+            }
+            self.power.problem = Some("CPU policy applied, but thermal activation failed".into());
+        }
+        if save {
+            self.persist();
+        }
+        let snap = self.orch.query_snapshot();
+        reply.view = self.view_from(&snap);
+        Some(reply)
+    }
+
+    fn validate_policy(
+        &self,
+        profile: awcc_core::PowerProfile,
+        policy: &awcc_core::ThermalPolicy,
+    ) -> Result<(), String> {
+        policy.validate(profile)?;
+        match policy {
+            awcc_core::ThermalPolicy::Preset { mode } if !self.orch.supports_mode(*mode) => {
+                Err(format!("{mode} is not supported on this device"))
+            }
+            awcc_core::ThermalPolicy::Manual {
+                curve: Some(curve), ..
+            } => validate_curve(curve),
+            awcc_core::ThermalPolicy::Manual { .. }
+                if !self.orch.supports_mode(ThermalMode::Manual) =>
+            {
+                Err("Manual is not supported on this device".into())
+            }
+            _ => Ok(()),
+        }
     }
 
     fn now(&self) -> Instant {
@@ -511,6 +900,9 @@ impl ControlCore {
     }
 
     fn persist(&mut self) {
+        if self.applying_power {
+            return;
+        }
         self.settings.schema_version = SETTINGS_SCHEMA_VERSION;
         self.sink.submit(self.settings.clone());
     }
@@ -519,6 +911,12 @@ impl ControlCore {
         let (pending, error) = self.sink.status();
         let now = self.now();
         ControlStatus {
+            power: {
+                let mut p = self.power.clone();
+                p.selected = self.settings.power.selected;
+                p.counterparts = self.settings.power.counterparts.clone();
+                p
+            },
             state: self.state,
             saved_curve: {
                 let mut c = self.settings.curve.clone();
@@ -581,6 +979,11 @@ impl ControlCore {
 
     /// Execute one client operation to completion.
     pub fn handle(&mut self, op: ControlOp) -> ControlReply {
+        if !self.applying_power
+            && let Some(reply) = self.handle_power(&op)
+        {
+            return reply;
+        }
         match op {
             ControlOp::SetRestoreAtStartup(value) => {
                 self.settings.restore_at_startup = value;
@@ -752,7 +1155,14 @@ impl ControlCore {
             ControlOp::SetTccOffset(o) => ServiceCommand::SetTccOffset(o),
             ControlOp::ConfigureCurve(_)
             | ControlOp::StopCurve
-            | ControlOp::SetRestoreAtStartup(_) => {
+            | ControlOp::SetRestoreAtStartup(_)
+            | ControlOp::EnablePower
+            | ControlOp::SelectPower(_)
+            | ControlOp::ConfigurePower { .. }
+            | ControlOp::HoldPower(_)
+            | ControlOp::ReleasePower { .. }
+            | ControlOp::DisconnectPower(_)
+            | ControlOp::ReconcilePower => {
                 return self.reject("internal", "operation routed incorrectly".to_string());
             }
         };
@@ -847,6 +1257,9 @@ impl ControlCore {
         self.orch.reset_curve_memory();
         self.sensor_missing_since = None;
         self.needs_revalidation = true;
+        if self.power_enabled {
+            let _ = self.handle(ControlOp::ReconcilePower);
+        }
     }
 
     /// One scheduled evaluation. `interest` says whether a client recently looked at the state.
@@ -1082,6 +1495,10 @@ struct HandleInner {
     memory: Mutex<OperationMemory>,
     pending: Mutex<std::collections::HashSet<String>>,
     stop_requested: AtomicBool,
+    generation: Arc<AtomicU64>,
+    next_generation: AtomicU64,
+    queued: AtomicUsize,
+    capacity: usize,
 }
 
 /// What is known about a request id (reconciliation after a lost connection or timeout).
@@ -1139,6 +1556,10 @@ impl ControlHandle {
             memory: Mutex::new(OperationMemory::default()),
             pending: Mutex::new(std::collections::HashSet::new()),
             stop_requested: AtomicBool::new(false),
+            generation: Arc::new(AtomicU64::new(0)),
+            next_generation: AtomicU64::new(0),
+            queued: AtomicUsize::new(0),
+            capacity,
         });
         let worker_inner = Arc::clone(&inner);
         let interval = core.tick_interval();
@@ -1156,6 +1577,9 @@ impl ControlHandle {
                     let wait = next_tick.saturating_duration_since(Instant::now());
                     match rx.recv_timeout(wait) {
                         Ok(env) => {
+                            if !matches!(env.request, ControlRequest::Shutdown) {
+                                worker_inner.queued.fetch_sub(1, Ordering::AcqRel);
+                            }
                             if worker_inner.stop_requested.load(Ordering::Acquire) {
                                 break;
                             }
@@ -1232,6 +1656,28 @@ impl ControlHandle {
         request: ControlRequest,
         deadline: Duration,
     ) -> Result<Option<ControlReply>, SubmitError> {
+        self.request_inner(request, deadline, None)
+    }
+
+    pub fn reserve_desired(&self) -> u64 {
+        self.inner.next_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn request_desired(
+        &self,
+        request: ControlRequest,
+        deadline: Duration,
+        generation: u64,
+    ) -> Result<Option<ControlReply>, SubmitError> {
+        self.request_inner(request, deadline, Some(generation))
+    }
+
+    fn request_inner(
+        &self,
+        request: ControlRequest,
+        deadline: Duration,
+        desired: Option<u64>,
+    ) -> Result<Option<ControlReply>, SubmitError> {
         if self.inner.stop_requested.load(Ordering::Acquire) {
             return Err(SubmitError::Stopped);
         }
@@ -1253,12 +1699,87 @@ impl ControlHandle {
                 return Ok(None);
             }
         }
+        if self
+            .inner
+            .queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.inner.capacity).then_some(n + 1)
+            })
+            .is_err()
+        {
+            if let Some(id) = &op_id {
+                self.inner
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(id);
+            }
+            return Err(SubmitError::Overloaded);
+        }
+        let remembered = op_id.as_ref().is_some_and(|id| {
+            self.inner
+                .memory
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(id)
+                .is_some()
+        });
+        let generation = if !remembered
+            && matches!(
+                &request,
+                ControlRequest::Op {
+                    op: ControlOp::SelectPower(_)
+                        | ControlOp::ConfigurePower { .. }
+                        | ControlOp::SetThermalMode(_)
+                        | ControlOp::ApplyManualBoost { .. }
+                        | ControlOp::ConfigureCurve(_)
+                        | ControlOp::ToggleGMode,
+                    ..
+                }
+            ) {
+            {
+                let token = desired.unwrap_or_else(|| self.reserve_desired());
+                let previous = self.inner.generation.fetch_max(token, Ordering::AcqRel);
+                if previous > token {
+                    self.inner.queued.fetch_sub(1, Ordering::AcqRel);
+                    if let Some(id) = &op_id {
+                        self.inner
+                            .pending
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .remove(id);
+                    }
+                    let (view, _) = self.published().ok_or(SubmitError::Stopped)?;
+                    return Ok(Some(ControlReply {
+                        raw_output: None,
+                        view: (*view).clone(),
+                        result: Err(ControlRejection {
+                            code: "superseded",
+                            message: "a newer authorized selection superseded this request".into(),
+                        }),
+                    }));
+                }
+                Some(token)
+            }
+        } else {
+            None
+        };
         match self.inner.tx.try_send(Envelope {
+            generation,
             request,
             reply: reply_tx,
         }) {
             Ok(()) => {}
             Err(e) => {
+                self.inner.queued.fetch_sub(1, Ordering::AcqRel);
+                if let Some(g) = generation {
+                    let _ = self.inner.generation.compare_exchange(
+                        g,
+                        g - 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
                 if let Some(id) = &op_id {
                     self.inner
                         .pending
@@ -1315,6 +1836,7 @@ impl ControlHandle {
         // Wake an idle worker. If the queue is full, its next iteration sees stop_requested
         // before executing any more queued operations.
         let _ = self.inner.tx.try_send(Envelope {
+            generation: None,
             request: ControlRequest::Shutdown,
             reply,
         });
@@ -1359,6 +1881,11 @@ fn publish(inner: &HandleInner, view: &ThermalView) {
 /// Serve one envelope; returns `true` when the worker should stop.
 fn serve(core: &mut ControlCore, inner: &HandleInner, env: Envelope) -> bool {
     let before = core.view_revision;
+    core.desired_generation = Some((
+        Arc::clone(&inner.generation),
+        env.generation
+            .unwrap_or_else(|| inner.generation.load(Ordering::Acquire)),
+    ));
     let (reply, stop) = match env.request {
         ControlRequest::Refresh => {
             let view = core.refresh();
@@ -1391,7 +1918,20 @@ fn serve(core: &mut ControlCore, inner: &HandleInner, env: Envelope) -> bool {
                 },
                 None => {
                     let reply = match request {
-                        ControlRequest::Op { op, .. } => core.handle(op),
+                        ControlRequest::Op { op, .. } => {
+                            if core
+                                .desired_generation
+                                .as_ref()
+                                .is_some_and(|(latest, g)| latest.load(Ordering::Acquire) != *g)
+                            {
+                                core.reject(
+                                    "superseded",
+                                    "a newer selection superseded this request".into(),
+                                )
+                            } else {
+                                core.handle(op)
+                            }
+                        }
                         ControlRequest::RawAcpi { request, .. } => core.raw_acpi(&request),
                         _ => unreachable!("only operations reach replay handling"),
                     };
@@ -1646,6 +2186,193 @@ mod tests {
             cpu_points: pts([(45, 0), (60, 35), (75, 70), (85, 100)]),
             gpu_points: pts([(45, 0), (60, 35), (75, 70), (85, 100)]),
         }
+    }
+
+    #[test]
+    fn delayed_authorization_cannot_overwrite_a_newer_socket_selection() {
+        let mut r = rig();
+        r.core.handle(ControlOp::EnablePower);
+        let h = ControlHandle::spawn(r.core).unwrap();
+        let old = h.reserve_desired();
+        let reply = h
+            .request(
+                ControlRequest::Op {
+                    id: "newer".into(),
+                    op: ControlOp::SelectPower(awcc_core::PowerProfile::PowerSaver),
+                },
+                Duration::from_secs(3),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(reply.result.is_ok());
+        let reply = h
+            .request_desired(
+                ControlRequest::Op {
+                    id: "older-authorized-late".into(),
+                    op: ControlOp::SelectPower(awcc_core::PowerProfile::Performance),
+                },
+                Duration::from_secs(3),
+                old,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.result.unwrap_err().code, "superseded");
+        assert_eq!(
+            h.published().unwrap().0.control.power.active,
+            Some(awcc_core::PowerProfile::PowerSaver)
+        );
+        let _ = h.stop(Duration::from_secs(3));
+    }
+
+    #[test]
+    fn superseded_cpu_work_does_not_apply_thermal_policy_or_save_new_intent() {
+        use awcc_platform::cpu_policy::{CpuPolicyBackend, CpuPolicyOutcome};
+        struct SupersedingCpu(Arc<AtomicU64>);
+        impl CpuPolicyBackend for SupersedingCpu {
+            fn available(&self, _: awcc_core::PowerProfile) -> bool {
+                true
+            }
+            fn apply(
+                &mut self,
+                _: awcc_core::PowerProfile,
+                _: &dyn Fn() -> bool,
+            ) -> CpuPolicyOutcome {
+                self.0.store(2, Ordering::Release);
+                CpuPolicyOutcome {
+                    confirmed: true,
+                    controls: vec!["earlier CPU phase completed".into()],
+                    errors: vec![],
+                }
+            }
+        }
+        let mut r = rig();
+        r.core.handle(ControlOp::EnablePower);
+        let latest = Arc::new(AtomicU64::new(1));
+        r.core.desired_generation = Some((latest.clone(), 1));
+        r.core.set_cpu_backend(Box::new(SupersedingCpu(latest)));
+        let before = r.core.refresh().audit.len();
+        let saved = r.core.settings.power.clone();
+        let reply = r.core.handle(ControlOp::SetThermalMode(ThermalMode::Cool));
+        assert_eq!(reply.result.unwrap_err().code, "superseded");
+        assert_eq!(r.core.refresh().audit.len(), before);
+        assert_eq!(r.core.settings.power, saved);
+    }
+
+    #[test]
+    fn missing_cpu_controls_never_publish_success_and_explicit_turbo_survives_profiles() {
+        let mut r = rig();
+        r.core.handle(ControlOp::EnablePower);
+        r.core.handle(ControlOp::SetCpuTurbo(false));
+        r.core.handle(ControlOp::SetThermalMode(ThermalMode::Cool));
+        assert_eq!(r.core.settings.power.turbo_override, Some(false));
+        assert!(matches!(
+            r.core.refresh().cpu_turbo,
+            WireObservation::Observed { value: false }
+        ));
+        let saved = r.core.settings.power.clone();
+        r.core
+            .set_cpu_backend(Box::new(awcc_platform::cpu_policy::LinuxCpuPolicy::new(
+                "/nonexistent/awcc-test-cpufreq",
+            )));
+        let reply = r
+            .core
+            .handle(ControlOp::SelectPower(awcc_core::PowerProfile::Performance));
+        assert!(reply.result.is_err());
+        assert!(!reply.view.control.power.cpu.confirmed);
+        assert_eq!(r.core.settings.power, saved);
+    }
+
+    #[test]
+    fn system_profiles_remember_counterparts_and_temporary_holds_never_change_them() {
+        use awcc_core::PowerProfile as P;
+        let sink = Arc::new(RecordingSink::default());
+        let mut r = rig_with(|_, _| SettingsLoad::Missing, sink.clone());
+        r.core.handle(ControlOp::EnablePower);
+        r.core.handle(ControlOp::SetThermalMode(ThermalMode::Cool));
+        assert_eq!(r.core.settings.power.selected, Some(P::PowerSaver));
+        let saved = r.core.settings.power.clone();
+        let hold = crate::power::ProfileHold {
+            cookie: 1,
+            owner: ":1.test".into(),
+            profile: P::Performance,
+            reason: "test".into(),
+            application_id: "test".into(),
+        };
+        let saves = sink.saved.lock().unwrap().len();
+        r.core.handle(ControlOp::HoldPower(hold));
+        assert_eq!(r.core.refresh().control.power.active, Some(P::Performance));
+        assert_eq!(r.core.settings.power, saved);
+        assert_eq!(sink.saved.lock().unwrap().len(), saves);
+        r.core.handle(ControlOp::DisconnectPower(":1.test".into()));
+        assert_eq!(
+            r.core.refresh().thermal_mode_state,
+            ThermalModeState::Known(ThermalMode::Cool)
+        );
+        assert_eq!(r.core.settings.power, saved);
+        r.core.handle(ControlOp::SetThermalMode(ThermalMode::Quiet));
+        assert_eq!(
+            r.core.refresh().thermal_mode_state,
+            ThermalModeState::Known(ThermalMode::Quiet)
+        );
+    }
+
+    #[test]
+    fn mapped_gmode_never_toggles_an_unreadable_latch() {
+        let mut r = rig();
+        r.core.handle(ControlOp::EnablePower);
+        r.core.orchestrator_mut().set_sim_faults(SimFaults {
+            game_shift_query_unavailable: true,
+            ..Default::default()
+        });
+        let writes = r.core.refresh().audit.len();
+        let reply = r.core.handle(ControlOp::SetThermalMode(ThermalMode::GMode));
+        assert!(reply.result.unwrap().is_error_or_rollback());
+        assert_eq!(r.core.refresh().audit.len(), writes);
+    }
+
+    #[test]
+    fn mapped_gmode_is_idempotent_and_restart_resume_reapply_the_saved_policy() {
+        use awcc_core::PowerProfile as P;
+        let mut r = rig();
+        r.core.handle(ControlOp::EnablePower);
+        r.core.handle(ControlOp::SetThermalMode(ThermalMode::GMode));
+        let writes = r.core.refresh().audit.len();
+        r.core.handle(ControlOp::SelectPower(P::Performance));
+        assert_eq!(r.core.refresh().audit.len(), writes);
+        let saved = r.core.settings.clone();
+        let mut restarted = rig_with(
+            |_, _| SettingsLoad::Loaded(saved),
+            Arc::new(NullSettingsSink),
+        );
+        restarted.core.handle(ControlOp::EnablePower);
+        assert_eq!(
+            restarted.core.refresh().thermal_mode_state,
+            ThermalModeState::Known(ThermalMode::GMode)
+        );
+        restarted.core.note_resume();
+        assert_eq!(
+            restarted.core.refresh().thermal_mode_state,
+            ThermalModeState::Known(ThermalMode::GMode)
+        );
+    }
+
+    #[test]
+    fn partial_thermal_failure_does_not_publish_or_save_a_new_active_profile() {
+        let mut r = rig();
+        r.core.handle(ControlOp::EnablePower);
+        let saved = r.core.settings.power.clone();
+        r.core
+            .orchestrator_mut()
+            .set_sim_scenario(SimScenario::AcpiSetFailureRollback);
+        r.core.handle(ControlOp::SetThermalMode(ThermalMode::Cool));
+        let view = r.core.refresh();
+        assert_eq!(
+            view.control.power.active,
+            Some(awcc_core::PowerProfile::Balanced)
+        );
+        assert!(view.control.power.cpu.confirmed);
+        assert!(view.control.power.problem.is_some());
+        assert_eq!(r.core.settings.power, saved);
     }
 
     #[test]

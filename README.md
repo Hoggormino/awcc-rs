@@ -128,21 +128,15 @@ saved service settings**, equivalent to `--uninstall-service --purge`. See the
 [installation guide](packaging/linux/INSTALL.txt) for cleanup details and kernel
 driver prerequisites.
 
-### Saved thermal preset
+### System power profiles
 
-Selecting a firmware preset such as Cool or Quiet saves the accepted choice in
-the background service. The service restores it when it starts, before the GUI
-opens. Failed requests preserve the previous choice. Manual fan control and
-G-Mode are transient and clear automatic preset restoration; custom fan curves
-have their own startup preference and take precedence when enabled.
+AWCC's background service provides the standard system PowerProfiles interface
+for KDE/GNOME, with independently saved thermal counterparts for Power Save,
+Balanced and Performance. The Settings pane configures these associations; manual
+fan settings and curves remain available. CPU policy and firmware outcomes are
+reported separately. See [system power profiles](docs/power_profiles.md) for
+CPU/turbo ownership, authorization, compatibility and provider handover/recovery.
 
-A fresh installation makes no preset change until you select one. After upgrading
-from a version that did not save presets, select your preferred preset once.
-Settings save failures appear in the GUI's service details.
-
-Desktop power managers can also select firmware profiles and overwrite AWCC's
-restored choice at login or when power sources change. Configure one owner of
-firmware thermal profiles; see [power management integration](packaging/linux/INSTALL.txt).
 
 For development builds, the Actions run has a separately named **`.AppImage`**
 artifact and a complete **`awcc-rs-dist-…`** bundle. Use the download links in the

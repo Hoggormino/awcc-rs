@@ -1365,6 +1365,57 @@ pub fn run_with_log_dir(
 fn main() -> std::process::ExitCode {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
+    if raw_args.first().is_some_and(|s| s == "--powerprofilesctl") {
+        return match awcc_service::power_bus::run_cli(&raw_args[1..]) {
+            Ok(code) => std::process::ExitCode::from(code),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    if raw_args.first().is_some_and(|s| s == "--provider-health") {
+        return match awcc_service::provider_install::health() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    if raw_args.first().is_some_and(|s| s == "--provider-handover") {
+        if !awcc_service::provider_install::is_root() {
+            eprintln!("provider handover requires root");
+            return std::process::ExitCode::FAILURE;
+        }
+        let paths = awcc_service::installer::InstallPaths::system();
+        let runner = awcc_service::installer::SystemRunner::default();
+        let result = match raw_args.get(1).map(String::as_str) {
+            Some("install") => {
+                std::env::current_exe()
+                    .map_err(|e| e.to_string())
+                    .and_then(|path| {
+                        let executable = if path.starts_with("/opt/awcc-rs/service/") {
+                            "/opt/awcc-rs/service/current/bin/awcc-cli".to_string()
+                        } else {
+                            path.to_str()
+                                .ok_or("service executable path is not UTF-8")?
+                                .to_string()
+                        };
+                        awcc_service::provider_install::install(&paths, &runner, &executable)
+                    })
+            }
+            Some("remove") => awcc_service::provider_install::remove(&paths, &runner),
+            _ => Err("expected install or remove".into()),
+        };
+        return match result {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     // Only initialize global file/tracing diagnostics and panic hook when not running a pure
     // fast-path (`--help`, `--version`) or passive `diagnostics` export.
     if let Ok(inv) = parse_cli_invocation(&raw_args)

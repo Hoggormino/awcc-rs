@@ -2,10 +2,13 @@
 Description=AWCC privileged hardware service
 Documentation=https://github.com/Hoggormino/awcc-rs
 # acpi_call is loaded by systemd-modules-load when configured; order after it and after /var.
-After=local-fs.target systemd-modules-load.service
+Requires=dbus.service
+After=local-fs.target systemd-modules-load.service dbus.service
 
 [Service]
-Type=simple
+Type=dbus
+BusName=org.freedesktop.UPower.PowerProfiles
+ExecStartPre=+/usr/bin/awcc-cli --provider-handover install
 ExecStart=/usr/bin/awcc-cli -d
 Environment=XDG_STATE_HOME=/var/lib/awcc
 Restart=on-failure

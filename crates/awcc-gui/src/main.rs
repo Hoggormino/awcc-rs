@@ -1136,10 +1136,63 @@ fn sync_service_control_to_ui(ui: &MainWindow, snap: &SystemSnapshot) {
         return;
     }
     ui.set_service_restore_available(
-        snap.service_control.is_some() && snap.service_error.is_none(),
+        snap.service_control
+            .as_ref()
+            .is_some_and(|c| c.power.available.is_empty())
+            && snap.service_error.is_none(),
     );
     if let Some(control) = &snap.service_control {
         ui.set_service_restore_at_startup(control.restore_at_startup);
+        let power = &control.power;
+        if power.available.is_empty() {
+            ui.set_power_summary("".into());
+        } else {
+            ui.set_power_summary(
+                format!(
+                    "Selected: {} · Active: {} · CPU: {} · Thermal: {}{}",
+                    power.selected.map_or("default", |p| p.as_str()),
+                    power.active.map_or("unavailable", |p| p.as_str()),
+                    if power.cpu.confirmed {
+                        "confirmed"
+                    } else {
+                        "unconfirmed"
+                    },
+                    power
+                        .thermal
+                        .as_ref()
+                        .map_or_else(|| "unavailable".into(), |l| l.detail_message()),
+                    power
+                        .problem
+                        .as_ref()
+                        .map_or(String::new(), |p| format!(" · {p}"))
+                )
+                .into(),
+            );
+            if snap.service_error.is_some() {
+                ui.set_power_summary(
+                    format!(
+                        "Last known power state (service unavailable): {}",
+                        ui.get_power_summary()
+                    )
+                    .into(),
+                );
+            }
+            for (profile, policy) in &power.counterparts {
+                let name = match policy {
+                    awcc_core::ThermalPolicy::Preset { mode } => mode.display_name(),
+                    _ => "Manual",
+                };
+                match profile {
+                    awcc_core::PowerProfile::PowerSaver => {
+                        ui.set_power_saver_counterpart(name.into())
+                    }
+                    awcc_core::PowerProfile::Balanced => ui.set_balanced_counterpart(name.into()),
+                    awcc_core::PowerProfile::Performance => {
+                        ui.set_performance_counterpart(name.into())
+                    }
+                }
+            }
+        }
         let state = match control.state {
             ControlState::Idle => "No custom fan curve is running.",
             ControlState::Active => "The service is applying the custom fan curve.",
@@ -1782,6 +1835,40 @@ fn wire_ui_callbacks(
 
     {
         let submit_cmd = Rc::clone(&submit_cmd);
+        ui.on_configure_power({
+            let weak = ui.as_weak();
+            let submit_cmd = submit_cmd.clone();
+            move |profile, mode| {
+                let Some(w) = weak.upgrade() else {
+                    return;
+                };
+                if w.get_is_simulated() || w.get_service_busy() {
+                    return;
+                }
+                let Ok(profile) = awcc_core::PowerProfile::parse(profile.as_str()) else {
+                    return;
+                };
+                let mode = match mode.as_str() {
+                    "Quiet" => ThermalMode::Quiet,
+                    "Cool" => ThermalMode::Cool,
+                    "Balanced" => ThermalMode::Balanced,
+                    "Performance" => ThermalMode::Performance,
+                    "Full Speed" => ThermalMode::FullSpeed,
+                    "G-Mode" => ThermalMode::GMode,
+                    _ => ThermalMode::Manual,
+                };
+                let policy = if mode == ThermalMode::Manual {
+                    awcc_core::ThermalPolicy::Manual {
+                        cpu_boost_pct: 30,
+                        gpu_boost_pct: 30,
+                        curve: None,
+                    }
+                } else {
+                    awcc_core::ThermalPolicy::Preset { mode }
+                };
+                submit_cmd(ServiceCommand::ConfigurePower { profile, policy });
+            }
+        });
         ui.on_select_thermal_mode(move |mode_str| {
             if let Some(mode) = parse_mode_key(mode_str.as_str()) {
                 submit_cmd(ServiceCommand::SetThermalMode(mode));
@@ -2412,6 +2499,8 @@ fn render_headless_screenshot(
             let s = orch.query_snapshot();
             sync_snapshot_to_ui(&ui, &s, true);
             ui.set_active_nav_index(3);
+            ui.set_power_summary("Selected: balanced · Active: balanced · CPU: confirmed · Thermal: Balanced confirmed".into());
+            ui.set_power_saver_counterpart("Cool".into());
             s
         }
         _ => {
@@ -3098,6 +3187,7 @@ mod tests {
                         device_name: "Test device".into(),
                         acpi_prefix: "TEST".into(),
                         control_running: true,
+                        power_provider_ready: true,
                     },
                     capabilities: Vec::new(),
                 }
@@ -3519,6 +3609,56 @@ mod tests {
     }
 
     #[test]
+    fn observed_power_counterparts_do_not_submit_profile_changes() {
+        let (service, release) = gated_service(2);
+        let (ui, ops, _timer) = wired_ui(&service);
+        let mut snap = healthy_snapshot();
+        snap.is_simulated = false;
+        snap.service_control = Some(awcc_service::wire::ControlStatus {
+            power: awcc_service::power::PowerStatus {
+                active: Some(awcc_core::PowerProfile::Balanced),
+                available: awcc_core::PowerProfile::ALL.to_vec(),
+                counterparts: awcc_service::power::PowerSettings::default().counterparts,
+                ..Default::default()
+            },
+            state: ControlState::Idle,
+            saved_curve: FanCurveConfig::default(),
+            intent_active: false,
+            restore_at_startup: false,
+            last_evaluation_age_secs: None,
+            last_outcome: None,
+            failure_reason: None,
+            tick_interval_ms: 2000,
+            uptime_secs: 0,
+            cpu_sensor_fresh: true,
+            settings_problem: None,
+            settings_save_pending: false,
+            settings_save_error: None,
+        });
+        sync_snapshot_to_ui(&ui, &snap, false);
+        snap.service_control
+            .as_mut()
+            .unwrap()
+            .power
+            .counterparts
+            .insert(
+                awcc_core::PowerProfile::PowerSaver,
+                awcc_core::ThermalPolicy::Preset {
+                    mode: ThermalMode::Cool,
+                },
+            );
+        sync_snapshot_to_ui(&ui, &snap, false);
+        slint::platform::update_timers_and_animations();
+        assert_eq!(ui.get_power_saver_counterpart(), "Cool");
+        assert_eq!(service.borrow().current_snapshot().command_seq, 0);
+        assert!(ops.borrow().pending.is_none());
+        snap.service_error = Some("disconnected".into());
+        sync_snapshot_to_ui(&ui, &snap, false);
+        assert!(ui.get_power_summary().contains("Last known"));
+        release.send(()).unwrap();
+    }
+
+    #[test]
     fn restore_preference_waits_for_confirmation_and_surfaces_settings_save_failures() {
         let (service, release) = gated_service(1);
         let (ui, ops, _timer) = wired_ui(&service);
@@ -3539,6 +3679,7 @@ mod tests {
         let mut confirmed = healthy_snapshot();
         confirmed.is_simulated = false;
         confirmed.service_control = Some(awcc_service::wire::ControlStatus {
+            power: Default::default(),
             state: ControlState::Idle,
             saved_curve: FanCurveConfig::default(),
             intent_active: false,

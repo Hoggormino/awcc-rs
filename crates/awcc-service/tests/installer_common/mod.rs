@@ -172,6 +172,11 @@ impl HostRunner for FakeHost {
             return Err(HostError::ToolNotFound(command.tool));
         }
         match command.tool {
+            HostTool::Busctl => Ok(HostOutput {
+                code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
             HostTool::Systemctl => {
                 let verb = args.get(2).map_or("", String::as_str).to_owned();
                 if state.failing_verbs.contains(&verb) {

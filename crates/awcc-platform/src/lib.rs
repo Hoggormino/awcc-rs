@@ -818,10 +818,14 @@ impl ThermalTransport for LinuxAcpiTransport {
     }
 
     fn set_game_shift_status(&mut self, enabled: bool) -> Result<(), TransportError> {
-        if let Ok(active) = self.query_game_shift_status()
-            && active == enabled
-        {
-            return Ok(());
+        match self.query_game_shift_status() {
+            Ok(active) if active == enabled => return Ok(()),
+            Ok(_) => {}
+            Err(error) => {
+                return Err(TransportError::TransportUnavailable(format!(
+                    "cannot ensure GameShift state without a valid latch reading: {error}"
+                )));
+            }
         }
         // WMAX `0x25 0x01` toggles the GameShift latch.
         // On some Alienware WMAX firmware (including m15 R6), `0x25 0x01` returns `0x1` even when

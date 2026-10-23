@@ -204,6 +204,24 @@ mod tests {
         }
     }
     #[test]
+    fn ignored_epp_write_is_a_partial_failure_not_confirmation() {
+        let root = fixture(
+            "ignored-epp",
+            "amd-pstate-epp",
+            "powersave performance",
+            Some("power balance_power balance_performance performance"),
+        );
+        let epp = root.join("policy0/energy_performance_preference");
+        fs::remove_file(&epp).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &epp).unwrap();
+        let outcome = LinuxCpuPolicy::new(&root).apply(PowerProfile::Performance, &|| true);
+        assert!(!outcome.confirmed);
+        assert!(outcome.errors[0].contains("requested performance"));
+        assert!(!outcome.controls.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn passive_and_generic_fallbacks_and_missing_controls() {
         for driver in ["intel_cpufreq", "amd-pstate", "acpi-cpufreq"] {
             let root = fixture(driver, driver, "powersave schedutil performance", None);
