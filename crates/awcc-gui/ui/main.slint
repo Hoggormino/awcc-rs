@@ -483,21 +483,9 @@ export component MainWindow inherits MaterialWindow {
                                 }
                             }
 
-                            // G-Mode Quick Action (explicitly sized Switch + TonalButton)
+                            // One explicit action; the profile badge above shows observed state.
                             HorizontalLayout {
-                                spacing: 8px;
                                 alignment: end;
-
-                                Switch {
-                                    width: 52px;
-                                    height: 32px;
-                                    y: floor((parent.height - self.height) / 2 / 1px) * 1px;
-                                    checked <=> root.gmode-active;
-                                    tooltip: "Toggle G-Mode (GameShift)";
-                                    checked_state_changed(_) => {
-                                        root.request-toggle-gmode();
-                                    }
-                                }
 
                                 TonalButton {
                                     height: 36px;
