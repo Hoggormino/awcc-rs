@@ -113,18 +113,22 @@ All formats use the same root-side provider handover journal in
 `/var/lib/awcc/provider-handover.json`. Known competing providers/CPU writers are
 inspected before takeover. Administrator unit overrides cause an explicit refusal.
 Previously unmasked competing units are masked/stopped; masks persist across
-reboot and block their D-Bus activation. The original executable and enablement
-are retained for AppImage/manual handover. Native packages ship vendor activation
-files; setup adds higher-priority `/usr/local/share/dbus-1/system-services`
+reboot and block their D-Bus activation. A known provider whose package unit file
+has been removed is still stopped if systemd reports it running or transitioning.
+The original executable and enablement are retained for AppImage/manual handover.
+Native packages ship vendor activation files; setup adds higher-priority
+`/usr/local/share/dbus-1/system-services`
 registration pointing to `awccd.service`, plus bus/polkit policy as necessary.
 The unit's pre-start check also covers deferred/offline package installations.
 
 The journal is written before mutations. Failed handover attempts restore recorded
 changes. Installation health failure stops the new daemon before provider recovery.
 Removal restores only recorded masks and starts only providers that were running
-before handover, when the recorded state is still applicable. Hash checks preserve
-changed registration files and require administrator review instead of overwriting
-them. An interrupted journal is recovered on the next setup attempt. Administrators
+before handover, when the recorded state is still applicable and the provider's
+unit file is still installed. Removing a mask does not reinstall a removed package.
+Hash checks preserve changed registration files and require administrator review
+instead of overwriting them. An interrupted journal is recovered on the next setup
+attempt. Administrators
 can retry `awcc-cli --provider-handover install` or `remove` as root after resolving
 reported conflicts. Never delete the journal to bypass recovery checks.
 

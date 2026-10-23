@@ -165,7 +165,19 @@ pub fn install(
                 "--property=LoadState,ActiveState,UnitFileState,DropInPaths",
             ],
         )?;
-        if props.lines().any(|p| p == "LoadState=not-found") {
+        // Package removal can delete the unit file while its process keeps running.
+        // LoadState describes the file, independently of the unit's runtime state.
+        let needs_stop = props.lines().any(|p| {
+            matches!(
+                p,
+                "ActiveState=active"
+                    | "ActiveState=activating"
+                    | "ActiveState=reloading"
+                    | "ActiveState=refreshing"
+                    | "ActiveState=deactivating"
+            )
+        });
+        if props.lines().any(|p| p == "LoadState=not-found") && !needs_stop {
             continue;
         }
         if props.lines().any(|p| p == "UnitFileState=masked-runtime") {
@@ -191,7 +203,15 @@ pub fn install(
         }
         record.units.push(Unit {
             name: unit.to_string(),
-            active: props.lines().any(|p| p == "ActiveState=active"),
+            active: props.lines().any(|p| {
+                matches!(
+                    p,
+                    "ActiveState=active"
+                        | "ActiveState=activating"
+                        | "ActiveState=reloading"
+                        | "ActiveState=refreshing"
+                )
+            }),
             enabled: props.lines().any(|p| p == "UnitFileState=enabled"),
         });
     }
@@ -276,7 +296,16 @@ pub fn remove(paths: &InstallPaths, runner: &dyn HostRunner) -> Result<(), Strin
             if paths.systemd_runtime_dir().is_dir() {
                 command(runner, HostTool::Systemctl, &["unmask", &unit.name])?;
                 if unit.active {
-                    command(runner, HostTool::Systemctl, &["start", &unit.name])?;
+                    let props = command(
+                        runner,
+                        HostTool::Systemctl,
+                        &["show", &unit.name, "--property=LoadState"],
+                    )?;
+                    // A package transaction may have removed the old executable/unit.
+                    // Remove our mask without trying to restart a missing provider.
+                    if !props.lines().any(|p| p == "LoadState=not-found") {
+                        command(runner, HostTool::Systemctl, &["start", &unit.name])?;
+                    }
                 }
             } else {
                 fs::remove_file(mask).map_err(|e| e.to_string())?;
@@ -333,6 +362,8 @@ mod tests {
         root: std::path::PathBuf,
         calls: Mutex<Vec<Vec<String>>>,
         fail_reload: AtomicBool,
+        provider_load_state: &'static str,
+        provider_active_state: &'static str,
     }
     use std::sync::atomic::{AtomicBool, Ordering};
     impl HostRunner for Fake {
@@ -351,11 +382,36 @@ mod tests {
             let mut code = 0;
             if c.tool == HostTool::Systemctl {
                 match args[0].as_str() {
-     "show" if args[1]=="power-profiles-daemon.service" => output="LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nDropInPaths=\n".into(),
-     "show" => output="LoadState=not-found\n".into(),
-     "mask" => {let p=self.root.join("etc/systemd/system/power-profiles-daemon.service");fs::create_dir_all(p.parent().unwrap()).unwrap(); std::os::unix::fs::symlink("/dev/null",p).unwrap();},
-     "unmask" => {fs::remove_file(self.root.join("etc/systemd/system/power-profiles-daemon.service")).unwrap();}, _=>{}
-    }
+                    "show" if args[1] == "power-profiles-daemon.service" => {
+                        output = format!(
+                            "LoadState={}\nActiveState={}\nUnitFileState={}\nDropInPaths=\n",
+                            self.provider_load_state,
+                            self.provider_active_state,
+                            if self.provider_load_state == "loaded" {
+                                "enabled"
+                            } else {
+                                ""
+                            }
+                        )
+                    }
+                    "show" => output = "LoadState=not-found\n".into(),
+                    "mask" => {
+                        let p = self
+                            .root
+                            .join("etc/systemd/system/power-profiles-daemon.service");
+                        fs::create_dir_all(p.parent().unwrap()).unwrap();
+                        std::os::unix::fs::symlink("/dev/null", p).unwrap();
+                    }
+                    "unmask" => {
+                        fs::remove_file(
+                            self.root
+                                .join("etc/systemd/system/power-profiles-daemon.service"),
+                        )
+                        .unwrap();
+                    }
+                    "start" if self.provider_load_state == "not-found" => code = 1,
+                    _ => {}
+                }
             } else if self.fail_reload.swap(false, Ordering::SeqCst) {
                 code = 1;
             }
@@ -379,6 +435,8 @@ mod tests {
                 root,
                 calls: Mutex::new(vec![]),
                 fail_reload: AtomicBool::new(false),
+                provider_load_state: "loaded",
+                provider_active_state: "active",
             },
         )
     }
@@ -399,6 +457,92 @@ mod tests {
                 .any(|c| c == &["start", "power-profiles-daemon.service"])
         );
         assert!(!paths.join("/usr/local/share/dbus-1/system-services/org.freedesktop.UPower.PowerProfiles.service").exists());
+    }
+    #[test]
+    fn removed_but_running_provider_is_stopped_and_not_restarted_on_removal() {
+        for active_state in [
+            "active",
+            "activating",
+            "reloading",
+            "refreshing",
+            "deactivating",
+        ] {
+            let (paths, mut fake) = fixture(&format!("removed-{active_state}"));
+            fake.provider_load_state = "not-found";
+            fake.provider_active_state = active_state;
+            install(&paths, &fake, "/usr/bin/awcc-cli").unwrap();
+            let record = load(&paths).unwrap().unwrap();
+            assert!(record.ready);
+            assert_eq!(record.units.len(), 1);
+            assert_eq!(record.units[0].name, "power-profiles-daemon.service");
+            assert_eq!(record.units[0].active, active_state != "deactivating");
+            assert!(
+                fake.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| { c == &["mask", "--now", "power-profiles-daemon.service"] })
+            );
+            remove(&paths, &fake).unwrap();
+            assert!(!paths.join(RECORD).exists());
+            assert!(
+                fs::symlink_metadata(
+                    paths.join("/etc/systemd/system/power-profiles-daemon.service")
+                )
+                .is_err()
+            );
+            assert!(
+                !fake
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| { c == &["start", "power-profiles-daemon.service"] })
+            );
+        }
+    }
+    #[test]
+    fn failed_handover_with_removed_provider_cleans_up_without_restart() {
+        let (paths, mut fake) = fixture("removed-rollback");
+        fake.provider_load_state = "not-found";
+        fake.fail_reload.store(true, Ordering::SeqCst);
+        let error = install(&paths, &fake, "/usr/bin/awcc-cli").unwrap_err();
+        assert!(error.contains("recovery: Ok(())"), "{error}");
+        assert!(!paths.join(RECORD).exists());
+        assert!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| { c == &["unmask", "power-profiles-daemon.service"] })
+        );
+        assert!(
+            !fake
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| { c == &["start", "power-profiles-daemon.service"] })
+        );
+    }
+    #[test]
+    fn absent_inactive_provider_is_not_masked_or_restarted() {
+        for active_state in ["inactive", "failed"] {
+            let (paths, mut fake) = fixture(&format!("absent-{active_state}"));
+            fake.provider_load_state = "not-found";
+            fake.provider_active_state = active_state;
+            install(&paths, &fake, "/usr/bin/awcc-cli").unwrap();
+            assert!(load(&paths).unwrap().unwrap().units.is_empty());
+            remove(&paths, &fake).unwrap();
+            assert!(
+                !fake
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| { matches!(c[0].as_str(), "mask" | "unmask" | "start") })
+            );
+        }
     }
     #[test]
     fn failed_handover_recovers_and_administrator_edits_are_preserved() {
