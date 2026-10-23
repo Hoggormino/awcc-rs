@@ -812,7 +812,9 @@ export component MainWindow inherits MaterialWindow {
 
                     // Left Column: Staged Manual Fan Boost Override Card
                     OutlinedCard {
-                        horizontal-stretch: 1;
+                        min-width: 330px;
+                        preferred-width: 330px;
+                        horizontal-stretch: 2;
 
                         VerticalLayout {
                             alignment: space-between;
@@ -852,7 +854,7 @@ export component MainWindow inherits MaterialWindow {
                                 text: "Adjust sliders to stage fan speed; click Apply Boost to activate Manual mode.";
                                 style: MaterialTypography.body_small;
                                 color: MaterialPalette.on_surface_variant;
-                                overflow: elide;
+                                wrap: word-wrap;
                             }
 
                             VerticalLayout {
@@ -941,7 +943,9 @@ export component MainWindow inherits MaterialWindow {
 
                     // Right Column: Custom 4-Point Temperature-to-Fan-Boost Curve Editor
                     OutlinedCard {
-                        horizontal-stretch: 1;
+                        min-width: 360px;
+                        preferred-width: 495px;
+                        horizontal-stretch: 3;
 
                         VerticalLayout {
                             alignment: space-between;
