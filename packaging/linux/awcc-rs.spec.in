@@ -86,6 +86,7 @@ install -m 0644 "%{staged_root}/share/icons/hicolor/256x256/apps/awcc-gui.png" "
 install -m 0644 "%{staged_root}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "%{buildroot}%{_datadir}/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"
 install -m 0644 "%{staged_root}/share/licenses/awcc-rs/LICENSE" "%{buildroot}%{_licensedir}/%{name}/LICENSE"
 install -m 0644 "%{staged_root}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "%{buildroot}%{_licensedir}/%{name}/THIRD_PARTY_NOTICES.md"
+install -Dm0644 "%{staged_root}/share/doc/awcc-rs/docs/power_profiles.md" "%{buildroot}%{_docdir}/%{name}/docs/power_profiles.md"
 install -m 0644 "%{staged_root}/share/doc/awcc-rs/README.md" "%{buildroot}%{_docdir}/%{name}/README.md"
 install -m 0644 "%{staged_root}/share/doc/awcc-rs/INSTALL.txt" "%{buildroot}%{_docdir}/%{name}/INSTALL.txt"
 
@@ -118,6 +119,7 @@ install -m 0644 "%{staged_root}/share/doc/awcc-rs/INSTALL.txt" "%{buildroot}%{_d
 %license %{_licensedir}/%{name}/THIRD_PARTY_NOTICES.md
 %doc %{_docdir}/%{name}/README.md
 %doc %{_docdir}/%{name}/INSTALL.txt
+%doc %{_docdir}/%{name}/docs
 
 %changelog
 * Mon Oct 19 2026 AWCC Linux Contributors <noreply@github.com> - @VERSION@-@RELEASE@

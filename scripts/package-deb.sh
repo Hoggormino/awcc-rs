@@ -83,6 +83,7 @@ install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/LICENSE" "${PKG_ROOT}/usr/
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "${PKG_ROOT}/usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md"
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/LICENSE" "${PKG_ROOT}/usr/share/doc/awcc-rs/copyright"
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "${PKG_ROOT}/usr/share/doc/awcc-rs/THIRD_PARTY_NOTICES.md"
+install -Dm0644 "${STAGED_DIR}/share/doc/awcc-rs/docs/power_profiles.md" "${PKG_ROOT}/usr/share/doc/awcc-rs/docs/power_profiles.md"
 install -m 0644 "${STAGED_DIR}/share/doc/awcc-rs/README.md" "${PKG_ROOT}/usr/share/doc/awcc-rs/README.md"
 install -m 0644 "${STAGED_DIR}/share/doc/awcc-rs/INSTALL.txt" "${PKG_ROOT}/usr/share/doc/awcc-rs/INSTALL.txt"
 

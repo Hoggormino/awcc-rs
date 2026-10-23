@@ -110,6 +110,7 @@ install -m 0644 "${STAGED_DIR}/share/icons/hicolor/256x256/apps/awcc-gui.png" "$
 install -m 0644 "${STAGED_DIR}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "${APPDIR}/usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/LICENSE" "${APPDIR}/usr/share/licenses/awcc-rs/LICENSE"
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "${APPDIR}/usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md"
+install -Dm0644 "${STAGED_DIR}/share/doc/awcc-rs/docs/power_profiles.md" "${APPDIR}/usr/share/doc/awcc-rs/docs/power_profiles.md"
 install -m 0644 "${STAGED_DIR}/share/doc/awcc-rs/README.md" "${APPDIR}/usr/share/doc/awcc-rs/README.md"
 install -m 0644 "${STAGED_DIR}/share/doc/awcc-rs/INSTALL.txt" "${APPDIR}/usr/share/doc/awcc-rs/INSTALL.txt"
 

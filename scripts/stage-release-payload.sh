@@ -122,6 +122,8 @@ install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/io.github.hoggormino.awcc_rs.
 install -m 0644 "${AWCC_REPO_ROOT}/LICENSE" "${OUT_DIR}/share/licenses/awcc-rs/LICENSE"
 install -m 0644 "${AWCC_REPO_ROOT}/THIRD_PARTY_NOTICES.md" "${OUT_DIR}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md"
 install -m 0644 "${AWCC_REPO_ROOT}/README.md" "${OUT_DIR}/share/doc/awcc-rs/README.md"
+install -Dm0644 "${AWCC_REPO_ROOT}/docs/power_profiles.md" "${OUT_DIR}/share/doc/awcc-rs/docs/power_profiles.md"
+install -Dm0644 "${AWCC_REPO_ROOT}/docs/power_profiles.md" "${OUT_DIR}/docs/power_profiles.md"
 install -m 0644 "${AWCC_REPO_ROOT}/packaging/linux/INSTALL.txt" "${OUT_DIR}/share/doc/awcc-rs/INSTALL.txt"
 
 # Also place top-level convenience copies of LICENSE, THIRD_PARTY_NOTICES.md, README.md, and INSTALL.txt
