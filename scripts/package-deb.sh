@@ -53,8 +53,7 @@ mkdir -p \
     "${PKG_ROOT}/usr/lib/modules-load.d" \
     "${PKG_ROOT}/usr/lib/udev/rules.d" \
     "${PKG_ROOT}/usr/share/applications" \
-    "${PKG_ROOT}/usr/share/icons/hicolor/scalable/apps" \
-    "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps" \
+    "${PKG_ROOT}/usr/share/icons/hicolor" \
     "${PKG_ROOT}/usr/share/metainfo" \
     "${PKG_ROOT}/usr/share/licenses/awcc-rs" \
     "${PKG_ROOT}/usr/share/doc/awcc-rs"
@@ -76,8 +75,7 @@ cp "${STAGED_DIR}/share/polkit-1/actions/"* "${PKG_ROOT}/usr/share/polkit-1/acti
 install -m 0644 "${STAGED_DIR}/share/systemd/awccd.service" "${PKG_ROOT}/usr/lib/systemd/system/awccd.service"
 install -m 0644 "${STAGED_DIR}/share/modules-load.d/awcc-rs.conf" "${PKG_ROOT}/usr/lib/modules-load.d/awcc-rs.conf"
 install -m 0644 "${STAGED_DIR}/share/udev/rules.d/70-awcc-rs.rules" "${PKG_ROOT}/usr/lib/udev/rules.d/70-awcc-rs.rules"
-install -m 0644 "${STAGED_DIR}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "${PKG_ROOT}/usr/share/icons/hicolor/scalable/apps/awcc-gui.svg"
-install -m 0644 "${STAGED_DIR}/share/icons/hicolor/256x256/apps/awcc-gui.png" "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps/awcc-gui.png"
+cp -a "${STAGED_DIR}/share/icons/hicolor/." "${PKG_ROOT}/usr/share/icons/hicolor/"
 install -m 0644 "${STAGED_DIR}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "${PKG_ROOT}/usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/LICENSE" "${PKG_ROOT}/usr/share/licenses/awcc-rs/LICENSE"
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "${PKG_ROOT}/usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md"

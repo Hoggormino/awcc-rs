@@ -79,8 +79,7 @@ mkdir -p \
     "${APPDIR}/usr/lib" \
     "${APPDIR}/usr/share/awcc" \
     "${APPDIR}/usr/share/applications" \
-    "${APPDIR}/usr/share/icons/hicolor/scalable/apps" \
-    "${APPDIR}/usr/share/icons/hicolor/256x256/apps" \
+    "${APPDIR}/usr/share/icons/hicolor" \
     "${APPDIR}/usr/share/metainfo" \
     "${APPDIR}/usr/share/licenses/awcc-rs" \
     "${APPDIR}/usr/share/doc/awcc-rs"
@@ -105,8 +104,7 @@ cp -a "${STAGED_DIR}/${SERVICE_PAYLOAD_RELATIVE}/." "${APPDIR}/usr/${SERVICE_PAY
 printf 'appimage\n' > "${APPDIR}/usr/share/awcc/package-format"
 chmod 0644 "${APPDIR}/usr/share/awcc/package-format"
 install -m 0644 "${STAGED_DIR}/share/applications/awcc-gui.desktop" "${APPDIR}/usr/share/applications/awcc-gui.desktop"
-install -m 0644 "${STAGED_DIR}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "${APPDIR}/usr/share/icons/hicolor/scalable/apps/awcc-gui.svg"
-install -m 0644 "${STAGED_DIR}/share/icons/hicolor/256x256/apps/awcc-gui.png" "${APPDIR}/usr/share/icons/hicolor/256x256/apps/awcc-gui.png"
+cp -a "${STAGED_DIR}/share/icons/hicolor/." "${APPDIR}/usr/share/icons/hicolor/"
 install -m 0644 "${STAGED_DIR}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "${APPDIR}/usr/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/LICENSE" "${APPDIR}/usr/share/licenses/awcc-rs/LICENSE"
 install -m 0644 "${STAGED_DIR}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "${APPDIR}/usr/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md"

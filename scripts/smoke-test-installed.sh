@@ -178,13 +178,24 @@ expect_field dirty "${EXPECT_DIRTY}"
 expect_field package-format "${EXPECT_PACKAGE_FORMAT}"
 case "$(version_field "${CLI_VERSION_OUT}" package-format)" in
     tarball|appimage|deb|rpm|arch)
-        PACKAGE_DOC_DIR="$(dirname -- "$(readlink -f -- "${CLI_BIN}")")/../share/doc/awcc-rs/docs"
+        PACKAGE_SHARE_DIR="$(dirname -- "$(readlink -f -- "${CLI_BIN}")")/../share"
+        PACKAGE_DOC_DIR="${PACKAGE_SHARE_DIR}/doc/awcc-rs/docs"
         for guide in power_profiles.md structured_logging_and_support_export.md; do
             if [[ ! -f "${PACKAGE_DOC_DIR}/${guide}" ]]; then
                 echo "ERROR: [${LABEL}] shipped guide is missing: ${guide}" >&2
                 exit 1
             fi
         done
+        for size in 16 24 32 48 64 128 256 512 2048; do
+            if [[ ! -f "${PACKAGE_SHARE_DIR}/icons/hicolor/${size}x${size}/apps/awcc-gui.png" ]]; then
+                echo "ERROR: [${LABEL}] shipped ${size}px application icon is missing" >&2
+                exit 1
+            fi
+        done
+        if [[ ! -f "${PACKAGE_SHARE_DIR}/icons/hicolor/scalable/apps/awcc-gui.svg" ]]; then
+            echo "ERROR: [${LABEL}] shipped scalable application icon is missing" >&2
+            exit 1
+        fi
         ;;
 esac
 echo "    $(head -n 1 <<<"${CLI_VERSION_OUT}") [package-format: $(version_field "${CLI_VERSION_OUT}" package-format)]"

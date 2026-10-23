@@ -58,8 +58,7 @@ mkdir -p %{buildroot}/usr/lib/systemd/system
 mkdir -p %{buildroot}/usr/lib/modules-load.d
 mkdir -p %{buildroot}/usr/lib/udev/rules.d
 mkdir -p %{buildroot}%{_datadir}/applications
-mkdir -p %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
-mkdir -p %{buildroot}%{_datadir}/icons/hicolor/256x256/apps
+mkdir -p %{buildroot}%{_datadir}/icons/hicolor
 mkdir -p %{buildroot}%{_datadir}/metainfo
 mkdir -p %{buildroot}%{_licensedir}/%{name}
 mkdir -p %{buildroot}%{_docdir}/%{name}
@@ -81,8 +80,7 @@ cp "%{staged_root}/share/polkit-1/actions/"* "%{buildroot}/usr/share/polkit-1/ac
 install -m 0644 "%{staged_root}/share/systemd/awccd.service" "%{buildroot}/usr/lib/systemd/system/awccd.service"
 install -m 0644 "%{staged_root}/share/modules-load.d/awcc-rs.conf" "%{buildroot}/usr/lib/modules-load.d/awcc-rs.conf"
 install -m 0644 "%{staged_root}/share/udev/rules.d/70-awcc-rs.rules" "%{buildroot}/usr/lib/udev/rules.d/70-awcc-rs.rules"
-install -m 0644 "%{staged_root}/share/icons/hicolor/scalable/apps/awcc-gui.svg" "%{buildroot}%{_datadir}/icons/hicolor/scalable/apps/awcc-gui.svg"
-install -m 0644 "%{staged_root}/share/icons/hicolor/256x256/apps/awcc-gui.png" "%{buildroot}%{_datadir}/icons/hicolor/256x256/apps/awcc-gui.png"
+cp -a "%{staged_root}/share/icons/hicolor/." "%{buildroot}%{_datadir}/icons/hicolor/"
 install -m 0644 "%{staged_root}/share/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml" "%{buildroot}%{_datadir}/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml"
 install -m 0644 "%{staged_root}/share/licenses/awcc-rs/LICENSE" "%{buildroot}%{_licensedir}/%{name}/LICENSE"
 install -m 0644 "%{staged_root}/share/licenses/awcc-rs/THIRD_PARTY_NOTICES.md" "%{buildroot}%{_licensedir}/%{name}/THIRD_PARTY_NOTICES.md"
@@ -114,7 +112,7 @@ install -m 0644 "%{staged_root}/share/doc/awcc-rs/INSTALL.txt" "%{buildroot}%{_d
 /usr/lib/modules-load.d/awcc-rs.conf
 /usr/lib/udev/rules.d/70-awcc-rs.rules
 %{_datadir}/icons/hicolor/scalable/apps/awcc-gui.svg
-%{_datadir}/icons/hicolor/256x256/apps/awcc-gui.png
+%{_datadir}/icons/hicolor/*/apps/awcc-gui.png
 %{_datadir}/metainfo/io.github.hoggormino.awcc_rs.metainfo.xml
 %license %{_licensedir}/%{name}/LICENSE
 %license %{_licensedir}/%{name}/THIRD_PARTY_NOTICES.md
