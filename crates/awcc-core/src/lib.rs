@@ -1367,3 +1367,6 @@ mod tests {
         assert_eq!(interpolate_curve_boost(&curve.cpu_points, 92), 100);
     }
 }
+
+pub mod power;
+pub use power::{PowerProfile, ThermalPolicy};
